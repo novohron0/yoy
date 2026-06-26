@@ -1,0 +1,9 @@
+# Секреты и сессия — НИКОГДА не коммитить
+.credentials
+*.session
+*.session-journal
+# Профили и расписания планировщика (доступ к аккаунтам)
+profiles/
+__pycache__/
+.venv/
+.DS_Store

@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Telegram планировщик</title>
+<style>
+  :root {
+    --bg: #0e1621;
+    --panel: #17212b;
+    --panel-2: #1d2733;
+    --panel-3: #243140;
+    --accent: #2b5278;
+    --accent-2: #3a6ea5;
+    --accent-3: #4a7fbf;
+    --text: #e7eef5;
+    --muted: #7d8b99;
+    --border: #0b121a;
+    --ok: #4bb34b;
+    --err: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  a { color: var(--accent-3); }
+  .hidden { display: none !important; }
+
+  /* ---------- общие элементы ---------- */
+  .btn {
+    padding: 12px 16px;
+    background: var(--accent-2);
+    color: #fff;
+    border: none;
+    border-radius: 10px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .btn:hover { background: var(--accent-3); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.ghost { background: var(--panel-2); color: var(--text); }
+  .btn.ghost:hover { background: var(--panel-3); }
+  .btn.danger { background: transparent; color: var(--err); padding: 6px 10px; font-weight: 500; }
+  .btn.full { width: 100%; }
+  input, textarea {
+    width: 100%;
+    padding: 11px 13px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    color: var(--text);
+    font-size: 15px;
+    font-family: inherit;
+  }
+  input:focus, textarea:focus { outline: none; border-color: var(--accent-2); }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 14px 0 6px; }
+  .err { color: var(--err); font-size: 13px; margin-top: 10px; min-height: 16px; }
+  .hint { font-size: 12px; color: var(--muted); line-height: 1.5; }
+
+  .wrap { max-width: 760px; margin: 0 auto; padding: 28px 18px 60px; }
+  .topbar { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; }
+  .topbar h1 { font-size: 20px; margin: 0; flex: 1; }
+  .back {
+    background: var(--panel-2); border: none; color: var(--text);
+    width: 38px; height: 38px; border-radius: 10px; cursor: pointer; font-size: 18px;
+  }
+  .back:hover { background: var(--panel-3); }
+
+  /* ---------- экран профилей ---------- */
+  .profiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 14px; }
+  .profile-card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; padding: 18px; cursor: pointer;
+    display: flex; align-items: center; gap: 13px; position: relative;
+    transition: background .12s;
+  }
+  .profile-card:hover { background: var(--panel-2); }
+  .profile-card .ava {
+    width: 46px; height: 46px; border-radius: 50%;
+    background: var(--accent-2); display: flex; align-items: center; justify-content: center;
+    font-size: 20px; font-weight: 600; flex-shrink: 0;
+  }
+  .profile-card .pname { font-size: 16px; font-weight: 600; }
+  .profile-card .pstate { font-size: 12px; margin-top: 3px; }
+  .pstate.on { color: var(--ok); }
+  .pstate.off { color: var(--err); }
+  .profile-card .del {
+    position: absolute; top: 8px; right: 8px;
+    background: transparent; border: none; color: var(--muted);
+    cursor: pointer; font-size: 16px; opacity: 0; padding: 4px;
+  }
+  .profile-card:hover .del { opacity: 1; }
+  .profile-card .del:hover { color: var(--err); }
+  .add-card {
+    border: 2px dashed var(--panel-3); background: transparent;
+    color: var(--muted); justify-content: center; font-weight: 600;
+  }
+  .add-card:hover { color: var(--text); border-color: var(--accent-2); }
+
+  /* ---------- модалка ---------- */
+  .overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6);
+    display: flex; align-items: center; justify-content: center; z-index: 50; padding: 16px;
+  }
+  .modal {
+    background: var(--panel); border-radius: 16px; padding: 26px;
+    width: 420px; max-width: 100%; box-shadow: 0 16px 50px rgba(0,0,0,.55);
+    max-height: 92vh; overflow-y: auto;
+  }
+  .modal h2 { margin: 0 0 4px; font-size: 19px; }
+  .modal .sub { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  .modal-actions { display: flex; gap: 10px; margin-top: 18px; }
+  .modal-actions .btn { flex: 1; }
+
+  /* ---------- секции компоновщика ---------- */
+  .section { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 18px; margin-bottom: 16px; }
+  .section h3 { margin: 0 0 12px; font-size: 15px; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 7px;
+    background: var(--panel-3); border-radius: 20px; padding: 6px 8px 6px 12px; font-size: 13px;
+  }
+  .chip .x { cursor: pointer; color: var(--muted); font-size: 15px; line-height: 1; }
+  .chip .x:hover { color: var(--err); }
+  .chip-kind { font-size: 12px; }
+  .add-chat {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--panel-2); border: 1px dashed var(--panel-3); color: var(--muted);
+    border-radius: 20px; padding: 6px 14px; font-size: 13px; cursor: pointer;
+  }
+  .add-chat:hover { color: var(--text); border-color: var(--accent-2); }
+
+  /* поиск в модалке */
+  .results { margin-top: 12px; max-height: 320px; overflow-y: auto; }
+  .result {
+    display: flex; align-items: center; gap: 11px;
+    padding: 9px 8px; border-radius: 9px; cursor: pointer;
+  }
+  .result:hover { background: var(--panel-2); }
+  .result.picked { background: var(--accent); }
+  .result .ava {
+    width: 36px; height: 36px; border-radius: 50%; background: var(--accent-2);
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  .result .rname { font-size: 14px; font-weight: 500; }
+  .result .rkind { font-size: 12px; color: var(--muted); }
+  .result.picked .rkind { color: #cfe0f0; }
+
+  textarea#msg { min-height: 96px; resize: vertical; }
+
+  /* дни недели */
+  .weekdays { display: flex; flex-wrap: wrap; gap: 7px; }
+  .wd {
+    width: 42px; height: 38px; border-radius: 9px; border: 1px solid var(--border);
+    background: var(--panel-2); color: var(--muted); cursor: pointer; font-size: 13px; font-weight: 600;
+  }
+  .wd.on { background: var(--accent-2); color: #fff; border-color: var(--accent-2); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+  .row > div { flex: 1; min-width: 140px; }
+
+  .mode-note {
+    margin-top: 12px; padding: 10px 12px; border-radius: 9px;
+    background: var(--panel-2); font-size: 13px; line-height: 1.5;
+  }
+  .mode-note b { color: var(--accent-3); }
+
+  .sched-list { display: flex; flex-direction: column; gap: 10px; }
+  .sched-item {
+    background: var(--panel-2); border-radius: 11px; padding: 13px 14px;
+    display: flex; gap: 12px; align-items: flex-start;
+  }
+  .sched-item .si-main { flex: 1; min-width: 0; }
+  .sched-item .si-when { font-size: 13px; color: var(--accent-3); font-weight: 600; margin-bottom: 4px; }
+  .sched-item .si-text { font-size: 14px; margin-bottom: 5px; white-space: pre-wrap; word-break: break-word; }
+  .sched-item .si-to { font-size: 12px; color: var(--muted); }
+
+  .toast {
+    position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
+    background: var(--panel-3); padding: 12px 20px; border-radius: 10px;
+    font-size: 14px; box-shadow: 0 8px 24px rgba(0,0,0,.5); z-index: 80; max-width: 90vw;
+  }
+  .toast.ok { border-left: 3px solid var(--ok); }
+  .toast.bad { border-left: 3px solid var(--err); }
+</style>
+</head>
+<body>
+
+<!-- ============ Экран профилей ============ -->
+<div id="screen-profiles" class="wrap">
+  <div class="topbar"><h1>Профили Telegram</h1></div>
+  <div class="hint" style="margin-bottom:16px">Выбери аккаунт, чтобы настроить отправку постов по чатам. Или добавь новый.</div>
+  <div class="profiles" id="profiles-grid"></div>
+</div>
+
+<!-- ============ Экран компоновщика ============ -->
+<div id="screen-compose" class="wrap hidden">
+  <div class="topbar">
+    <button class="back" onclick="goProfiles()">←</button>
+    <h1 id="compose-title">…</h1>
+  </div>
+
+  <!-- Получатели -->
+  <div class="section">
+    <h3>Кому отправить</h3>
+    <div class="chips" id="recipients">
+      <div class="add-chat" onclick="openSearch()">＋ Добавить чат</div>
+    </div>
+  </div>
+
+  <!-- Сообщение -->
+  <div class="section">
+    <h3>Сообщение</h3>
+    <textarea id="msg" placeholder="Текст поста…"></textarea>
+  </div>
+
+  <!-- Расписание -->
+  <div class="section">
+    <h3>Когда отправить</h3>
+    <div class="row">
+      <div>
+        <label>Время</label>
+        <input type="time" id="sched-time" value="12:00" />
+      </div>
+    </div>
+
+    <label>Дни недели (для повтора)</label>
+    <div class="weekdays" id="weekdays"></div>
+
+    <label>Конкретные даты (разовая отправка)</label>
+    <div class="row">
+      <div style="flex:2"><input type="date" id="date-input" /></div>
+      <button class="btn ghost" type="button" onclick="addDate()" style="flex:0 0 auto">Добавить дату</button>
+    </div>
+    <div class="chips" id="dates-chips" style="margin-top:10px"></div>
+
+    <div class="mode-note" id="mode-note"></div>
+  </div>
+
+  <div class="row" style="gap:10px">
+    <button class="btn full" onclick="saveSchedule()">Запланировать</button>
+    <button class="btn ghost full" onclick="sendNow()">Отправить сейчас</button>
+  </div>
+  <div class="err" id="compose-err"></div>
+
+  <!-- Активные расписания -->
+  <div class="section" id="sched-section" style="margin-top:24px">
+    <h3>Запланированные отправки</h3>
+    <div class="sched-list" id="sched-list"></div>
+  </div>
+</div>
+
+<!-- ============ Модалка: добавить аккаунт ============ -->
+<div id="modal-add" class="overlay hidden">
+  <div class="modal">
+    <h2>Новый аккаунт</h2>
+    <p class="sub" id="add-sub">Введи данные приложения Telegram</p>
+
+    <div id="add-credentials">
+      <p class="hint">Получи <b>api_id</b> и <b>api_hash</b> на
+        <a href="https://my.telegram.org" target="_blank">my.telegram.org</a> → API development tools.</p>
+      <label>Название профиля</label>
+      <input id="in-name" placeholder="Напр. Личный / Рабочий" />
+      <label>api_id (число)</label>
+      <input id="in-api-id" inputmode="numeric" placeholder="1234567" />
+      <label>api_hash (32 hex-символа)</label>
+      <input id="in-api-hash" placeholder="abcdef0123..." />
+    </div>
+
+    <div id="add-phone" class="hidden">
+      <label>Номер телефона</label>
+      <input id="in-phone" placeholder="+79991234567" />
+    </div>
+
+    <div id="add-code" class="hidden">
+      <label>Код из Telegram</label>
+      <input id="in-code" inputmode="numeric" placeholder="12345" />
+    </div>
+
+    <div id="add-password" class="hidden">
+      <label>Пароль 2FA</label>
+      <input id="in-password" type="password" placeholder="••••••" />
+    </div>
+
+    <div class="err" id="add-err"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeAdd()">Отмена</button>
+      <button class="btn" id="add-next" onclick="addNext()">Далее</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ Модалка: поиск чата ============ -->
+<div id="modal-search" class="overlay hidden">
+  <div class="modal">
+    <h2>Поиск чата</h2>
+    <p class="sub">Лс, группы и каналы — как в поиске Telegram. Жми, чтобы выбрать.</p>
+    <input id="search-input" placeholder="Введи имя, @username или название…" oninput="onSearchInput()" />
+    <div class="results" id="search-results"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeSearch()">Отмена</button>
+      <button class="btn" onclick="closeSearch()">Готово</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const WD_NAMES = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"];
+const KIND_ICON = { user: "👤", group: "👥", channel: "📢", chat: "💬" };
+
+let state = {
+  profileId: null,
+  profileName: "",
+  recipients: {},   // id -> {id, name, kind}
+  weekdays: new Set(),
+  dates: new Set(),
+  addStep: null,
+  searchTimer: null,
+};
+
+// ---------- helpers ----------
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  return { ok: res.ok, data };
+}
+function post(path, body) {
+  return api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+}
+function el(id) { return document.getElementById(id); }
+function escapeHtml(s) {
+  return (s || "").replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function toast(msg, kind) {
+  const t = document.createElement("div");
+  t.className = "toast " + (kind || "ok");
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+
+// ---------- экран профилей ----------
+async function loadProfiles() {
+  const { data } = await api("/api/profiles");
+  const grid = el("profiles-grid");
+  grid.innerHTML = "";
+  for (const p of (data.profiles || [])) {
+    const card = document.createElement("div");
+    card.className = "profile-card";
+    const initial = (p.name || "?").trim().charAt(0).toUpperCase() || "?";
+    card.innerHTML = `
+      <div class="ava">${escapeHtml(initial)}</div>
+      <div>
+        <div class="pname">${escapeHtml(p.name)}</div>
+        <div class="pstate ${p.authorized ? "on" : "off"}">${p.authorized ? "● подключён" : "○ нужен вход"}</div>
+      </div>
+      <button class="del" title="Удалить">✕</button>`;
+    card.onclick = () => openProfile(p);
+    card.querySelector(".del").onclick = (e) => { e.stopPropagation(); deleteProfile(p); };
+    grid.appendChild(card);
+  }
+  const add = document.createElement("div");
+  add.className = "profile-card add-card";
+  add.innerHTML = "＋ Добавить аккаунт";
+  add.onclick = openAdd;
+  grid.appendChild(add);
+}
+
+async function deleteProfile(p) {
+  if (!confirm(`Удалить профиль «${p.name}» и выйти из аккаунта?`)) return;
+  await api(`/api/profiles/${p.id}`, { method: "DELETE" });
+  loadProfiles();
+}
+
+async function openProfile(p) {
+  // Если не авторизован — продолжаем вход
+  const { data } = await api(`/api/profiles/${p.id}/status`);
+  if (data.step !== "ready") {
+    state.profileId = p.id;
+    openAdd(p.id, data.step);
+    return;
+  }
+  enterCompose(p.id, p.name);
+}
+
+// ---------- добавление аккаунта ----------
+function showAddStep(step) {
+  state.addStep = step;
+  const subs = {
+    credentials: "Введи данные приложения Telegram",
+    phone: "Введи номер телефона",
+    code: "Введи код, который пришёл в Telegram",
+    password: "У тебя включена двухфакторная защита",
+  };
+  for (const s of ["credentials", "phone", "code", "password"])
+    el("add-" + s).classList.toggle("hidden", s !== step);
+  el("add-sub").textContent = subs[step] || "";
+  el("add-err").textContent = "";
+  el("add-next").textContent = step === "code" || step === "password" ? "Войти" : "Далее";
+}
+function openAdd(existingId, step) {
+  el("modal-add").classList.remove("hidden");
+  if (typeof existingId === "string") {
+    state.profileId = existingId;
+    showAddStep(step || "phone");
+  } else {
+    state.profileId = null;
+    el("in-name").value = ""; el("in-api-id").value = ""; el("in-api-hash").value = "";
+    el("in-phone").value = ""; el("in-code").value = ""; el("in-password").value = "";
+    showAddStep("credentials");
+  }
+}
+function closeAdd() { el("modal-add").classList.add("hidden"); loadProfiles(); }
+
+async function addNext() {
+  el("add-err").textContent = "";
+  if (state.addStep === "credentials") {
+    const { ok, data } = await post("/api/profiles", {
+      name: el("in-name").value, api_id: el("in-api-id").value, api_hash: el("in-api-hash").value,
+    });
+    if (!ok) return (el("add-err").textContent = data.error);
+    state.profileId = data.id;
+    showAddStep("phone");
+  } else if (state.addStep === "phone") {
+    el("add-err").textContent = "Отправляю код…";
+    const { ok, data } = await post(`/api/profiles/${state.profileId}/login/send_code`, { phone: el("in-phone").value });
+    if (!ok) return (el("add-err").textContent = data.error);
+    showAddStep("code");
+    if (data.code_via) {
+      el("add-sub").innerHTML = `Код отправлен <b>${escapeHtml(data.code_via)}</b>. Найди его и введи ниже.`;
+    }
+  } else if (state.addStep === "code") {
+    const { ok, data } = await post(`/api/profiles/${state.profileId}/login/sign_in`, { code: el("in-code").value });
+    if (!ok) return (el("add-err").textContent = data.error);
+    if (data.step === "password") return showAddStep("password");
+    finishAdd();
+  } else if (state.addStep === "password") {
+    const { ok, data } = await post(`/api/profiles/${state.profileId}/login/password`, { password: el("in-password").value });
+    if (!ok) return (el("add-err").textContent = data.error);
+    finishAdd();
+  }
+}
+async function finishAdd() {
+  el("modal-add").classList.add("hidden");
+  const { data } = await api(`/api/profiles/${state.profileId}/status`);
+  const name = (data.me && data.me.name) ? data.me.name : "Аккаунт";
+  await loadProfiles();
+  enterCompose(state.profileId, name);
+}
+
+// ---------- компоновщик ----------
+function enterCompose(pid, name) {
+  state.profileId = pid;
+  state.profileName = name;
+  state.recipients = {};
+  state.weekdays = new Set();
+  state.dates = new Set();
+  el("screen-profiles").classList.add("hidden");
+  el("screen-compose").classList.remove("hidden");
+  el("compose-title").textContent = name;
+  el("msg").value = "";
+  el("compose-err").textContent = "";
+  renderRecipients();
+  renderWeekdays();
+  renderDates();
+  updateModeNote();
+  loadSchedules();
+}
+function goProfiles() {
+  el("screen-compose").classList.add("hidden");
+  el("screen-profiles").classList.remove("hidden");
+  loadProfiles();
+}
+
+function renderRecipients() {
+  const box = el("recipients");
+  box.querySelectorAll(".chip").forEach(c => c.remove());
+  const addBtn = box.querySelector(".add-chat");
+  for (const r of Object.values(state.recipients)) {
+    const chip = document.createElement("div");
+    chip.className = "chip";
+    chip.innerHTML = `<span class="chip-kind">${KIND_ICON[r.kind] || "💬"}</span>${escapeHtml(r.name)}<span class="x">✕</span>`;
+    chip.querySelector(".x").onclick = () => { delete state.recipients[r.id]; renderRecipients(); };
+    box.insertBefore(chip, addBtn);
+  }
+}
+
+function renderWeekdays() {
+  const box = el("weekdays");
+  box.innerHTML = "";
+  WD_NAMES.forEach((nm, i) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "wd" + (state.weekdays.has(i) ? " on" : "");
+    b.textContent = nm;
+    b.onclick = () => {
+      state.weekdays.has(i) ? state.weekdays.delete(i) : state.weekdays.add(i);
+      renderWeekdays(); updateModeNote();
+    };
+    box.appendChild(b);
+  });
+}
+
+function addDate() {
+  const v = el("date-input").value;
+  if (v) { state.dates.add(v); el("date-input").value = ""; renderDates(); updateModeNote(); }
+}
+function renderDates() {
+  const box = el("dates-chips");
+  box.innerHTML = "";
+  [...state.dates].sort().forEach(d => {
+    const chip = document.createElement("div");
+    chip.className = "chip";
+    chip.innerHTML = `📅 ${d}<span class="x">✕</span>`;
+    chip.querySelector(".x").onclick = () => { state.dates.delete(d); renderDates(); updateModeNote(); };
+    box.appendChild(chip);
+  });
+}
+
+function updateModeNote() {
+  const t = el("sched-time").value || "—";
+  let html;
+  if (state.dates.size) {
+    html = `<b>Разовая отправка.</b> Сообщение уйдёт по одному разу в каждую выбранную дату в ${t}.`;
+  } else if (state.weekdays.size) {
+    const days = [...state.weekdays].sort().map(i => WD_NAMES[i]).join(", ");
+    html = `<b>Повтор каждую неделю.</b> Будет отправляться по дням: ${days} в ${t}.`;
+  } else {
+    html = `<b>Повтор каждый день.</b> Сообщение будет уходить ежедневно в ${t}.`;
+  }
+  el("mode-note").innerHTML = html;
+}
+
+// ---------- поиск чата ----------
+function openSearch() {
+  el("modal-search").classList.remove("hidden");
+  el("search-input").value = "";
+  el("search-input").focus();
+  runSearch("");
+}
+function closeSearch() { el("modal-search").classList.add("hidden"); }
+function onSearchInput() {
+  clearTimeout(state.searchTimer);
+  const q = el("search-input").value;
+  state.searchTimer = setTimeout(() => runSearch(q), 280);
+}
+async function runSearch(q) {
+  const box = el("search-results");
+  box.innerHTML = `<div style="color:var(--muted);padding:10px">Поиск…</div>`;
+  const { ok, data } = await api(`/api/profiles/${state.profileId}/search?q=${encodeURIComponent(q)}`);
+  box.innerHTML = "";
+  if (!ok) { box.innerHTML = `<div style="color:var(--err);padding:10px">${escapeHtml(data.error || "Ошибка")}</div>`; return; }
+  if (!data.results.length) { box.innerHTML = `<div style="color:var(--muted);padding:10px">Ничего не найдено</div>`; return; }
+  for (const r of data.results) {
+    const row = document.createElement("div");
+    const picked = !!state.recipients[r.id];
+    row.className = "result" + (picked ? " picked" : "");
+    row.innerHTML = `
+      <div class="ava">${KIND_ICON[r.kind] || "💬"}</div>
+      <div style="flex:1;min-width:0">
+        <div class="rname">${escapeHtml(r.name)}</div>
+        <div class="rkind">${r.kind}${r.username ? " · @" + escapeHtml(r.username) : ""}</div>
+      </div>
+      <div style="font-size:18px">${picked ? "✓" : "＋"}</div>`;
+    row.onclick = () => {
+      if (state.recipients[r.id]) delete state.recipients[r.id];
+      else state.recipients[r.id] = { id: r.id, name: r.name, kind: r.kind };
+      renderRecipients();
+      runSearch(el("search-input").value);
+    };
+    box.appendChild(row);
+  }
+}
+
+// ---------- сохранение / отправка ----------
+function collectTargets() {
+  return Object.values(state.recipients).map(r => ({ id: r.id, name: r.name, kind: r.kind }));
+}
+function validateCommon() {
+  el("compose-err").textContent = "";
+  const targets = collectTargets();
+  if (!targets.length) { el("compose-err").textContent = "Добавь хотя бы один чат."; return null; }
+  const text = el("msg").value.trim();
+  if (!text) { el("compose-err").textContent = "Введи текст сообщения."; return null; }
+  return { targets, text };
+}
+
+async function saveSchedule() {
+  const base = validateCommon();
+  if (!base) return;
+  const { ok, data } = await post(`/api/profiles/${state.profileId}/schedules`, {
+    ...base,
+    time: el("sched-time").value,
+    weekdays: [...state.weekdays],
+    dates: [...state.dates],
+  });
+  if (!ok) return (el("compose-err").textContent = data.error);
+  toast("Запланировано ✓", "ok");
+  el("msg").value = "";
+  state.dates = new Set();
+  renderDates(); updateModeNote();
+  loadSchedules();
+}
+
+async function sendNow() {
+  const base = validateCommon();
+  if (!base) return;
+  const { ok, data } = await post(`/api/profiles/${state.profileId}/send`, base);
+  if (!ok) return (el("compose-err").textContent = data.error);
+  const errs = (data.errors || []).length;
+  toast(errs ? `Отправлено ${data.sent.length}, ошибок ${errs}` : `Отправлено в ${data.sent.length} чат(ов) ✓`, errs ? "bad" : "ok");
+}
+
+// ---------- список расписаний ----------
+function describeWhen(s) {
+  if (s.dates && s.dates.length) return `📅 ${s.dates.join(", ")} в ${s.time}`;
+  if (s.weekdays && s.weekdays.length) return `🔁 ${s.weekdays.map(i => WD_NAMES[i]).join(", ")} в ${s.time}`;
+  return `🔁 ежедневно в ${s.time}`;
+}
+async function loadSchedules() {
+  const { data } = await api(`/api/profiles/${state.profileId}/schedules`);
+  const list = el("sched-list");
+  list.innerHTML = "";
+  const items = (data.schedules || []).filter(s => s.enabled !== false);
+  if (!items.length) { list.innerHTML = `<div class="hint">Пока ничего не запланировано.</div>`; return; }
+  for (const s of items) {
+    const to = (s.targets || []).map(t => `${KIND_ICON[t.kind] || "💬"} ${t.name}`).join(", ");
+    const item = document.createElement("div");
+    item.className = "sched-item";
+    item.innerHTML = `
+      <div class="si-main">
+        <div class="si-when">${escapeHtml(describeWhen(s))}</div>
+        <div class="si-text">${escapeHtml(s.text)}</div>
+        <div class="si-to">→ ${escapeHtml(to)}</div>
+      </div>
+      <button class="btn danger">Удалить</button>`;
+    item.querySelector("button").onclick = async () => {
+      await api(`/api/profiles/${state.profileId}/schedules/${s.id}`, { method: "DELETE" });
+      loadSchedules();
+    };
+    list.appendChild(item);
+  }
+}
+
+// время меняется — обновляем подсказку
+document.addEventListener("input", (e) => { if (e.target.id === "sched-time") updateModeNote(); });
+
+// старт
+loadProfiles();
+</script>
+</body>
+</html>

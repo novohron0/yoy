@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m pip --version)",
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(.venv/bin/python -c \"import ast; ast.parse\\(open\\('userbot.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(.venv/bin/python -c \"import telethon; print\\('telethon', telethon.__version__\\)\")",
+      "Bash(.venv/bin/python -c \"import importlib.util,sys; spec=importlib.util.spec_from_file_location\\('ub','userbot.py'\\); m=importlib.util.module_from_spec\\(spec\\); spec.loader.exec_module\\(m\\); print\\('import OK — функции:', [n for n in dir\\(m\\) if not n.startswith\\('__'\\)][:8]\\)\")",
+      "Bash(awk -F= '{ if\\($1==\"api_id\"\\) print \"api_id =\", $2; else if\\($1==\"api_hash\"\\) print \"api_hash =\", substr\\($2,1,4\\) \"…\" substr\\($2, length\\($2\\)-3\\) \" \\(длина \" length\\($2\\) \"\\)\" }' /Users/kamilimangulov/yoy/.credentials)",
+      "Bash(grep -rli \"clutch\\\\|клач\\\\|клатч\\\\|clach\" /Users/kamilimangulov/yoy 2>/dev/null | grep -v \"/.venv/\" | grep -v \"/__pycache__/\"; echo \"--- по всей домашней папке \\(имена файлов/папок\\) ---\"; find /Users/kamilimangulov -maxdepth 4 -iname \"*clutch*\" 2>/dev/null | head; find /Users/kamilimangulov -maxdepth 4 -iname \"*clach*\" 2>/dev/null | head; find /Users/kamilimangulov -maxdepth 4 \\\\\\( -iname \"*клач*\" -o -iname \"*клатч*\" \\\\\\) 2>/dev/null | head)",
+      "Bash(python3 -)",
+      "Bash(.venv/bin/python userbot.py --reset)",
+      "Bash(.venv/bin/python --version)",
+      "Bash(.venv/bin/pip list *)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(.venv/bin/python -c \"import fastapi, uvicorn; print\\('fastapi', fastapi.__version__, 'uvicorn', uvicorn.__version__\\)\")",
+      "Bash(.venv/bin/python web.py)",
+      "Bash(curl -s http://127.0.0.1:8000/api/status)",
+      "Read(//tmp/**)",
+      "Bash(curl -s http://127.0.0.1:8000/api/dialogs)",
+      "Bash(.venv/bin/python -c \"import sys,json; d=json.load\\(sys.stdin\\)['dialogs']; print\\('кол-во:',len\\(d\\)\\); [print\\(x\\) for x in d[:3]]\")",
+      "Bash(.venv/bin/python -c \"import sys,json; m=json.load\\(sys.stdin\\).get\\('messages',[]\\); print\\('сообщений:',len\\(m\\)\\); [print\\(x['out'],x['time'],x['text'][:40]\\) for x in m]\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://127.0.0.1:8000/)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://127.0.0.1:8000/static/index.html)",
+      "Bash(pkill -f \"web.py\")",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(.venv/bin/python test_send_code.py 45ab27cc)",
+      "Bash(git init *)",
+      "Bash(git add *)"
+    ]
+  }
+}

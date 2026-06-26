@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "userbot-web",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": ["web.py"],
+      "port": 8000
+    }
+  ]
+}
