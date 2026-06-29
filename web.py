@@ -54,6 +54,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROFILES_DIR = os.path.join(BASE_DIR, "profiles")
 PROFILES_JSON = os.path.join(PROFILES_DIR, "profiles.json")
 SCHEDULES_JSON = os.path.join(PROFILES_DIR, "schedules.json")
+PACKS_JSON = os.path.join(PROFILES_DIR, "packs.json")
 USERS_JSON = os.path.join(PROFILES_DIR, "users.json")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
@@ -132,6 +133,14 @@ def load_schedules():
 
 def save_schedules(schedules):
     _write_json(SCHEDULES_JSON, {"schedules": schedules})
+
+
+def load_packs():
+    return _read_json(PACKS_JSON, {"packs": []})["packs"]
+
+
+def save_packs(packs):
+    _write_json(PACKS_JSON, {"packs": packs})
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +669,7 @@ async def admin_delete_user(uid: str, admin=Depends(require_admin)):
     for p in [p for p in load_profiles() if p.get("owner") == uid]:
         await _destroy_profile(p)
     save_schedules([s for s in load_schedules() if s.get("owner") != uid])
+    save_packs([p for p in load_packs() if p.get("owner") != uid])
     save_users([u for u in users if u["id"] != uid])
     return {"ok": True}
 
@@ -704,6 +714,11 @@ class ScheduleIn(BaseModel):
     dates: list[str] = []     # ["YYYY-MM-DD", ...]
     interval_min: int | None = None  # минуты; если задано — режим «каждые N минут»
     interval_max: int | None = None  # верхняя граница случайного интервала
+
+
+class PackIn(BaseModel):
+    name: str
+    targets: list[Target]
 
 
 # ---------------------------------------------------------------------------
@@ -818,6 +833,7 @@ async def delete_profile(pid: str, user=Depends(require_user)):
     await _destroy_profile(profile)
     save_profiles([p for p in load_profiles() if p["id"] != pid])
     save_schedules([s for s in load_schedules() if s["profile_id"] != pid])
+    save_packs([p for p in load_packs() if p["profile_id"] != pid])
     return {"ok": True}
 
 
@@ -1113,6 +1129,48 @@ async def delete_schedule(pid: str, sid: str, user=Depends(require_user)):
     if len(new) == len(schedules):
         return JSONResponse({"error": "Расписание не найдено"}, status_code=404)
     save_schedules(new)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Папки чатов (сохранённые наборы получателей)
+# ---------------------------------------------------------------------------
+@app.get("/api/profiles/{pid}/packs")
+async def get_packs(pid: str, user=Depends(require_user)):
+    _owned_profile(pid, user)
+    return {"packs": [p for p in load_packs() if p["profile_id"] == pid]}
+
+
+@app.post("/api/profiles/{pid}/packs")
+async def create_pack(pid: str, body: PackIn, user=Depends(require_user)):
+    _owned_profile(pid, user)
+    name = body.name.strip()
+    if not name:
+        return JSONResponse({"error": "Введи название папки"}, status_code=400)
+    if not body.targets:
+        return JSONResponse({"error": "В папке нет чатов"}, status_code=400)
+    pack = {
+        "id": uuid.uuid4().hex[:8],
+        "profile_id": pid,
+        "owner": user["id"],
+        "name": name,
+        "targets": [t.model_dump() for t in body.targets],
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    packs = load_packs()
+    packs.append(pack)
+    save_packs(packs)
+    return {"ok": True, "pack": pack}
+
+
+@app.delete("/api/profiles/{pid}/packs/{packid}")
+async def delete_pack(pid: str, packid: str, user=Depends(require_user)):
+    _owned_profile(pid, user)
+    packs = load_packs()
+    new = [p for p in packs if not (p["id"] == packid and p["profile_id"] == pid)]
+    if len(new) == len(packs):
+        return JSONResponse({"error": "Папка не найдена"}, status_code=404)
+    save_packs(new)
     return {"ok": True}
 
 

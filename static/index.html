@@ -236,6 +236,12 @@
     <div class="chips" id="recipients">
       <div class="add-chat" onclick="openSearch()">＋ Добавить чат</div>
     </div>
+
+    <div style="margin-top:14px">
+      <div class="hint" style="margin-bottom:6px">📁 Папки чатов — клик добавляет все чаты папки сразу:</div>
+      <div class="chips" id="packs-list"></div>
+      <button class="btn ghost" type="button" style="margin-top:10px" onclick="saveCurrentPack()">💾 Сохранить выбранные как папку</button>
+    </div>
   </div>
 
   <!-- Сообщение -->
@@ -586,7 +592,54 @@ function enterCompose(pid, name) {
   renderDates();
   setSchedMode("daily");
   renderFloodBanner();
+  loadPacks();
   loadSchedules();
+}
+
+// ---------- папки чатов ----------
+async function loadPacks() {
+  const box = el("packs-list");
+  const { data } = await api(`/api/profiles/${state.profileId}/packs`);
+  box.innerHTML = "";
+  const packs = data.packs || [];
+  if (!packs.length) { box.innerHTML = `<span class="hint">Папок пока нет — выбери чаты и сохрани.</span>`; return; }
+  for (const pk of packs) {
+    const chip = document.createElement("div");
+    chip.className = "chip";
+    chip.innerHTML = `<span class="pk-apply" style="cursor:pointer">📁 ${escapeHtml(pk.name)} · ${pk.targets.length}</span><span class="x" title="Удалить папку">✕</span>`;
+    chip.querySelector(".pk-apply").onclick = () => applyPack(pk);
+    chip.querySelector(".x").onclick = (e) => { e.stopPropagation(); deletePack(pk); };
+    box.appendChild(chip);
+  }
+}
+
+function applyPack(pk) {
+  let added = 0;
+  for (const t of (pk.targets || [])) {
+    if (!state.recipients[t.id]) {
+      state.recipients[t.id] = { id: t.id, name: t.name, kind: t.kind };
+      added++;
+    }
+  }
+  renderRecipients();
+  toast(`Из «${pk.name}» добавлено: ${added}`, "ok");
+}
+
+async function saveCurrentPack() {
+  const targets = collectTargets();
+  if (!targets.length) { toast("Сначала выбери хотя бы один чат", "bad"); return; }
+  const name = prompt("Название папки (например «Каналы» или «Клиенты»):");
+  if (!name || !name.trim()) return;
+  const { ok, data } = await post(`/api/profiles/${state.profileId}/packs`, { name: name.trim(), targets });
+  if (!ok) return toast(data.error || "Ошибка", "bad");
+  toast("Папка сохранена ✓", "ok");
+  loadPacks();
+}
+
+async function deletePack(pk) {
+  if (!confirm(`Удалить папку «${pk.name}»? (чаты в ней не удаляются)`)) return;
+  await api(`/api/profiles/${state.profileId}/packs/${pk.id}`, { method: "DELETE" });
+  loadPacks();
 }
 
 function renderFloodBanner() {
