@@ -81,6 +81,19 @@ if not SECRET_KEY:
 # Для локального запуска по http можно выставить COOKIE_SECURE=0.
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"
 
+# --- Тарифы и оплата ---
+# Токен CryptoBot (Crypto Pay API). Получить: @CryptoBot → Crypto Pay → Create App.
+CRYPTOBOT_TOKEN = os.environ.get("CRYPTOBOT_TOKEN", "")
+CRYPTOBOT_API = os.environ.get("CRYPTOBOT_API", "https://pay.crypt.bot/api")
+
+# Тарифы доступа. Цена в рублях за период `days`. Меняй цифры как нужно.
+TIERS = {
+    "start":    {"name": "Старт",    "price_rub": 1000, "days": 7, "max_accounts": 1},
+    "standard": {"name": "Стандарт", "price_rub": 2500, "days": 7, "max_accounts": 3},
+    "pro":      {"name": "Про",      "price_rub": 5000, "days": 7, "max_accounts": 20},
+}
+DEFAULT_TIER = "start"
+
 
 def _valid_hash(value):
     """api_hash должен быть ровно 32 hex-символа."""
@@ -202,6 +215,56 @@ def _verify_token(token):
     return uid
 
 
+def _tier_key(user):
+    t = (user or {}).get("tier") or DEFAULT_TIER
+    return t if t in TIERS else DEFAULT_TIER
+
+
+def _sub_active(user):
+    if (user or {}).get("is_admin"):
+        return True   # админ всегда с доступом
+    pu = (user or {}).get("paid_until")
+    if not pu:
+        return False
+    try:
+        return datetime.now() < datetime.fromisoformat(pu)
+    except Exception:
+        return False
+
+
+def _days_left(user):
+    pu = (user or {}).get("paid_until")
+    if not pu:
+        return 0
+    try:
+        secs = (datetime.fromisoformat(pu) - datetime.now()).total_seconds()
+        return max(0, int((secs + 86399) // 86400))  # округление вверх до дней
+    except Exception:
+        return 0
+
+
+def _extend_subscription(uid, tier_key, days, clear_invoice=None):
+    """Продлевает подписку: добавляет days к текущей дате (или от now, если истекла)."""
+    users = load_users()
+    for u in users:
+        if u["id"] == uid:
+            base = datetime.now()
+            if u.get("paid_until"):
+                try:
+                    pu = datetime.fromisoformat(u["paid_until"])
+                    if pu > base:
+                        base = pu
+                except Exception:
+                    pass
+            u["paid_until"] = (base + timedelta(days=int(days))).isoformat(timespec="seconds")
+            if tier_key:
+                u["tier"] = tier_key
+            if clear_invoice and u.get("pending_invoice") == clear_invoice:
+                u.pop("pending_invoice", None)
+            break
+    save_users(users)
+
+
 def _user_public(u):
     return {
         "id": u["id"],
@@ -209,6 +272,10 @@ def _user_public(u):
         "status": u.get("status"),
         "is_admin": bool(u.get("is_admin")),
         "created": u.get("created"),
+        "tier": _tier_key(u),
+        "paid_until": u.get("paid_until"),
+        "sub_active": _sub_active(u),
+        "days_left": _days_left(u),
     }
 
 
@@ -234,6 +301,16 @@ async def require_admin(request: Request):
     u = _current_user(request)
     if not u or not u.get("is_admin"):
         raise HTTPException(status_code=403, detail="Только для администратора")
+    return u
+
+
+async def require_active(request: Request):
+    """Доступ к действиям только при активной подписке (иначе 402 — нужна оплата)."""
+    u = _current_user(request)
+    if not u:
+        raise HTTPException(status_code=401, detail="Не авторизован")
+    if not _sub_active(u):
+        raise HTTPException(status_code=402, detail="Подписка неактивна — оплати доступ")
     return u
 
 
@@ -483,11 +560,11 @@ async def _scheduler_loop():
                 if not rule.get("enabled", True):
                     continue
 
-                # Расписания заблокированных/удалённых пользователей не отправляем
+                # Не отправляем, если владелец заблокирован/удалён или подписка истекла
                 owner = rule.get("owner")
                 if owner is not None:
                     ou = get_user(owner)
-                    if ou is None or ou.get("status") != "approved":
+                    if ou is None or ou.get("status") != "approved" or not _sub_active(ou):
                         continue
 
                 # Профиль на охлаждении после флуда — пропускаем (возобновится сам)
@@ -703,6 +780,118 @@ async def admin_delete_user(uid: str, admin=Depends(require_admin)):
     return {"ok": True}
 
 
+class SubIn(BaseModel):
+    tier: str | None = None
+    add_days: int | None = None
+
+
+@app.post("/api/admin/users/{uid}/subscription")
+async def admin_subscription(uid: str, body: SubIn, admin=Depends(require_admin)):
+    """Админ: сменить тариф и/или продлить подписку вручную."""
+    users = load_users()
+    target = next((u for u in users if u["id"] == uid), None)
+    if not target:
+        return JSONResponse({"error": "Пользователь не найден"}, status_code=404)
+    if body.tier:
+        if body.tier not in TIERS:
+            return JSONResponse({"error": "Неизвестный тариф"}, status_code=400)
+        target["tier"] = body.tier
+    if body.add_days:
+        base = datetime.now()
+        if target.get("paid_until"):
+            try:
+                pu = datetime.fromisoformat(target["paid_until"])
+                if pu > base:
+                    base = pu
+            except Exception:
+                pass
+        target["paid_until"] = (base + timedelta(days=int(body.add_days))).isoformat(timespec="seconds")
+    save_users(users)
+    return {"ok": True, "user": _user_public(target)}
+
+
+# ---------------------------------------------------------------------------
+# Тарифы и оплата (CryptoBot)
+# ---------------------------------------------------------------------------
+@app.get("/api/tiers")
+async def get_tiers(user=Depends(require_user)):
+    return {"tiers": TIERS, "default": DEFAULT_TIER}
+
+
+@app.get("/api/billing/info")
+async def billing_info(user=Depends(require_user)):
+    tkey = _tier_key(user)
+    return {
+        "tier_key": tkey,
+        "tier": TIERS[tkey],
+        "active": _sub_active(user),
+        "paid_until": user.get("paid_until"),
+        "days_left": _days_left(user),
+        "crypto_enabled": bool(CRYPTOBOT_TOKEN),
+    }
+
+
+@app.post("/api/billing/invoice")
+async def billing_invoice(user=Depends(require_user)):
+    if not CRYPTOBOT_TOKEN:
+        return JSONResponse({"error": "Оплата криптой не настроена (нет CRYPTOBOT_TOKEN)"}, status_code=400)
+    tkey = _tier_key(user)
+    tier = TIERS[tkey]
+    import httpx
+
+    data = {
+        "currency_type": "fiat",
+        "fiat": "RUB",
+        "amount": str(tier["price_rub"]),
+        "description": f"Доступ «{tier['name']}» на {tier['days']} дн.",
+        "payload": f"{user['id']}:{tkey}",
+        "expires_in": 3600,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post(f"{CRYPTOBOT_API}/createInvoice", json=data,
+                             headers={"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN})
+            j = r.json()
+    except Exception as e:
+        return JSONResponse({"error": f"CryptoBot недоступен: {e}"}, status_code=502)
+    if not j.get("ok"):
+        return JSONResponse({"error": f"CryptoBot: {j.get('error')}"}, status_code=502)
+    inv = j["result"]
+    users = load_users()
+    for u in users:
+        if u["id"] == user["id"]:
+            u["pending_invoice"] = inv["invoice_id"]
+            break
+    save_users(users)
+    pay_url = inv.get("bot_invoice_url") or inv.get("mini_app_invoice_url") or inv.get("pay_url")
+    return {"pay_url": pay_url, "invoice_id": inv["invoice_id"], "amount": tier["price_rub"]}
+
+
+@app.post("/api/billing/check")
+async def billing_check(user=Depends(require_user)):
+    u = get_user(user["id"])
+    inv_id = (u or {}).get("pending_invoice")
+    if not inv_id or not CRYPTOBOT_TOKEN:
+        return {"active": _sub_active(u), "paid": False, "days_left": _days_left(u)}
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(f"{CRYPTOBOT_API}/getInvoices",
+                            params={"invoice_ids": str(inv_id)},
+                            headers={"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN})
+            j = r.json()
+    except Exception as e:
+        return JSONResponse({"error": f"CryptoBot недоступен: {e}"}, status_code=502)
+    items = (j.get("result") or {}).get("items") or []
+    paid = any(it.get("status") == "paid" for it in items)
+    if paid:
+        _extend_subscription(user["id"], _tier_key(u), TIERS[_tier_key(u)]["days"], clear_invoice=inv_id)
+        u2 = get_user(user["id"])
+        return {"active": True, "paid": True, "paid_until": u2.get("paid_until"), "days_left": _days_left(u2)}
+    return {"active": _sub_active(u), "paid": False, "days_left": _days_left(u)}
+
+
 # ---------------------------------------------------------------------------
 # Модели запросов
 # ---------------------------------------------------------------------------
@@ -832,7 +1021,7 @@ async def list_profiles(user=Depends(require_user)):
 
 
 @app.post("/api/profiles")
-async def create_profile(body: CreateProfileIn, user=Depends(require_user)):
+async def create_profile(body: CreateProfileIn, user=Depends(require_active)):
     name = body.name.strip() or "Аккаунт"
     api_id = body.api_id.strip()
     api_hash = body.api_hash.strip()
@@ -840,6 +1029,16 @@ async def create_profile(body: CreateProfileIn, user=Depends(require_user)):
         return JSONResponse({"error": "api_id должен состоять только из цифр"}, status_code=400)
     if not _valid_hash(api_hash):
         return JSONResponse({"error": "api_hash должен быть ровно 32 hex-символа"}, status_code=400)
+
+    # Лимит аккаунтов по тарифу (админа не ограничиваем)
+    if not user.get("is_admin"):
+        tier = TIERS[_tier_key(user)]
+        mine = [p for p in load_profiles() if p.get("owner") == user["id"]]
+        if len(mine) >= tier["max_accounts"]:
+            return JSONResponse(
+                {"error": f"На тарифе «{tier['name']}» лимит аккаунтов: {tier['max_accounts']}. Нужен тариф повыше."},
+                status_code=403,
+            )
 
     pid = uuid.uuid4().hex[:8]
     profiles = load_profiles()
@@ -874,7 +1073,7 @@ async def delete_profile(pid: str, user=Depends(require_user)):
 # Вход в профиль
 # ---------------------------------------------------------------------------
 @app.post("/api/profiles/{pid}/login/send_code")
-async def send_code(pid: str, body: PhoneIn, user=Depends(require_user)):
+async def send_code(pid: str, body: PhoneIn, user=Depends(require_active)):
     _owned_profile(pid, user)
     client = await get_client(pid)
     if client is None:
@@ -917,7 +1116,7 @@ async def send_code(pid: str, body: PhoneIn, user=Depends(require_user)):
 
 
 @app.post("/api/profiles/{pid}/login/sign_in")
-async def sign_in(pid: str, body: CodeIn, user=Depends(require_user)):
+async def sign_in(pid: str, body: CodeIn, user=Depends(require_active)):
     _owned_profile(pid, user)
     client = await get_client(pid)
     login = state.login.get(pid, {})
@@ -938,7 +1137,7 @@ async def sign_in(pid: str, body: CodeIn, user=Depends(require_user)):
 
 
 @app.post("/api/profiles/{pid}/login/password")
-async def login_password(pid: str, body: PasswordIn, user=Depends(require_user)):
+async def login_password(pid: str, body: PasswordIn, user=Depends(require_active)):
     _owned_profile(pid, user)
     client = await get_client(pid)
     if client is None:
@@ -966,7 +1165,7 @@ def _qr_svg(data):
 
 
 @app.post("/api/profiles/{pid}/login/qr")
-async def login_qr_start(pid: str, user=Depends(require_user)):
+async def login_qr_start(pid: str, user=Depends(require_active)):
     _owned_profile(pid, user)
     client = await get_client(pid)
     if client is None:
@@ -982,7 +1181,7 @@ async def login_qr_start(pid: str, user=Depends(require_user)):
 
 
 @app.post("/api/profiles/{pid}/login/qr/poll")
-async def login_qr_poll(pid: str, user=Depends(require_user)):
+async def login_qr_poll(pid: str, user=Depends(require_active)):
     _owned_profile(pid, user)
     qr = state.login.get(pid, {}).get("qr")
     if qr is None:
@@ -1051,7 +1250,7 @@ async def search(pid: str, q: str = "", user=Depends(require_user)):
 # Немедленная отправка
 # ---------------------------------------------------------------------------
 @app.post("/api/profiles/{pid}/send")
-async def send_now(pid: str, body: SendIn, user=Depends(require_user)):
+async def send_now(pid: str, body: SendIn, user=Depends(require_active)):
     profile = _owned_profile(pid, user)
     if _on_cooldown(profile):
         return JSONResponse(
@@ -1109,7 +1308,7 @@ async def get_schedules(pid: str, user=Depends(require_user)):
 
 
 @app.post("/api/profiles/{pid}/schedules")
-async def create_schedule(pid: str, body: ScheduleIn, user=Depends(require_user)):
+async def create_schedule(pid: str, body: ScheduleIn, user=Depends(require_active)):
     _owned_profile(pid, user)
     if not body.text.strip():
         return JSONResponse({"error": "Пустое сообщение"}, status_code=400)

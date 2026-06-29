@@ -206,10 +206,22 @@
   </div>
 </div>
 
+<!-- ============ Экран оплаты ============ -->
+<div id="screen-pay" class="wrap hidden">
+  <div class="topbar"><h1>Доступ</h1><button class="btn ghost" onclick="logout()">Выйти</button></div>
+  <div class="section" style="max-width:420px;margin:0 auto;text-align:center">
+    <div id="pay-info"></div>
+    <button class="btn full" id="pay-btn" onclick="startPay()" style="margin-top:16px">Оплатить криптой</button>
+    <button class="btn ghost full" id="pay-check" onclick="checkPayOnce()" style="margin-top:10px;display:none">Я оплатил — проверить</button>
+    <div class="hint" id="pay-status" style="margin-top:14px"></div>
+  </div>
+</div>
+
 <!-- ============ Экран профилей ============ -->
 <div id="screen-profiles" class="wrap hidden">
   <div class="topbar">
     <h1>Профили Telegram</h1>
+    <span id="days-left" class="hint" style="margin-right:6px"></span>
     <button class="btn ghost" id="btn-admin" onclick="openAdmin()" style="display:none">Пользователи</button>
     <button class="btn ghost" onclick="logout()">Выйти</button>
   </div>
@@ -409,6 +421,9 @@ let state = {
   qrActive: false,
   schedMode: "daily",   // "daily" | "interval"
   profilesById: {},
+  billing: null,
+  tiers: null,
+  payPolls: 0,
 };
 
 // ---------- helpers ----------
@@ -418,6 +433,9 @@ async function api(path, opts) {
   try { data = await res.json(); } catch (e) {}
   if (res.status === 401 && !path.startsWith("/api/auth/")) {
     showAuth();  // сессия истекла или пользователь заблокирован
+  }
+  if (res.status === 402 && !path.startsWith("/api/billing/")) {
+    handlePaywall();  // подписка неактивна — показываем оплату
   }
   return { ok: res.ok, data };
 }
@@ -908,7 +926,7 @@ async function loadSchedules() {
 let authMode = "login";
 
 function showScreen(id) {
-  for (const s of ["screen-auth", "screen-profiles", "screen-compose", "screen-admin"])
+  for (const s of ["screen-auth", "screen-pay", "screen-profiles", "screen-compose", "screen-admin"])
     el(s).classList.toggle("hidden", s !== id);
 }
 
@@ -947,10 +965,71 @@ async function submitAuth() {
   enterApp();
 }
 
-function enterApp() {
+async function enterApp() {
   el("btn-admin").style.display = (state.me && state.me.is_admin) ? "" : "none";
+  const { data: bill } = await api("/api/billing/info");
+  state.billing = bill || {};
+  renderDaysLeft();
+  if (!state.billing.active) { showPay(); return; }
   showScreen("screen-profiles");
   loadProfiles();
+}
+
+function renderDaysLeft() {
+  const b = state.billing || {};
+  const span = el("days-left");
+  if (state.me && state.me.is_admin) { span.textContent = "админ"; return; }
+  span.textContent = b.active ? `доступ: ${b.days_left} дн` : "не оплачен";
+}
+
+// ---------- оплата ----------
+function showPay() {
+  const b = state.billing || {};
+  const t = b.tier || {};
+  el("pay-info").innerHTML =
+    `<div style="font-size:17px;margin-bottom:8px">Доступ неактивен</div>
+     <div class="hint">Тариф «${escapeHtml(t.name || "Старт")}» — <b>${t.price_rub || ""} ₽</b> за ${t.days || 7} дней.</div>`;
+  el("pay-status").textContent = "";
+  el("pay-check").style.display = "none";
+  if (b.crypto_enabled) {
+    el("pay-btn").style.display = "";
+  } else {
+    el("pay-btn").style.display = "none";
+    el("pay-status").innerHTML = "Автооплата пока не настроена. Напиши администратору, чтобы выдал доступ.";
+  }
+  showScreen("screen-pay");
+}
+
+async function startPay() {
+  el("pay-status").textContent = "Создаю счёт…";
+  const { ok, data } = await post("/api/billing/invoice");
+  if (!ok) { el("pay-status").textContent = data.error || "Ошибка"; return; }
+  window.open(data.pay_url, "_blank");
+  el("pay-status").innerHTML = "Счёт открыт в CryptoBot. Оплати — доступ откроется автоматически.<br>Жду оплату…";
+  el("pay-check").style.display = "";
+  state.payPolls = 0;
+  pollPay();
+}
+
+async function pollPay() {
+  if (el("screen-pay").classList.contains("hidden")) return;
+  state.payPolls = (state.payPolls || 0) + 1;
+  const { ok, data } = await post("/api/billing/check");
+  if (ok && data.paid) { toast("Оплата получена ✓ Доступ открыт", "ok"); return enterApp(); }
+  if (state.payPolls < 120) setTimeout(pollPay, 3000);   // опрос ~6 минут
+}
+
+async function checkPayOnce() {
+  el("pay-status").textContent = "Проверяю оплату…";
+  const { ok, data } = await post("/api/billing/check");
+  if (ok && data.paid) { toast("Оплата получена ✓", "ok"); return enterApp(); }
+  el("pay-status").textContent = "Оплата ещё не пришла. Если только что оплатил — подожди минуту и проверь снова.";
+}
+
+async function handlePaywall() {
+  const { data } = await api("/api/billing/info");
+  state.billing = data || {};
+  showPay();
 }
 
 async function checkAuth() {
@@ -965,7 +1044,14 @@ async function logout() {
 }
 
 // ---------- админка: пользователи ----------
-function openAdmin() { showScreen("screen-admin"); loadAdminUsers(); }
+async function openAdmin() {
+  showScreen("screen-admin");
+  if (!state.tiers) {
+    const { data } = await api("/api/tiers");
+    state.tiers = (data && data.tiers) || {};
+  }
+  loadAdminUsers();
+}
 
 const USTATUS = { approved: "✅ одобрен", pending: "⏳ ждёт одобрения", blocked: "⛔ заблокирован" };
 
@@ -975,36 +1061,54 @@ async function loadAdminUsers() {
   const { ok, data } = await api("/api/admin/users");
   if (!ok) { box.innerHTML = `<div class="hint">${escapeHtml(data.error || "Ошибка")}</div>`; return; }
   box.innerHTML = "";
+  const tierOpts = Object.entries(state.tiers || {}).map(([k, t]) =>
+    `<option value="${k}">${escapeHtml(t.name)} (${t.price_rub}₽)</option>`).join("");
   for (const u of (data.users || [])) {
     const me = state.me && u.id === state.me.id;
     const item = document.createElement("div");
     item.className = "sched-item";
+    const sub = u.is_admin ? "♾ админ (безлимит)"
+      : (u.sub_active ? `✅ оплачен · осталось ${u.days_left} дн · тариф ${escapeHtml(u.tier)}`
+                      : `⛔ доступ не оплачен · тариф ${escapeHtml(u.tier)}`);
     let actions = "";
     if (!me) {
       if (u.status !== "approved") actions += `<button class="btn" data-act="approve">Одобрить</button>`;
       if (u.status !== "blocked") actions += `<button class="btn ghost" data-act="block">Заблокировать</button>`;
+      if (!u.is_admin) {
+        actions += `<select class="adm-tier" style="padding:7px">${tierOpts}</select>`;
+        actions += `<button class="btn" data-act="week">+7 дней</button>`;
+        actions += `<button class="btn ghost" data-act="month">+30 дней</button>`;
+      }
       actions += `<button class="btn danger" data-act="delete">Удалить</button>`;
     }
     item.innerHTML = `
       <div class="si-main">
         <div class="si-when">${escapeHtml(u.username)}${u.is_admin ? " · админ" : ""}${me ? " · это ты" : ""}</div>
-        <div class="si-to">${USTATUS[u.status] || u.status}${u.created ? " · с " + escapeHtml(u.created) : ""}</div>
+        <div class="si-to">${USTATUS[u.status] || u.status} · ${sub}</div>
       </div>
-      <div style="display:flex;flex-direction:column;gap:6px">${actions}</div>`;
-    item.querySelectorAll("button").forEach(b => { b.onclick = () => adminAction(u, b.dataset.act); });
+      <div style="display:flex;flex-direction:column;gap:6px;min-width:150px">${actions}</div>`;
+    const sel = item.querySelector(".adm-tier");
+    if (sel) sel.value = u.tier;
+    item.querySelectorAll("button").forEach(b => { b.onclick = () => adminAction(u, b.dataset.act, item); });
     box.appendChild(item);
   }
 }
 
-async function adminAction(u, act) {
+async function adminAction(u, act, item) {
   if (act === "delete") {
     if (!confirm(`Удалить пользователя «${u.username}» со всеми его аккаунтами и расписаниями?`)) return;
     const { ok, data } = await api(`/api/admin/users/${u.id}`, { method: "DELETE" });
     if (!ok) return toast(data.error || "Ошибка", "bad");
-  } else {
+  } else if (act === "approve" || act === "block") {
     const status = act === "approve" ? "approved" : "blocked";
     const { ok, data } = await post(`/api/admin/users/${u.id}/status`, { status });
     if (!ok) return toast(data.error || "Ошибка", "bad");
+  } else if (act === "week" || act === "month") {
+    const tier = item.querySelector(".adm-tier") ? item.querySelector(".adm-tier").value : undefined;
+    const add_days = act === "week" ? 7 : 30;
+    const { ok, data } = await post(`/api/admin/users/${u.id}/subscription`, { tier, add_days });
+    if (!ok) return toast(data.error || "Ошибка", "bad");
+    toast(`Продлено на ${add_days} дн ✓`, "ok");
   }
   loadAdminUsers();
 }
