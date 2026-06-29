@@ -2,16 +2,29 @@ services:
   scheduler:
     build: .
     restart: unless-stopped
-    ports:
-      # наружу слушаем 8000; через Caddy (см. DEPLOY.md) будет HTTPS
-      - "8000:8000"
     environment:
-      # ОБЯЗАТЕЛЬНО задай пароль — без него панель открыта всем.
-      # Значения берутся из файла .env рядом с этим compose.
-      PANEL_USER: ${PANEL_USER:-admin}
-      PANEL_PASSWORD: ${PANEL_PASSWORD:?Задай PANEL_PASSWORD в .env}
       # Часовой пояс для расписаний (иначе UTC). Пример: Europe/Moscow, Asia/Almaty
       TZ: ${TZ:-UTC}
+      # SECRET_KEY можно не задавать — сгенерируется и сохранится в
+      # profiles/secret.key (тогда сессии входа переживают перезапуск).
     volumes:
-      # сессии и расписания переживают перезапуски/пересборку контейнера
+      # профили, расписания, пользователи, ключ подписи — переживают перезапуски
       - ./profiles:/app/profiles
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # домен панели (берётся из .env), на него Caddy получит HTTPS-сертификат
+      PANEL_DOMAIN: ${PANEL_DOMAIN:?Задай PANEL_DOMAIN в .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -21,7 +21,8 @@ Telegram планировщик постов — веб-панель.
 """
 
 import asyncio
-import base64
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -29,7 +30,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -50,9 +51,31 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROFILES_DIR = os.path.join(BASE_DIR, "profiles")
 PROFILES_JSON = os.path.join(PROFILES_DIR, "profiles.json")
 SCHEDULES_JSON = os.path.join(PROFILES_DIR, "schedules.json")
+USERS_JSON = os.path.join(PROFILES_DIR, "users.json")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 os.makedirs(PROFILES_DIR, exist_ok=True)
+
+# Ключ для подписи cookie-сессий. Берём из env SECRET_KEY либо генерируем и
+# сохраняем в profiles/secret.key (тогда сессии переживают перезапуск сервера).
+SECRET_KEY = os.environ.get("SECRET_KEY")
+if not SECRET_KEY:
+    _key_path = os.path.join(PROFILES_DIR, "secret.key")
+    if os.path.exists(_key_path):
+        with open(_key_path, "r", encoding="utf-8") as f:
+            SECRET_KEY = f.read().strip()
+    else:
+        SECRET_KEY = secrets.token_hex(32)
+        with open(_key_path, "w", encoding="utf-8") as f:
+            f.write(SECRET_KEY)
+        try:
+            os.chmod(_key_path, 0o600)
+        except OSError:
+            pass
+
+# secure-флаг для cookie. По умолчанию включён (мы за HTTPS через Caddy).
+# Для локального запуска по http можно выставить COOKIE_SECURE=0.
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"
 
 
 def _valid_hash(value):
@@ -106,6 +129,112 @@ def load_schedules():
 
 def save_schedules(schedules):
     _write_json(SCHEDULES_JSON, {"schedules": schedules})
+
+
+# ---------------------------------------------------------------------------
+# Пользователи и аутентификация
+# ---------------------------------------------------------------------------
+# Модель доступа:
+#   • человек регистрируется (логин + пароль) → статус "pending";
+#   • войти и пользоваться можно только после одобрения админом ("approved");
+#   • первый зарегистрированный пользователь автоматически становится админом;
+#   • каждый видит только свои Telegram-профили и расписания (поле owner);
+#   • заблокированный ("blocked") пользователь не входит, его рассылки не идут.
+def load_users():
+    return _read_json(USERS_JSON, {"users": []})["users"]
+
+
+def save_users(users):
+    _write_json(USERS_JSON, {"users": users})
+
+
+def get_user(uid):
+    for u in load_users():
+        if u["id"] == uid:
+            return u
+    return None
+
+
+def get_user_by_name(username):
+    uname = (username or "").strip().lower()
+    for u in load_users():
+        if u["username"].lower() == uname:
+            return u
+    return None
+
+
+def _hash_pw(password, salt=None):
+    if salt is None:
+        salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100_000)
+    return salt, dk.hex()
+
+
+def _verify_pw(password, salt, expected):
+    _, h = _hash_pw(password, salt)
+    return secrets.compare_digest(h, expected)
+
+
+def _sign_token(uid):
+    sig = hmac.new(SECRET_KEY.encode("utf-8"), uid.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{uid}.{sig}"
+
+
+def _verify_token(token):
+    if not token or "." not in token:
+        return None
+    uid, _, sig = token.partition(".")
+    expected = hmac.new(SECRET_KEY.encode("utf-8"), uid.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not secrets.compare_digest(sig, expected):
+        return None
+    return uid
+
+
+def _user_public(u):
+    return {
+        "id": u["id"],
+        "username": u["username"],
+        "status": u.get("status"),
+        "is_admin": bool(u.get("is_admin")),
+        "created": u.get("created"),
+    }
+
+
+def _current_user(request: Request):
+    """Возвращает пользователя по cookie-сессии (только одобренного) или None."""
+    uid = _verify_token(request.cookies.get("session"))
+    if not uid:
+        return None
+    u = get_user(uid)
+    if not u or u.get("status") != "approved":
+        return None
+    return u
+
+
+async def require_user(request: Request):
+    u = _current_user(request)
+    if not u:
+        raise HTTPException(status_code=401, detail="Не авторизован")
+    return u
+
+
+async def require_admin(request: Request):
+    u = _current_user(request)
+    if not u or not u.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Только для администратора")
+    return u
+
+
+def _set_session_cookie(resp, uid):
+    resp.set_cookie(
+        "session",
+        _sign_token(uid),
+        max_age=60 * 60 * 24 * 30,
+        httponly=True,
+        samesite="lax",
+        secure=COOKIE_SECURE,
+        path="/",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +372,13 @@ async def _scheduler_loop():
                 if not rule.get("enabled", True):
                     continue
 
+                # Расписания заблокированных/удалённых пользователей не отправляем
+                owner = rule.get("owner")
+                if owner is not None:
+                    ou = get_user(owner)
+                    if ou is None or ou.get("status") != "approved":
+                        continue
+
                 # Чистим прошедшие конкретные даты у разовых правил
                 if rule.get("dates"):
                     fresh = [d for d in rule["dates"] if d >= today]
@@ -290,44 +426,145 @@ app = FastAPI(lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
-# Защита паролем (HTTP Basic Auth)
+# Регистрация / вход / выход
 # ---------------------------------------------------------------------------
-# Панель даёт доступ к Telegram-аккаунтам, поэтому в облаке её НЕЛЬЗЯ
-# выставлять без пароля. Логин/пароль берём из переменных окружения:
-#   PANEL_USER     — имя пользователя (по умолчанию "admin")
-#   PANEL_PASSWORD — пароль (если не задан, защита выключена — только для
-#                    локального запуска на 127.0.0.1)
-PANEL_USER = os.environ.get("PANEL_USER", "admin")
-PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD")
-
-if not PANEL_PASSWORD:
-    print(
-        "[auth] ВНИМАНИЕ: PANEL_PASSWORD не задан — панель открыта без пароля. "
-        "Это безопасно только для локального запуска (127.0.0.1). "
-        "Перед публикацией в интернет задай PANEL_PASSWORD."
-    )
+class RegisterIn(BaseModel):
+    username: str
+    password: str
 
 
-@app.middleware("http")
-async def basic_auth(request: Request, call_next):
-    if PANEL_PASSWORD:
-        header = request.headers.get("Authorization", "")
-        ok = False
-        if header.startswith("Basic "):
-            try:
-                decoded = base64.b64decode(header[6:]).decode("utf-8")
-                user, _, pw = decoded.partition(":")
-                ok = secrets.compare_digest(user, PANEL_USER) and secrets.compare_digest(
-                    pw, PANEL_PASSWORD
-                )
-            except Exception:
-                ok = False
-        if not ok:
-            return Response(
-                status_code=401,
-                headers={"WWW-Authenticate": 'Basic realm="Telegram Scheduler"'},
-            )
-    return await call_next(request)
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+def _claim_orphan_data(uid):
+    """Привязывает профили/расписания без владельца к первому админу."""
+    profiles = load_profiles()
+    changed = False
+    for p in profiles:
+        if not p.get("owner"):
+            p["owner"] = uid
+            changed = True
+    if changed:
+        save_profiles(profiles)
+    schedules = load_schedules()
+    changed = False
+    for s in schedules:
+        if not s.get("owner"):
+            s["owner"] = uid
+            changed = True
+    if changed:
+        save_schedules(schedules)
+
+
+@app.post("/api/auth/register")
+async def register(body: RegisterIn):
+    username = body.username.strip()
+    password = body.password
+    if len(username) < 3:
+        return JSONResponse({"error": "Логин — минимум 3 символа"}, status_code=400)
+    if len(password) < 6:
+        return JSONResponse({"error": "Пароль — минимум 6 символов"}, status_code=400)
+    if get_user_by_name(username):
+        return JSONResponse({"error": "Такой логин уже занят"}, status_code=400)
+
+    users = load_users()
+    is_first = len(users) == 0
+    salt, pw_hash = _hash_pw(password)
+    uid = uuid.uuid4().hex[:8]
+    user = {
+        "id": uid,
+        "username": username,
+        "salt": salt,
+        "pw_hash": pw_hash,
+        "status": "approved" if is_first else "pending",
+        "is_admin": is_first,
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    users.append(user)
+    save_users(users)
+
+    if is_first:
+        # Первый пользователь — админ. Забираем старые профили без владельца.
+        _claim_orphan_data(uid)
+        resp = JSONResponse({"step": "ready", "user": _user_public(user)})
+        _set_session_cookie(resp, uid)
+        return resp
+
+    return JSONResponse({"step": "pending"})
+
+
+@app.post("/api/auth/login")
+async def login(body: LoginIn):
+    user = get_user_by_name(body.username)
+    if not user or not _verify_pw(body.password, user["salt"], user["pw_hash"]):
+        return JSONResponse({"error": "Неверный логин или пароль"}, status_code=400)
+    if user.get("status") == "pending":
+        return JSONResponse({"error": "Аккаунт ждёт одобрения администратором"}, status_code=403)
+    if user.get("status") == "blocked":
+        return JSONResponse({"error": "Аккаунт заблокирован"}, status_code=403)
+    resp = JSONResponse({"step": "ready", "user": _user_public(user)})
+    _set_session_cookie(resp, user["id"])
+    return resp
+
+
+@app.post("/api/auth/logout")
+async def logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie("session", path="/")
+    return resp
+
+
+@app.get("/api/auth/me")
+async def auth_me(request: Request):
+    u = _current_user(request)
+    if not u:
+        return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    return {"user": _user_public(u)}
+
+
+# ---------------------------------------------------------------------------
+# Админка: управление пользователями
+# ---------------------------------------------------------------------------
+class UserStatusIn(BaseModel):
+    status: str  # "approved" | "blocked"
+
+
+@app.get("/api/admin/users")
+async def admin_list_users(admin=Depends(require_admin)):
+    return {"users": [_user_public(u) for u in load_users()]}
+
+
+@app.post("/api/admin/users/{uid}/status")
+async def admin_set_status(uid: str, body: UserStatusIn, admin=Depends(require_admin)):
+    if body.status not in ("approved", "blocked"):
+        return JSONResponse({"error": "Неверный статус"}, status_code=400)
+    if uid == admin["id"]:
+        return JSONResponse({"error": "Нельзя менять статус самому себе"}, status_code=400)
+    users = load_users()
+    target = next((u for u in users if u["id"] == uid), None)
+    if not target:
+        return JSONResponse({"error": "Пользователь не найден"}, status_code=404)
+    target["status"] = body.status
+    save_users(users)
+    return {"ok": True, "user": _user_public(target)}
+
+
+@app.delete("/api/admin/users/{uid}")
+async def admin_delete_user(uid: str, admin=Depends(require_admin)):
+    if uid == admin["id"]:
+        return JSONResponse({"error": "Нельзя удалить самого себя"}, status_code=400)
+    users = load_users()
+    if not any(u["id"] == uid for u in users):
+        return JSONResponse({"error": "Пользователь не найден"}, status_code=404)
+
+    # Удаляем профили пользователя (вместе с сессиями Telegram) и его расписания.
+    for p in [p for p in load_profiles() if p.get("owner") == uid]:
+        await _destroy_profile(p)
+    save_schedules([s for s in load_schedules() if s.get("owner") != uid])
+    save_users([u for u in users if u["id"] != uid])
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -385,55 +622,17 @@ async def _profile_status(pid):
     return "code" if state.login.get(pid, {}).get("phone_code_hash") else "phone"
 
 
-@app.get("/api/profiles")
-async def list_profiles():
-    out = []
-    for p in load_profiles():
-        try:
-            client = await get_client(p["id"])
-            authorized = bool(client and await client.is_user_authorized())
-        except Exception:
-            authorized = False
-        out.append({"id": p["id"], "name": p["name"], "authorized": authorized})
-    return {"profiles": out}
-
-
-@app.post("/api/profiles")
-async def create_profile(body: CreateProfileIn):
-    name = body.name.strip() or "Аккаунт"
-    api_id = body.api_id.strip()
-    api_hash = body.api_hash.strip()
-    if not api_id.isdigit():
-        return JSONResponse({"error": "api_id должен состоять только из цифр"}, status_code=400)
-    if not _valid_hash(api_hash):
-        return JSONResponse({"error": "api_hash должен быть ровно 32 hex-символа"}, status_code=400)
-
-    pid = uuid.uuid4().hex[:8]
-    profiles = load_profiles()
-    profiles.append({"id": pid, "name": name, "api_id": int(api_id), "api_hash": api_hash})
-    save_profiles(profiles)
-    state.login[pid] = {"phone": None, "phone_code_hash": None}
-    return {"id": pid, "step": "phone"}
-
-
-@app.get("/api/profiles/{pid}/status")
-async def profile_status(pid: str):
-    if get_profile(pid) is None:
-        return JSONResponse({"error": "Профиль не найден"}, status_code=404)
-    step = await _profile_status(pid)
-    if step == "ready":
-        client = await get_client(pid)
-        me = await client.get_me()
-        return {"step": "ready", "me": {"id": me.id, "name": me.first_name or "", "username": me.username or ""}}
-    return {"step": step}
-
-
-@app.delete("/api/profiles/{pid}")
-async def delete_profile(pid: str):
+def _owned_profile(pid, user):
+    """Профиль, принадлежащий пользователю, иначе HTTPException 404."""
     profile = get_profile(pid)
-    if profile is None:
-        return JSONResponse({"error": "Профиль не найден"}, status_code=404)
+    if profile is None or profile.get("owner") != user["id"]:
+        raise HTTPException(status_code=404, detail="Профиль не найден")
+    return profile
 
+
+async def _destroy_profile(profile):
+    """Отзывает сессию Telegram и удаляет файлы сессии профиля."""
+    pid = profile["id"]
     client = state.clients.pop(pid, None)
     if client is None:
         try:
@@ -451,7 +650,6 @@ async def delete_profile(pid: str):
         except Exception:
             pass
 
-    # Удаляем файлы сессии
     for suffix in (".session", ".session-journal"):
         path = _session_path(profile) + suffix
         if os.path.exists(path):
@@ -459,11 +657,60 @@ async def delete_profile(pid: str):
                 os.remove(path)
             except OSError:
                 pass
-
-    save_profiles([p for p in load_profiles() if p["id"] != pid])
-    save_schedules([s for s in load_schedules() if s["profile_id"] != pid])
     state.login.pop(pid, None)
     state.entities.pop(pid, None)
+
+
+@app.get("/api/profiles")
+async def list_profiles(user=Depends(require_user)):
+    out = []
+    for p in load_profiles():
+        if p.get("owner") != user["id"]:
+            continue
+        try:
+            client = await get_client(p["id"])
+            authorized = bool(client and await client.is_user_authorized())
+        except Exception:
+            authorized = False
+        out.append({"id": p["id"], "name": p["name"], "authorized": authorized})
+    return {"profiles": out}
+
+
+@app.post("/api/profiles")
+async def create_profile(body: CreateProfileIn, user=Depends(require_user)):
+    name = body.name.strip() or "Аккаунт"
+    api_id = body.api_id.strip()
+    api_hash = body.api_hash.strip()
+    if not api_id.isdigit():
+        return JSONResponse({"error": "api_id должен состоять только из цифр"}, status_code=400)
+    if not _valid_hash(api_hash):
+        return JSONResponse({"error": "api_hash должен быть ровно 32 hex-символа"}, status_code=400)
+
+    pid = uuid.uuid4().hex[:8]
+    profiles = load_profiles()
+    profiles.append({"id": pid, "name": name, "api_id": int(api_id), "api_hash": api_hash, "owner": user["id"]})
+    save_profiles(profiles)
+    state.login[pid] = {"phone": None, "phone_code_hash": None}
+    return {"id": pid, "step": "phone"}
+
+
+@app.get("/api/profiles/{pid}/status")
+async def profile_status(pid: str, user=Depends(require_user)):
+    _owned_profile(pid, user)
+    step = await _profile_status(pid)
+    if step == "ready":
+        client = await get_client(pid)
+        me = await client.get_me()
+        return {"step": "ready", "me": {"id": me.id, "name": me.first_name or "", "username": me.username or ""}}
+    return {"step": step}
+
+
+@app.delete("/api/profiles/{pid}")
+async def delete_profile(pid: str, user=Depends(require_user)):
+    profile = _owned_profile(pid, user)
+    await _destroy_profile(profile)
+    save_profiles([p for p in load_profiles() if p["id"] != pid])
+    save_schedules([s for s in load_schedules() if s["profile_id"] != pid])
     return {"ok": True}
 
 
@@ -471,7 +718,8 @@ async def delete_profile(pid: str):
 # Вход в профиль
 # ---------------------------------------------------------------------------
 @app.post("/api/profiles/{pid}/login/send_code")
-async def send_code(pid: str, body: PhoneIn):
+async def send_code(pid: str, body: PhoneIn, user=Depends(require_user)):
+    _owned_profile(pid, user)
     client = await get_client(pid)
     if client is None:
         return JSONResponse({"error": "Профиль не найден"}, status_code=404)
@@ -513,7 +761,8 @@ async def send_code(pid: str, body: PhoneIn):
 
 
 @app.post("/api/profiles/{pid}/login/sign_in")
-async def sign_in(pid: str, body: CodeIn):
+async def sign_in(pid: str, body: CodeIn, user=Depends(require_user)):
+    _owned_profile(pid, user)
     client = await get_client(pid)
     login = state.login.get(pid, {})
     if client is None or not login.get("phone_code_hash"):
@@ -533,7 +782,8 @@ async def sign_in(pid: str, body: CodeIn):
 
 
 @app.post("/api/profiles/{pid}/login/password")
-async def login_password(pid: str, body: PasswordIn):
+async def login_password(pid: str, body: PasswordIn, user=Depends(require_user)):
+    _owned_profile(pid, user)
     client = await get_client(pid)
     if client is None:
         return JSONResponse({"error": "Профиль не найден"}, status_code=404)
@@ -549,7 +799,8 @@ async def login_password(pid: str, body: PasswordIn):
 # Поиск чатов
 # ---------------------------------------------------------------------------
 @app.get("/api/profiles/{pid}/search")
-async def search(pid: str, q: str = ""):
+async def search(pid: str, q: str = "", user=Depends(require_user)):
+    _owned_profile(pid, user)
     client = await get_client(pid)
     if client is None or not await client.is_user_authorized():
         return JSONResponse({"error": "Не авторизован"}, status_code=401)
@@ -588,7 +839,8 @@ async def search(pid: str, q: str = ""):
 # Немедленная отправка
 # ---------------------------------------------------------------------------
 @app.post("/api/profiles/{pid}/send")
-async def send_now(pid: str, body: SendIn):
+async def send_now(pid: str, body: SendIn, user=Depends(require_user)):
+    _owned_profile(pid, user)
     client = await get_client(pid)
     if client is None or not await client.is_user_authorized():
         return JSONResponse({"error": "Не авторизован"}, status_code=401)
@@ -620,14 +872,14 @@ def _validate_time(t):
 
 
 @app.get("/api/profiles/{pid}/schedules")
-async def get_schedules(pid: str):
+async def get_schedules(pid: str, user=Depends(require_user)):
+    _owned_profile(pid, user)
     return {"schedules": [s for s in load_schedules() if s["profile_id"] == pid]}
 
 
 @app.post("/api/profiles/{pid}/schedules")
-async def create_schedule(pid: str, body: ScheduleIn):
-    if get_profile(pid) is None:
-        return JSONResponse({"error": "Профиль не найден"}, status_code=404)
+async def create_schedule(pid: str, body: ScheduleIn, user=Depends(require_user)):
+    _owned_profile(pid, user)
     if not body.text.strip():
         return JSONResponse({"error": "Пустое сообщение"}, status_code=400)
     if not body.targets:
@@ -638,6 +890,7 @@ async def create_schedule(pid: str, body: ScheduleIn):
     rule = {
         "id": uuid.uuid4().hex[:8],
         "profile_id": pid,
+        "owner": user["id"],
         "targets": [t.model_dump() for t in body.targets],
         "text": body.text,
         "time": body.time,
@@ -654,7 +907,8 @@ async def create_schedule(pid: str, body: ScheduleIn):
 
 
 @app.delete("/api/profiles/{pid}/schedules/{sid}")
-async def delete_schedule(pid: str, sid: str):
+async def delete_schedule(pid: str, sid: str, user=Depends(require_user)):
+    _owned_profile(pid, user)
     schedules = load_schedules()
     new = [s for s in schedules if not (s["id"] == sid and s["profile_id"] == pid)]
     if len(new) == len(schedules):

@@ -191,9 +191,28 @@
 </head>
 <body>
 
+<!-- ============ Экран входа / регистрации ============ -->
+<div id="screen-auth" class="wrap hidden">
+  <div class="topbar"><h1 id="auth-title">Вход</h1></div>
+  <div class="section" style="max-width:380px;margin:0 auto">
+    <label>Логин</label>
+    <input id="auth-user" autocomplete="username" placeholder="Твой логин" />
+    <label>Пароль</label>
+    <input id="auth-pass" type="password" autocomplete="current-password" placeholder="Пароль"
+           onkeydown="if(event.key==='Enter')submitAuth()" />
+    <div class="err" id="auth-err"></div>
+    <button class="btn full" id="auth-submit" style="margin-top:14px" onclick="submitAuth()">Войти</button>
+    <div class="hint" id="auth-switch" style="margin-top:14px;text-align:center"></div>
+  </div>
+</div>
+
 <!-- ============ Экран профилей ============ -->
-<div id="screen-profiles" class="wrap">
-  <div class="topbar"><h1>Профили Telegram</h1></div>
+<div id="screen-profiles" class="wrap hidden">
+  <div class="topbar">
+    <h1>Профили Telegram</h1>
+    <button class="btn ghost" id="btn-admin" onclick="openAdmin()" style="display:none">Пользователи</button>
+    <button class="btn ghost" onclick="logout()">Выйти</button>
+  </div>
   <div class="hint" style="margin-bottom:16px">Выбери аккаунт, чтобы настроить отправку постов по чатам. Или добавь новый.</div>
   <div class="profiles" id="profiles-grid"></div>
 </div>
@@ -255,6 +274,16 @@
   </div>
 </div>
 
+<!-- ============ Экран пользователей (админ) ============ -->
+<div id="screen-admin" class="wrap hidden">
+  <div class="topbar">
+    <button class="back" onclick="goProfiles()">←</button>
+    <h1>Пользователи</h1>
+  </div>
+  <div class="hint" style="margin-bottom:16px">Одобряй или блокируй тех, кто зарегистрировался. Войти и пользоваться могут только одобренные.</div>
+  <div class="section"><div class="sched-list" id="admin-list"></div></div>
+</div>
+
 <!-- ============ Модалка: добавить аккаунт ============ -->
 <div id="modal-add" class="overlay hidden">
   <div class="modal">
@@ -314,6 +343,7 @@ const WD_NAMES = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"];
 const KIND_ICON = { user: "👤", group: "👥", channel: "📢", chat: "💬" };
 
 let state = {
+  me: null,         // текущий пользователь {id, username, is_admin, ...}
   profileId: null,
   profileName: "",
   recipients: {},   // id -> {id, name, kind}
@@ -328,6 +358,9 @@ async function api(path, opts) {
   const res = await fetch(path, opts);
   let data = {};
   try { data = await res.json(); } catch (e) {}
+  if (res.status === 401 && !path.startsWith("/api/auth/")) {
+    showAuth();  // сессия истекла или пользователь заблокирован
+  }
   return { ok: res.ok, data };
 }
 function post(path, body) {
@@ -462,8 +495,7 @@ function enterCompose(pid, name) {
   state.recipients = {};
   state.weekdays = new Set();
   state.dates = new Set();
-  el("screen-profiles").classList.add("hidden");
-  el("screen-compose").classList.remove("hidden");
+  showScreen("screen-compose");
   el("compose-title").textContent = name;
   el("msg").value = "";
   el("compose-err").textContent = "";
@@ -474,8 +506,7 @@ function enterCompose(pid, name) {
   loadSchedules();
 }
 function goProfiles() {
-  el("screen-compose").classList.add("hidden");
-  el("screen-profiles").classList.remove("hidden");
+  showScreen("screen-profiles");
   loadProfiles();
 }
 
@@ -649,11 +680,116 @@ async function loadSchedules() {
   }
 }
 
+// ---------- аутентификация ----------
+let authMode = "login";
+
+function showScreen(id) {
+  for (const s of ["screen-auth", "screen-profiles", "screen-compose", "screen-admin"])
+    el(s).classList.toggle("hidden", s !== id);
+}
+
+function showAuth() {
+  state.me = null;
+  el("auth-user").value = "";
+  el("auth-pass").value = "";
+  setAuthMode("login");
+  showScreen("screen-auth");
+}
+
+function setAuthMode(mode) {
+  authMode = mode;
+  el("auth-title").textContent = mode === "login" ? "Вход" : "Регистрация";
+  el("auth-submit").textContent = mode === "login" ? "Войти" : "Зарегистрироваться";
+  el("auth-err").textContent = "";
+  el("auth-switch").innerHTML = mode === "login"
+    ? `Нет аккаунта? <a href="#" onclick="setAuthMode('register');return false">Зарегистрироваться</a>`
+    : `Уже есть аккаунт? <a href="#" onclick="setAuthMode('login');return false">Войти</a>`;
+}
+
+async function submitAuth() {
+  el("auth-err").textContent = "";
+  const username = el("auth-user").value.trim();
+  const password = el("auth-pass").value;
+  if (!username || !password) { el("auth-err").textContent = "Заполни логин и пароль."; return; }
+  const path = authMode === "login" ? "/api/auth/login" : "/api/auth/register";
+  const { ok, data } = await post(path, { username, password });
+  if (!ok) { el("auth-err").textContent = data.error || "Ошибка"; return; }
+  if (data.step === "pending") {
+    setAuthMode("login");
+    toast("Заявка отправлена — дождись одобрения администратора", "ok");
+    return;
+  }
+  state.me = data.user;   // вход или первый пользователь (админ)
+  enterApp();
+}
+
+function enterApp() {
+  el("btn-admin").style.display = (state.me && state.me.is_admin) ? "" : "none";
+  showScreen("screen-profiles");
+  loadProfiles();
+}
+
+async function checkAuth() {
+  const { ok, data } = await api("/api/auth/me");
+  if (ok && data.user) { state.me = data.user; enterApp(); }
+  else showAuth();
+}
+
+async function logout() {
+  await post("/api/auth/logout");
+  showAuth();
+}
+
+// ---------- админка: пользователи ----------
+function openAdmin() { showScreen("screen-admin"); loadAdminUsers(); }
+
+const USTATUS = { approved: "✅ одобрен", pending: "⏳ ждёт одобрения", blocked: "⛔ заблокирован" };
+
+async function loadAdminUsers() {
+  const box = el("admin-list");
+  box.innerHTML = `<div class="hint">Загрузка…</div>`;
+  const { ok, data } = await api("/api/admin/users");
+  if (!ok) { box.innerHTML = `<div class="hint">${escapeHtml(data.error || "Ошибка")}</div>`; return; }
+  box.innerHTML = "";
+  for (const u of (data.users || [])) {
+    const me = state.me && u.id === state.me.id;
+    const item = document.createElement("div");
+    item.className = "sched-item";
+    let actions = "";
+    if (!me) {
+      if (u.status !== "approved") actions += `<button class="btn" data-act="approve">Одобрить</button>`;
+      if (u.status !== "blocked") actions += `<button class="btn ghost" data-act="block">Заблокировать</button>`;
+      actions += `<button class="btn danger" data-act="delete">Удалить</button>`;
+    }
+    item.innerHTML = `
+      <div class="si-main">
+        <div class="si-when">${escapeHtml(u.username)}${u.is_admin ? " · админ" : ""}${me ? " · это ты" : ""}</div>
+        <div class="si-to">${USTATUS[u.status] || u.status}${u.created ? " · с " + escapeHtml(u.created) : ""}</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px">${actions}</div>`;
+    item.querySelectorAll("button").forEach(b => { b.onclick = () => adminAction(u, b.dataset.act); });
+    box.appendChild(item);
+  }
+}
+
+async function adminAction(u, act) {
+  if (act === "delete") {
+    if (!confirm(`Удалить пользователя «${u.username}» со всеми его аккаунтами и расписаниями?`)) return;
+    const { ok, data } = await api(`/api/admin/users/${u.id}`, { method: "DELETE" });
+    if (!ok) return toast(data.error || "Ошибка", "bad");
+  } else {
+    const status = act === "approve" ? "approved" : "blocked";
+    const { ok, data } = await post(`/api/admin/users/${u.id}/status`, { status });
+    if (!ok) return toast(data.error || "Ошибка", "bad");
+  }
+  loadAdminUsers();
+}
+
 // время меняется — обновляем подсказку
 document.addEventListener("input", (e) => { if (e.target.id === "sched-time") updateModeNote(); });
 
 // старт
-loadProfiles();
+checkAuth();
 </script>
 </body>
 </html>

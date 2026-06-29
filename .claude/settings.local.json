@@ -68,7 +68,14 @@
       "Bash(python3 -c \"import fastapi, telethon, uvicorn; print\\('зависимости установлены'\\)\")",
       "Bash(.venv/bin/python -c \"import fastapi, telethon, uvicorn; print\\('OK: зависимости установлены в .venv'\\)\")",
       "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://127.0.0.1:8000/)",
-      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Подготовка к облачному деплою \\(Oracle Always Free, 24/7\\) *)"
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Подготовка к облачному деплою \\(Oracle Always Free, 24/7\\) *)",
+      "Bash(gh repo *)",
+      "Bash(git ls-remote *)",
+      "Bash(git push *)",
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'DEPLOY.md: добавлен вариант российского VPS \\(для РФ, Oracle недоступен\\) *)",
+      "Bash(.venv/bin/python -c \"import importlib, web; importlib.reload\\(web\\); print\\('import OK; routes:', len\\(web.app.routes\\)\\)\")",
+      "Bash(cd /Users/kamilimangulov/yoy *)",
+      "Bash(.venv/bin/python -c \"import web; print\\('web.py OK, routes:', len\\(web.app.routes\\)\\)\")"
     ]
   }
 }

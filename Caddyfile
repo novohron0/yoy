@@ -1,0 +1,3 @@
+{$PANEL_DOMAIN} {
+    reverse_proxy scheduler:8000
+}
