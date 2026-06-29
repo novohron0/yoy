@@ -77,7 +77,8 @@
       "Bash(cd /Users/kamilimangulov/yoy *)",
       "Bash(.venv/bin/python -c \"import web; print\\('web.py OK, routes:', len\\(web.app.routes\\)\\)\")",
       "Bash(.venv/bin/python -c ' *)",
-      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Вход в Telegram по QR-коду \\(альтернатива коду из приложения\\) *)"
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Вход в Telegram по QR-коду \\(альтернатива коду из приложения\\) *)",
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Расписание по интервалу: отправка каждые N минут \\(с рандомом\\) *)"
     ]
   }
 }

@@ -26,10 +26,11 @@ import hmac
 import io
 import json
 import os
+import random
 import secrets
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
@@ -380,6 +381,26 @@ async def _scheduler_loop():
                     if ou is None or ou.get("status") != "approved":
                         continue
 
+                # Режим интервала: каждые N (случайно min..max) минут
+                if rule.get("interval_min"):
+                    nf = rule.get("next_fire")
+                    due = nf is None
+                    if not due:
+                        try:
+                            due = now >= datetime.fromisoformat(nf)
+                        except Exception:
+                            due = True
+                    if due:
+                        await _fire_rule(rule)
+                        lo = int(rule.get("interval_min") or 1)
+                        hi = int(rule.get("interval_max") or lo)
+                        if hi < lo:
+                            hi = lo
+                        delay = random.randint(lo, hi)
+                        rule["next_fire"] = (now + timedelta(minutes=delay)).isoformat(timespec="seconds")
+                        changed = True
+                    continue
+
                 # Чистим прошедшие конкретные даты у разовых правил
                 if rule.get("dates"):
                     fresh = [d for d in rule["dates"] if d >= today]
@@ -603,9 +624,11 @@ class SendIn(BaseModel):
 class ScheduleIn(BaseModel):
     targets: list[Target]
     text: str
-    time: str               # "HH:MM"
+    time: str = "12:00"       # "HH:MM" (для режима «по времени»)
     weekdays: list[int] = []  # 0=Пн ... 6=Вс
     dates: list[str] = []     # ["YYYY-MM-DD", ...]
+    interval_min: int | None = None  # минуты; если задано — режим «каждые N минут»
+    interval_max: int | None = None  # верхняя граница случайного интервала
 
 
 # ---------------------------------------------------------------------------
@@ -941,8 +964,6 @@ async def create_schedule(pid: str, body: ScheduleIn, user=Depends(require_user)
         return JSONResponse({"error": "Пустое сообщение"}, status_code=400)
     if not body.targets:
         return JSONResponse({"error": "Не выбран ни один чат"}, status_code=400)
-    if not _validate_time(body.time):
-        return JSONResponse({"error": "Неверное время (нужен формат ЧЧ:ММ)"}, status_code=400)
 
     rule = {
         "id": uuid.uuid4().hex[:8],
@@ -950,13 +971,30 @@ async def create_schedule(pid: str, body: ScheduleIn, user=Depends(require_user)
         "owner": user["id"],
         "targets": [t.model_dump() for t in body.targets],
         "text": body.text,
-        "time": body.time,
-        "weekdays": sorted(set(w for w in body.weekdays if 0 <= w <= 6)),
-        "dates": sorted(set(body.dates)),
         "enabled": True,
         "last_fired": None,
         "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
+
+    if body.interval_min is not None:
+        # Режим «каждые N минут» (опционально случайно в диапазоне)
+        lo = int(body.interval_min)
+        hi = int(body.interval_max) if body.interval_max is not None else lo
+        if lo < 1:
+            return JSONResponse({"error": "Минимальный интервал — 1 минута"}, status_code=400)
+        if hi < lo:
+            hi = lo
+        rule["interval_min"] = lo
+        rule["interval_max"] = hi
+        rule["next_fire"] = None   # None → отправит на ближайшем тике (сразу)
+    else:
+        # Режим «по времени»
+        if not _validate_time(body.time):
+            return JSONResponse({"error": "Неверное время (нужен формат ЧЧ:ММ)"}, status_code=400)
+        rule["time"] = body.time
+        rule["weekdays"] = sorted(set(w for w in body.weekdays if 0 <= w <= 6))
+        rule["dates"] = sorted(set(body.dates))
+
     schedules = load_schedules()
     schedules.append(rule)
     save_schedules(schedules)

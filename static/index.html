@@ -241,22 +241,43 @@
   <!-- Расписание -->
   <div class="section">
     <h3>Когда отправить</h3>
-    <div class="row">
-      <div>
-        <label>Время</label>
-        <input type="time" id="sched-time" value="12:00" />
+
+    <div class="weekdays" id="mode-tabs" style="margin-bottom:8px">
+      <button type="button" class="wd on" id="tab-daily" style="width:auto;padding:0 16px" onclick="setSchedMode('daily')">По времени</button>
+      <button type="button" class="wd" id="tab-interval" style="width:auto;padding:0 16px" onclick="setSchedMode('interval')">Каждые N минут</button>
+    </div>
+
+    <!-- Режим «по времени» -->
+    <div id="mode-daily-fields">
+      <div class="row">
+        <div>
+          <label>Время</label>
+          <input type="time" id="sched-time" value="12:00" />
+        </div>
       </div>
+
+      <label>Дни недели (для повтора)</label>
+      <div class="weekdays" id="weekdays"></div>
+
+      <label>Конкретные даты (разовая отправка)</label>
+      <div class="row">
+        <div style="flex:2"><input type="date" id="date-input" /></div>
+        <button class="btn ghost" type="button" onclick="addDate()" style="flex:0 0 auto">Добавить дату</button>
+      </div>
+      <div class="chips" id="dates-chips" style="margin-top:10px"></div>
     </div>
 
-    <label>Дни недели (для повтора)</label>
-    <div class="weekdays" id="weekdays"></div>
-
-    <label>Конкретные даты (разовая отправка)</label>
-    <div class="row">
-      <div style="flex:2"><input type="date" id="date-input" /></div>
-      <button class="btn ghost" type="button" onclick="addDate()" style="flex:0 0 auto">Добавить дату</button>
+    <!-- Режим «каждые N минут» -->
+    <div id="mode-interval-fields" class="hidden">
+      <label>Отправлять каждые (минут)</label>
+      <div class="row" style="align-items:center">
+        <div><input type="number" id="int-min" min="1" value="30" /></div>
+        <div style="flex:0 0 auto;color:var(--muted)">—</div>
+        <div><input type="number" id="int-max" min="1" value="30" /></div>
+      </div>
+      <p class="hint">Поставь одинаковые числа — будет ровный интервал (напр. каждые 30 мин).
+        Разные — случайный интервал в диапазоне (напр. 20–40 мин, чтобы не выглядеть как спам).</p>
     </div>
-    <div class="chips" id="dates-chips" style="margin-top:10px"></div>
 
     <div class="mode-note" id="mode-note"></div>
   </div>
@@ -361,6 +382,7 @@ let state = {
   addStep: null,
   searchTimer: null,
   qrActive: false,
+  schedMode: "daily",   // "daily" | "interval"
 };
 
 // ---------- helpers ----------
@@ -549,8 +571,17 @@ function enterCompose(pid, name) {
   renderRecipients();
   renderWeekdays();
   renderDates();
-  updateModeNote();
+  setSchedMode("daily");
   loadSchedules();
+}
+
+function setSchedMode(mode) {
+  state.schedMode = mode;
+  el("tab-daily").classList.toggle("on", mode === "daily");
+  el("tab-interval").classList.toggle("on", mode === "interval");
+  el("mode-daily-fields").classList.toggle("hidden", mode !== "daily");
+  el("mode-interval-fields").classList.toggle("hidden", mode !== "interval");
+  updateModeNote();
 }
 function goProfiles() {
   showScreen("screen-profiles");
@@ -603,8 +634,17 @@ function renderDates() {
 }
 
 function updateModeNote() {
-  const t = el("sched-time").value || "—";
   let html;
+  if (state.schedMode === "interval") {
+    const lo = el("int-min").value || "?";
+    const hi = el("int-max").value || lo;
+    html = (hi && hi !== lo)
+      ? `<b>Повтор по интервалу.</b> Сообщение будет уходить каждые <b>${lo}–${hi}</b> минут (случайно). Первое — сразу после сохранения.`
+      : `<b>Повтор по интервалу.</b> Сообщение будет уходить каждые <b>${lo}</b> минут. Первое — сразу после сохранения.`;
+    el("mode-note").innerHTML = html;
+    return;
+  }
+  const t = el("sched-time").value || "—";
   if (state.dates.size) {
     html = `<b>Разовая отправка.</b> Сообщение уйдёт по одному разу в каждую выбранную дату в ${t}.`;
   } else if (state.weekdays.size) {
@@ -673,12 +713,17 @@ function validateCommon() {
 async function saveSchedule() {
   const base = validateCommon();
   if (!base) return;
-  const { ok, data } = await post(`/api/profiles/${state.profileId}/schedules`, {
-    ...base,
-    time: el("sched-time").value,
-    weekdays: [...state.weekdays],
-    dates: [...state.dates],
-  });
+  let body;
+  if (state.schedMode === "interval") {
+    const lo = parseInt(el("int-min").value) || 0;
+    let hi = parseInt(el("int-max").value) || lo;
+    if (lo < 1) { el("compose-err").textContent = "Минимальный интервал — 1 минута."; return; }
+    if (hi < lo) hi = lo;
+    body = { ...base, interval_min: lo, interval_max: hi };
+  } else {
+    body = { ...base, time: el("sched-time").value, weekdays: [...state.weekdays], dates: [...state.dates] };
+  }
+  const { ok, data } = await post(`/api/profiles/${state.profileId}/schedules`, body);
   if (!ok) return (el("compose-err").textContent = data.error);
   toast("Запланировано ✓", "ok");
   el("msg").value = "";
@@ -698,6 +743,11 @@ async function sendNow() {
 
 // ---------- список расписаний ----------
 function describeWhen(s) {
+  if (s.interval_min) {
+    return (s.interval_max && s.interval_max !== s.interval_min)
+      ? `🔁 каждые ${s.interval_min}–${s.interval_max} мин`
+      : `🔁 каждые ${s.interval_min} мин`;
+  }
   if (s.dates && s.dates.length) return `📅 ${s.dates.join(", ")} в ${s.time}`;
   if (s.weekdays && s.weekdays.length) return `🔁 ${s.weekdays.map(i => WD_NAMES[i]).join(", ")} в ${s.time}`;
   return `🔁 ежедневно в ${s.time}`;
@@ -833,7 +883,9 @@ async function adminAction(u, act) {
 }
 
 // время меняется — обновляем подсказку
-document.addEventListener("input", (e) => { if (e.target.id === "sched-time") updateModeNote(); });
+document.addEventListener("input", (e) => {
+  if (["sched-time", "int-min", "int-max"].includes(e.target.id)) updateModeNote();
+});
 
 // старт
 checkAuth();
