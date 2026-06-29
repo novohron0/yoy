@@ -294,6 +294,19 @@
     <div class="mode-note" id="mode-note"></div>
   </div>
 
+  <!-- Задержка между чатами -->
+  <div class="section">
+    <h3>Задержка между чатами</h3>
+    <div class="row" style="align-items:center">
+      <div><input type="number" id="gap-min" min="0" value="10" /></div>
+      <div style="flex:0 0 auto;color:var(--muted)">—</div>
+      <div><input type="number" id="gap-max" min="0" value="30" /></div>
+      <div style="flex:0 0 auto;color:var(--muted)">сек</div>
+    </div>
+    <p class="hint">Сообщения уходят не разом, а по очереди с случайной паузой в этом диапазоне.
+      Защищает аккаунт от блокировок. По умолчанию 10–30 сек.</p>
+  </div>
+
   <div class="row" style="gap:10px">
     <button class="btn full" onclick="saveSchedule()">Запланировать</button>
     <button class="btn ghost full" onclick="sendNow()">Отправить сейчас</button>
@@ -801,18 +814,27 @@ function validateCommon() {
   return { targets, text };
 }
 
+function readGap() {
+  let lo = parseInt(el("gap-min").value);
+  let hi = parseInt(el("gap-max").value);
+  if (isNaN(lo) || lo < 0) lo = 0;
+  if (isNaN(hi) || hi < lo) hi = lo;
+  return { gap_min: lo, gap_max: hi };
+}
+
 async function saveSchedule() {
   const base = validateCommon();
   if (!base) return;
+  const gap = readGap();
   let body;
   if (state.schedMode === "interval") {
     const lo = parseInt(el("int-min").value) || 0;
     let hi = parseInt(el("int-max").value) || lo;
     if (lo < 1) { el("compose-err").textContent = "Минимальный интервал — 1 минута."; return; }
     if (hi < lo) hi = lo;
-    body = { ...base, interval_min: lo, interval_max: hi };
+    body = { ...base, ...gap, interval_min: lo, interval_max: hi };
   } else {
-    body = { ...base, time: el("sched-time").value, weekdays: [...state.weekdays], dates: [...state.dates] };
+    body = { ...base, ...gap, time: el("sched-time").value, weekdays: [...state.weekdays], dates: [...state.dates] };
   }
   const { ok, data } = await post(`/api/profiles/${state.profileId}/schedules`, body);
   if (!ok) return (el("compose-err").textContent = data.error);
@@ -826,10 +848,15 @@ async function saveSchedule() {
 async function sendNow() {
   const base = validateCommon();
   if (!base) return;
-  const { ok, data } = await post(`/api/profiles/${state.profileId}/send`, base);
+  const gap = readGap();
+  const { ok, data } = await post(`/api/profiles/${state.profileId}/send`, { ...base, ...gap });
   if (!ok) {
     el("compose-err").textContent = data.error || "Ошибка";
     await loadProfiles(); renderFloodBanner();   // мог встать на паузу (429)
+    return;
+  }
+  if (data.started) {
+    toast(`📨 Отправка запущена: ${data.started} чат(ов), пауза ${gap.gap_min}–${gap.gap_max}с между ними`, "ok");
     return;
   }
   if (data.paused) {

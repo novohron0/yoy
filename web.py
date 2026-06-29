@@ -360,9 +360,23 @@ def _due(rule, now):
 # ---------------------------------------------------------------------------
 # Защита от флуда / бана (FloodWait, PeerFlood)
 # ---------------------------------------------------------------------------
-# Пауза между сообщениями в разные чаты (анти-всплеск), сек.
-SEND_GAP_MIN = float(os.environ.get("SEND_GAP_MIN", "2"))
-SEND_GAP_MAX = float(os.environ.get("SEND_GAP_MAX", "5"))
+# Пауза между сообщениями в разные чаты (анти-всплеск), сек — дефолт.
+SEND_GAP_MIN = float(os.environ.get("SEND_GAP_MIN", "10"))
+SEND_GAP_MAX = float(os.environ.get("SEND_GAP_MAX", "30"))
+
+
+def _send_gap(lo=None, hi=None):
+    """Случайная пауза между чатами (сек). Использует заданный диапазон или дефолт."""
+    try:
+        lo = float(lo) if lo is not None else SEND_GAP_MIN
+        hi = float(hi) if hi is not None else SEND_GAP_MAX
+    except (TypeError, ValueError):
+        lo, hi = SEND_GAP_MIN, SEND_GAP_MAX
+    if lo < 0:
+        lo = 0
+    if hi < lo:
+        hi = lo
+    return random.uniform(lo, hi)
 
 
 def _on_cooldown(profile):
@@ -424,21 +438,36 @@ async def _send_one(client, pid, target, text):
         return "error", str(e)
 
 
+async def _send_bulk(pid, targets, text, gap_lo=None, gap_hi=None):
+    """Последовательная отправка по чатам с паузой между ними и защитой от флуда."""
+    client = await get_client(pid)
+    if client is None or not await client.is_user_authorized():
+        return
+    n = len(targets)
+    for i, target in enumerate(targets):
+        if _on_cooldown(get_profile(pid)):
+            return
+        status, _ = await _send_one(client, pid, target, text)
+        if status in ("flood", "spam"):
+            return  # профиль на паузе — дальше не шлём
+        if i < n - 1:
+            await asyncio.sleep(_send_gap(gap_lo, gap_hi))
+
+
+async def _send_bulk_safe(pid, targets, text, gap_lo=None, gap_hi=None):
+    try:
+        await _send_bulk(pid, targets, text, gap_lo, gap_hi)
+    except Exception as e:
+        print(f"[send] фоновая отправка {pid}: {e}")
+
+
 async def _fire_rule(rule):
     """Отправляет сообщение правила по всем его чатам, с защитой от флуда."""
     pid = rule["profile_id"]
     if _on_cooldown(get_profile(pid)):
         return
-    client = await get_client(pid)
-    if client is None or not await client.is_user_authorized():
-        return
-    targets = rule.get("targets", [])
-    for i, target in enumerate(targets):
-        status, _ = await _send_one(client, pid, target, rule["text"])
-        if status in ("flood", "spam"):
-            return  # профиль на паузе — дальше не шлём
-        if i < len(targets) - 1:
-            await asyncio.sleep(random.uniform(SEND_GAP_MIN, SEND_GAP_MAX))
+    await _send_bulk(pid, rule.get("targets", []), rule["text"],
+                     rule.get("gap_min"), rule.get("gap_max"))
 
 
 async def _scheduler_loop():
@@ -704,6 +733,8 @@ class Target(BaseModel):
 class SendIn(BaseModel):
     targets: list[Target]
     text: str
+    gap_min: int | None = None   # пауза между чатами, сек (от)
+    gap_max: int | None = None   # пауза между чатами, сек (до)
 
 
 class ScheduleIn(BaseModel):
@@ -714,6 +745,8 @@ class ScheduleIn(BaseModel):
     dates: list[str] = []     # ["YYYY-MM-DD", ...]
     interval_min: int | None = None  # минуты; если задано — режим «каждые N минут»
     interval_max: int | None = None  # верхняя граница случайного интервала
+    gap_min: int | None = None       # пауза между чатами, сек (от)
+    gap_max: int | None = None       # пауза между чатами, сек (до)
 
 
 class PackIn(BaseModel):
@@ -1033,23 +1066,21 @@ async def send_now(pid: str, body: SendIn, user=Depends(require_user)):
     if not body.targets:
         return JSONResponse({"error": "Не выбран ни один чат"}, status_code=400)
 
-    sent, errors, paused = [], [], None
-    targets = list(body.targets)
-    for i, t in enumerate(targets):
-        status, detail = await _send_one(client, pid, {"id": t.id, "name": t.name}, body.text)
-        if status == "ok":
-            sent.append(t.name)
-        elif status == "flood":
-            paused = f"Telegram просит подождать {detail}с — отправка приостановлена."
-            break
-        elif status == "spam":
-            paused = "Telegram пометил аккаунт как спам — отправки остановлены на время."
-            break
-        else:
-            errors.append(f"{t.name}: {detail}")
-        if i < len(targets) - 1:
-            await asyncio.sleep(random.uniform(SEND_GAP_MIN, SEND_GAP_MAX))
-    return {"ok": True, "sent": sent, "errors": errors, "paused": paused}
+    targets = [{"id": t.id, "name": t.name, "kind": t.kind} for t in body.targets]
+    if len(targets) == 1:
+        # один чат — шлём сразу, чтобы дать мгновенный ответ
+        status, detail = await _send_one(client, pid, targets[0], body.text)
+        if status == "flood":
+            return {"ok": True, "sent": [], "paused": f"Telegram просит подождать {detail}с."}
+        if status == "spam":
+            return {"ok": True, "sent": [], "paused": "Telegram пометил аккаунт как спам."}
+        if status == "error":
+            return {"ok": True, "sent": [], "errors": [f"{targets[0]['name']}: {detail}"]}
+        return {"ok": True, "sent": [targets[0]["name"]], "errors": []}
+
+    # несколько чатов — отправляем в фоне с паузой между ними
+    asyncio.create_task(_send_bulk_safe(pid, targets, body.text, body.gap_min, body.gap_max))
+    return {"ok": True, "started": len(targets)}
 
 
 @app.post("/api/profiles/{pid}/resume")
@@ -1093,6 +1124,8 @@ async def create_schedule(pid: str, body: ScheduleIn, user=Depends(require_user)
         "text": body.text,
         "enabled": True,
         "last_fired": None,
+        "gap_min": body.gap_min,
+        "gap_max": body.gap_max,
         "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
 
