@@ -224,6 +224,12 @@
     <h1 id="compose-title">…</h1>
   </div>
 
+  <!-- Баннер паузы (флуд-защита) -->
+  <div id="flood-banner" class="hidden" style="background:var(--panel-3);border-left:3px solid var(--err);padding:12px 14px;border-radius:10px;margin-bottom:14px">
+    <div id="flood-text" style="font-size:14px;margin-bottom:10px">⏸ Аккаунт на паузе.</div>
+    <button class="btn ghost" onclick="resumeProfile()">Возобновить отправку</button>
+  </div>
+
   <!-- Получатели -->
   <div class="section">
     <h3>Кому отправить</h3>
@@ -383,6 +389,7 @@ let state = {
   searchTimer: null,
   qrActive: false,
   schedMode: "daily",   // "daily" | "interval"
+  profilesById: {},
 };
 
 // ---------- helpers ----------
@@ -416,15 +423,21 @@ async function loadProfiles() {
   const { data } = await api("/api/profiles");
   const grid = el("profiles-grid");
   grid.innerHTML = "";
+  state.profilesById = {};
   for (const p of (data.profiles || [])) {
+    state.profilesById[p.id] = p;
     const card = document.createElement("div");
     card.className = "profile-card";
     const initial = (p.name || "?").trim().charAt(0).toUpperCase() || "?";
+    const flood = (p.flagged || p.on_cooldown)
+      ? `<div class="pstate off">⏸ ${p.flagged ? "помечен спамом — на паузе" : "пауза (флуд)"}</div>`
+      : "";
     card.innerHTML = `
       <div class="ava">${escapeHtml(initial)}</div>
       <div>
         <div class="pname">${escapeHtml(p.name)}</div>
         <div class="pstate ${p.authorized ? "on" : "off"}">${p.authorized ? "● подключён" : "○ нужен вход"}</div>
+        ${flood}
       </div>
       <button class="del" title="Удалить">✕</button>`;
     card.onclick = () => openProfile(p);
@@ -572,7 +585,32 @@ function enterCompose(pid, name) {
   renderWeekdays();
   renderDates();
   setSchedMode("daily");
+  renderFloodBanner();
   loadSchedules();
+}
+
+function renderFloodBanner() {
+  const p = state.profilesById[state.profileId];
+  const banner = el("flood-banner");
+  if (p && (p.flagged || p.on_cooldown)) {
+    let msg = p.flood_note || "Аккаунт на паузе из-за флуда.";
+    if (p.cooldown_until) {
+      const until = new Date(p.cooldown_until);
+      if (!isNaN(until)) msg += ` До ${until.toLocaleString()}.`;
+    }
+    el("flood-text").textContent = "⏸ " + msg;
+    banner.classList.remove("hidden");
+  } else {
+    banner.classList.add("hidden");
+  }
+}
+
+async function resumeProfile() {
+  const { ok, data } = await api(`/api/profiles/${state.profileId}/resume`, { method: "POST" });
+  if (!ok) return toast(data.error || "Ошибка", "bad");
+  toast("Отправки возобновлены ✓", "ok");
+  await loadProfiles();
+  renderFloodBanner();
 }
 
 function setSchedMode(mode) {
@@ -736,7 +774,16 @@ async function sendNow() {
   const base = validateCommon();
   if (!base) return;
   const { ok, data } = await post(`/api/profiles/${state.profileId}/send`, base);
-  if (!ok) return (el("compose-err").textContent = data.error);
+  if (!ok) {
+    el("compose-err").textContent = data.error || "Ошибка";
+    await loadProfiles(); renderFloodBanner();   // мог встать на паузу (429)
+    return;
+  }
+  if (data.paused) {
+    toast("⏸ " + data.paused, "bad");
+    await loadProfiles(); renderFloodBanner();
+    return;
+  }
   const errs = (data.errors || []).length;
   toast(errs ? `Отправлено ${data.sent.length}, ошибок ${errs}` : `Отправлено в ${data.sent.length} чат(ов) ✓`, errs ? "bad" : "ok");
 }

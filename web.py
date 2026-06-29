@@ -43,6 +43,7 @@ from telethon.tl.types import User, Chat, Channel
 from telethon.errors import (
     ApiIdInvalidError,
     FloodWaitError,
+    PeerFloodError,
     PhoneCodeInvalidError,
     PhoneNumberInvalidError,
     SessionPasswordNeededError,
@@ -347,18 +348,88 @@ def _due(rule, now):
     return True  # каждый день
 
 
+# ---------------------------------------------------------------------------
+# Защита от флуда / бана (FloodWait, PeerFlood)
+# ---------------------------------------------------------------------------
+# Пауза между сообщениями в разные чаты (анти-всплеск), сек.
+SEND_GAP_MIN = float(os.environ.get("SEND_GAP_MIN", "2"))
+SEND_GAP_MAX = float(os.environ.get("SEND_GAP_MAX", "5"))
+
+
+def _on_cooldown(profile):
+    """True, если профиль сейчас на охлаждении после флуда."""
+    cu = (profile or {}).get("cooldown_until")
+    if not cu:
+        return False
+    try:
+        return datetime.now() < datetime.fromisoformat(cu)
+    except Exception:
+        return False
+
+
+def _set_cooldown(pid, seconds, note=None, flagged=False):
+    """Ставит профиль на паузу на `seconds` секунд (и опционально помечает спам-флагом)."""
+    profiles = load_profiles()
+    for p in profiles:
+        if p["id"] == pid:
+            until = datetime.now() + timedelta(seconds=max(1, int(seconds)))
+            p["cooldown_until"] = until.isoformat(timespec="seconds")
+            p["flood_note"] = note or ""
+            if flagged:
+                p["flagged"] = True
+            break
+    save_profiles(profiles)
+
+
+def _clear_cooldown(pid):
+    profiles = load_profiles()
+    changed = False
+    for p in profiles:
+        if p["id"] == pid:
+            for k in ("cooldown_until", "flood_note", "flagged"):
+                if k in p:
+                    p.pop(k, None)
+                    changed = True
+            break
+    if changed:
+        save_profiles(profiles)
+
+
+async def _send_one(client, pid, target, text):
+    """Отправляет одно сообщение. Возвращает ('ok'|'flood'|'spam'|'error', detail)."""
+    try:
+        entity = await _resolve(pid, target["id"])
+        await client.send_message(entity, text)
+        return "ok", None
+    except FloodWaitError as e:
+        wait = e.seconds + 30  # запас сверху
+        _set_cooldown(pid, wait, note=f"Пауза {e.seconds}с — Telegram просит притормозить (FloodWait).")
+        print(f"[flood] профиль {pid}: FloodWait {e.seconds}s → пауза до отправки")
+        return "flood", e.seconds
+    except PeerFloodError:
+        _set_cooldown(pid, 6 * 3600, note="Telegram пометил аккаунт как спам. Отправки остановлены на 6 ч — снизь частоту.", flagged=True)
+        print(f"[flood] профиль {pid}: PeerFloodError (спам-флаг) → длинная пауза + флаг")
+        return "spam", None
+    except Exception as e:
+        print(f"[scheduler] не удалось отправить в {target.get('name')}: {e}")
+        return "error", str(e)
+
+
 async def _fire_rule(rule):
-    """Отправляет сообщение правила по всем его чатам."""
+    """Отправляет сообщение правила по всем его чатам, с защитой от флуда."""
     pid = rule["profile_id"]
+    if _on_cooldown(get_profile(pid)):
+        return
     client = await get_client(pid)
     if client is None or not await client.is_user_authorized():
         return
-    for target in rule.get("targets", []):
-        try:
-            entity = await _resolve(pid, target["id"])
-            await client.send_message(entity, rule["text"])
-        except Exception as e:
-            print(f"[scheduler] не удалось отправить в {target.get('name')}: {e}")
+    targets = rule.get("targets", [])
+    for i, target in enumerate(targets):
+        status, _ = await _send_one(client, pid, target, rule["text"])
+        if status in ("flood", "spam"):
+            return  # профиль на паузе — дальше не шлём
+        if i < len(targets) - 1:
+            await asyncio.sleep(random.uniform(SEND_GAP_MIN, SEND_GAP_MAX))
 
 
 async def _scheduler_loop():
@@ -380,6 +451,10 @@ async def _scheduler_loop():
                     ou = get_user(owner)
                     if ou is None or ou.get("status") != "approved":
                         continue
+
+                # Профиль на охлаждении после флуда — пропускаем (возобновится сам)
+                if _on_cooldown(get_profile(rule["profile_id"])):
+                    continue
 
                 # Режим интервала: каждые N (случайно min..max) минут
                 if rule.get("interval_min"):
@@ -696,7 +771,15 @@ async def list_profiles(user=Depends(require_user)):
             authorized = bool(client and await client.is_user_authorized())
         except Exception:
             authorized = False
-        out.append({"id": p["id"], "name": p["name"], "authorized": authorized})
+        out.append({
+            "id": p["id"],
+            "name": p["name"],
+            "authorized": authorized,
+            "cooldown_until": p.get("cooldown_until"),
+            "on_cooldown": _on_cooldown(p),
+            "flagged": bool(p.get("flagged")),
+            "flood_note": p.get("flood_note") or "",
+        })
     return {"profiles": out}
 
 
@@ -920,7 +1003,12 @@ async def search(pid: str, q: str = "", user=Depends(require_user)):
 # ---------------------------------------------------------------------------
 @app.post("/api/profiles/{pid}/send")
 async def send_now(pid: str, body: SendIn, user=Depends(require_user)):
-    _owned_profile(pid, user)
+    profile = _owned_profile(pid, user)
+    if _on_cooldown(profile):
+        return JSONResponse(
+            {"error": f"Аккаунт на паузе из-за флуда. {profile.get('flood_note') or ''}".strip()},
+            status_code=429,
+        )
     client = await get_client(pid)
     if client is None or not await client.is_user_authorized():
         return JSONResponse({"error": "Не авторизован"}, status_code=401)
@@ -929,15 +1017,31 @@ async def send_now(pid: str, body: SendIn, user=Depends(require_user)):
     if not body.targets:
         return JSONResponse({"error": "Не выбран ни один чат"}, status_code=400)
 
-    sent, errors = [], []
-    for t in body.targets:
-        try:
-            entity = await _resolve(pid, t.id)
-            await client.send_message(entity, body.text)
+    sent, errors, paused = [], [], None
+    targets = list(body.targets)
+    for i, t in enumerate(targets):
+        status, detail = await _send_one(client, pid, {"id": t.id, "name": t.name}, body.text)
+        if status == "ok":
             sent.append(t.name)
-        except Exception as e:
-            errors.append(f"{t.name}: {e}")
-    return {"ok": True, "sent": sent, "errors": errors}
+        elif status == "flood":
+            paused = f"Telegram просит подождать {detail}с — отправка приостановлена."
+            break
+        elif status == "spam":
+            paused = "Telegram пометил аккаунт как спам — отправки остановлены на время."
+            break
+        else:
+            errors.append(f"{t.name}: {detail}")
+        if i < len(targets) - 1:
+            await asyncio.sleep(random.uniform(SEND_GAP_MIN, SEND_GAP_MAX))
+    return {"ok": True, "sent": sent, "errors": errors, "paused": paused}
+
+
+@app.post("/api/profiles/{pid}/resume")
+async def resume_profile(pid: str, user=Depends(require_user)):
+    """Снимает паузу/спам-флаг с профиля (возобновляет отправки)."""
+    _owned_profile(pid, user)
+    _clear_cooldown(pid)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
