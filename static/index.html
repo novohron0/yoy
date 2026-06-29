@@ -986,13 +986,21 @@ function renderDaysLeft() {
 function showPay() {
   const b = state.billing || {};
   const t = b.tier || {};
+  const price = t.price_rub || "";
   el("pay-info").innerHTML =
-    `<div style="font-size:17px;margin-bottom:8px">Доступ неактивен</div>
-     <div class="hint">Тариф «${escapeHtml(t.name || "Старт")}» — <b>${t.price_rub || ""} ₽</b> за ${t.days || 7} дней.</div>`;
+    `<div style="font-size:18px;margin-bottom:6px">Доступ к боту</div>
+     <div style="font-size:15px;margin-bottom:10px">Тариф «${escapeHtml(t.name || "Старт")}» — <b>${price} ₽</b> на ${t.days || 7} дней</div>
+     <div class="hint" style="text-align:left;line-height:1.6">
+       Как оплатить:<br>
+       1. Жми «Оплатить» — откроется CryptoBot.<br>
+       2. Нет крипты? Прямо там нажми <b>«Купить»/P2P</b> — купишь за пару минут картой/СБП.<br>
+       3. Подтверди оплату и вернись сюда — доступ откроется сам.
+     </div>`;
   el("pay-status").textContent = "";
   el("pay-check").style.display = "none";
   if (b.crypto_enabled) {
     el("pay-btn").style.display = "";
+    el("pay-btn").textContent = price ? `Оплатить ${price} ₽` : "Оплатить";
   } else {
     el("pay-btn").style.display = "none";
     el("pay-status").innerHTML = "Автооплата пока не настроена. Напиши администратору, чтобы выдал доступ.";
@@ -1005,7 +1013,7 @@ async function startPay() {
   const { ok, data } = await post("/api/billing/invoice");
   if (!ok) { el("pay-status").textContent = data.error || "Ошибка"; return; }
   window.open(data.pay_url, "_blank");
-  el("pay-status").innerHTML = "Счёт открыт в CryptoBot. Оплати — доступ откроется автоматически.<br>Жду оплату…";
+  el("pay-status").innerHTML = "Счёт открыт в CryptoBot. Оплати (если нет крипты — там же «Купить»/P2P).<br>После оплаты доступ откроется сам. Жду…";
   el("pay-check").style.display = "";
   state.payPolls = 0;
   pollPay();

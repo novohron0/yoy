@@ -85,6 +85,7 @@ COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"
 # Токен CryptoBot (Crypto Pay API). Получить: @CryptoBot → Crypto Pay → Create App.
 CRYPTOBOT_TOKEN = os.environ.get("CRYPTOBOT_TOKEN", "")
 CRYPTOBOT_API = os.environ.get("CRYPTOBOT_API", "https://pay.crypt.bot/api")
+PANEL_DOMAIN = os.environ.get("PANEL_DOMAIN", "")
 
 # Тарифы доступа. Цена в рублях за период `days`. Меняй цифры как нужно.
 TIERS = {
@@ -847,6 +848,10 @@ async def billing_invoice(user=Depends(require_user)):
         "payload": f"{user['id']}:{tkey}",
         "expires_in": 3600,
     }
+    # Кнопка возврата в панель после оплаты
+    if PANEL_DOMAIN:
+        data["paid_btn_name"] = "callback"
+        data["paid_btn_url"] = f"https://{PANEL_DOMAIN}"
     try:
         async with httpx.AsyncClient(timeout=20) as c:
             r = await c.post(f"{CRYPTOBOT_API}/createInvoice", json=data,
@@ -863,7 +868,8 @@ async def billing_invoice(user=Depends(require_user)):
             u["pending_invoice"] = inv["invoice_id"]
             break
     save_users(users)
-    pay_url = inv.get("bot_invoice_url") or inv.get("mini_app_invoice_url") or inv.get("pay_url")
+    # mini_app — самый гладкий экран оплаты прямо в Telegram
+    pay_url = inv.get("mini_app_invoice_url") or inv.get("bot_invoice_url") or inv.get("pay_url")
     return {"pay_url": pay_url, "invoice_id": inv["invoice_id"], "amount": tier["price_rub"]}
 
 

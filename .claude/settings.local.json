@@ -84,7 +84,9 @@
       "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Настраиваемая задержка между чатами \\(по умолчанию 10-30 сек\\) *)",
       "Bash(chmod +x update.sh)",
       "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Скрипт авто-обновления update.sh \\(git pull + пересборка при изменениях\\) *)",
-      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Платный доступ: подписка по тарифам + оплата криптой \\(CryptoBot\\) *)"
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Платный доступ: подписка по тарифам + оплата криптой \\(CryptoBot\\) *)",
+      "Bash(.venv/bin/python -c \"import web; print\\('web.py OK, routes:', len\\(web.app.routes\\), '| PANEL_DOMAIN read:', repr\\(web.PANEL_DOMAIN\\)\\)\")",
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Удобная оплата: мини-апп CryptoBot, кнопка возврата, понятные шаги *)"
     ]
   }
 }
