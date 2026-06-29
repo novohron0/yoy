@@ -304,6 +304,8 @@
     <div id="add-phone" class="hidden">
       <label>Номер телефона</label>
       <input id="in-phone" placeholder="+79991234567" />
+      <button class="btn ghost full" type="button" style="margin-top:12px" onclick="startQr()">📷 Войти по QR-коду</button>
+      <p class="hint" style="margin-top:8px">QR удобен, если код в Telegram не приходит.</p>
     </div>
 
     <div id="add-code" class="hidden">
@@ -314,6 +316,13 @@
     <div id="add-password" class="hidden">
       <label>Пароль 2FA</label>
       <input id="in-password" type="password" placeholder="••••••" />
+    </div>
+
+    <div id="add-qr" class="hidden">
+      <p class="hint">Открой <b>Telegram</b> → Настройки → <b>Устройства</b> →
+        «Подключить устройство» и наведи камеру на этот QR-код:</p>
+      <div id="qr-box" style="background:#fff;padding:14px;border-radius:12px;display:flex;justify-content:center;align-items:center;margin-top:10px;min-height:200px"></div>
+      <div class="hint" id="qr-status" style="margin-top:10px;text-align:center">Готовлю QR-код…</div>
     </div>
 
     <div class="err" id="add-err"></div>
@@ -351,6 +360,7 @@ let state = {
   dates: new Set(),
   addStep: null,
   searchTimer: null,
+  qrActive: false,
 };
 
 // ---------- helpers ----------
@@ -431,11 +441,14 @@ function showAddStep(step) {
     phone: "Введи номер телефона",
     code: "Введи код, который пришёл в Telegram",
     password: "У тебя включена двухфакторная защита",
+    qr: "Сканируй QR-код в приложении Telegram",
   };
-  for (const s of ["credentials", "phone", "code", "password"])
+  for (const s of ["credentials", "phone", "code", "password", "qr"])
     el("add-" + s).classList.toggle("hidden", s !== step);
   el("add-sub").textContent = subs[step] || "";
   el("add-err").textContent = "";
+  // на шаге QR кнопки «Далее» нет — вход происходит автоматически после скана
+  el("add-next").style.display = step === "qr" ? "none" : "";
   el("add-next").textContent = step === "code" || step === "password" ? "Войти" : "Далее";
 }
 function openAdd(existingId, step) {
@@ -450,7 +463,41 @@ function openAdd(existingId, step) {
     showAddStep("credentials");
   }
 }
-function closeAdd() { el("modal-add").classList.add("hidden"); loadProfiles(); }
+function closeAdd() {
+  state.qrActive = false;   // остановить опрос QR, если был
+  el("modal-add").classList.add("hidden");
+  loadProfiles();
+}
+
+// ---------- вход по QR ----------
+async function startQr() {
+  el("add-err").textContent = "";
+  showAddStep("qr");
+  el("qr-box").innerHTML = "";
+  el("qr-status").textContent = "Готовлю QR-код…";
+  const { ok, data } = await post(`/api/profiles/${state.profileId}/login/qr`);
+  if (!ok) { el("add-err").textContent = data.error || "Ошибка"; return showAddStep("phone"); }
+  if (data.status === "ready") return finishAdd();
+  el("qr-box").innerHTML = data.svg || "";
+  el("qr-status").textContent = "Ожидаю сканирования…";
+  state.qrActive = true;
+  pollQr();
+}
+
+async function pollQr() {
+  if (!state.qrActive) return;
+  const { ok, data } = await post(`/api/profiles/${state.profileId}/login/qr/poll`);
+  if (!state.qrActive) return;
+  if (!ok) { el("qr-status").textContent = data.error || "Ошибка"; return; }
+  if (data.status === "ready") { state.qrActive = false; return finishAdd(); }
+  if (data.status === "password") { state.qrActive = false; return showAddStep("password"); }
+  if (data.status === "expired") { return startQr(); }
+  if (data.svg) {            // QR обновился (старый истёк) — показываем новый
+    el("qr-box").innerHTML = data.svg;
+    el("qr-status").textContent = "QR обновлён, сканируй заново…";
+  }
+  setTimeout(pollQr, 1500);
+}
 
 async function addNext() {
   el("add-err").textContent = "";

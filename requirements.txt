@@ -2,3 +2,4 @@ telethon>=1.36.0
 fastapi>=0.110
 uvicorn[standard]>=0.29
 python-multipart>=0.0.9
+qrcode>=7.4

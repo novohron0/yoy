@@ -23,12 +23,13 @@ Telegram планировщик постов — веб-панель.
 import asyncio
 import hashlib
 import hmac
+import io
 import json
 import os
 import secrets
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
@@ -793,6 +794,62 @@ async def login_password(pid: str, body: PasswordIn, user=Depends(require_user))
         return JSONResponse({"error": f"Неверный пароль 2FA: {e}"}, status_code=400)
     state.login[pid] = {"phone": None, "phone_code_hash": None}
     return {"step": "ready"}
+
+
+# ---------------------------------------------------------------------------
+# Вход по QR-коду (обходит SMS/код — сканируешь QR в Telegram)
+# ---------------------------------------------------------------------------
+def _qr_svg(data):
+    """Рендерит QR в SVG прямо на сервере (токен входа не уходит к третьим лицам)."""
+    import qrcode
+    import qrcode.image.svg
+
+    img = qrcode.make(data, image_factory=qrcode.image.svg.SvgPathImage, box_size=11, border=2)
+    buf = io.BytesIO()
+    img.save(buf)
+    return buf.getvalue().decode("utf-8")
+
+
+@app.post("/api/profiles/{pid}/login/qr")
+async def login_qr_start(pid: str, user=Depends(require_user)):
+    _owned_profile(pid, user)
+    client = await get_client(pid)
+    if client is None:
+        return JSONResponse({"error": "Профиль не найден"}, status_code=404)
+    if await client.is_user_authorized():
+        return {"status": "ready"}
+    try:
+        qr = await client.qr_login()
+    except Exception as e:
+        return JSONResponse({"error": f"Не удалось создать QR: {e}"}, status_code=400)
+    state.login.setdefault(pid, {})["qr"] = qr
+    return {"status": "pending", "url": qr.url, "svg": _qr_svg(qr.url)}
+
+
+@app.post("/api/profiles/{pid}/login/qr/poll")
+async def login_qr_poll(pid: str, user=Depends(require_user)):
+    _owned_profile(pid, user)
+    qr = state.login.get(pid, {}).get("qr")
+    if qr is None:
+        return {"status": "expired"}
+    try:
+        await qr.wait(timeout=5)
+    except asyncio.TimeoutError:
+        # ещё не отсканировали; если токен истёк — пересоздаём (новый QR)
+        try:
+            if qr.expires and qr.expires <= datetime.now(timezone.utc):
+                await qr.recreate()
+                return {"status": "pending", "url": qr.url, "svg": _qr_svg(qr.url)}
+        except Exception:
+            pass
+        return {"status": "pending"}
+    except SessionPasswordNeededError:
+        return {"status": "password"}
+    except Exception as e:
+        return JSONResponse({"error": f"Ошибка входа по QR: {e}"}, status_code=400)
+    state.login[pid].pop("qr", None)
+    state.login[pid].update({"phone": None, "phone_code_hash": None})
+    return {"status": "ready"}
 
 
 # ---------------------------------------------------------------------------
