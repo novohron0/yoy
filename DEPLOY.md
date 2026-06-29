@@ -1,0 +1,156 @@
+# Деплой на Oracle Cloud Always Free (24/7, доступ с телефона)
+
+Цель: бот и панель крутятся в облаке круглосуточно, а ты заходишь с телефона по
+ссылке, добавляешь чаты и расписания. Сообщения уходят по таймеру, даже когда
+твой компьютер выключен.
+
+> **Важно про безопасность.** Панель даёт полный доступ к твоим Telegram-аккаунтам.
+> Поэтому она закрыта паролем (`PANEL_PASSWORD`), а заходить нужно по **HTTPS**
+> (см. шаг 6 — бесплатный домен + Caddy). Без HTTPS пароль идёт по сети открыто.
+
+---
+
+## 1. Создать аккаунт Oracle Cloud
+
+1. Зайди на https://www.oracle.com/cloud/free/ → **Start for free**.
+2. Регистрация: email, страна, телефон, **банковская карта** (для верификации;
+   с Always Free деньги не списываются).
+3. Выбери домашний регион поближе к тебе.
+
+## 2. Создать бесплатную виртуальную машину
+
+1. Меню → **Compute → Instances → Create instance**.
+2. **Image**: Ubuntu 22.04 (или 24.04).
+3. **Shape**: жми *Change shape* → раздел **Ampere (Arm)** → `VM.Standard.A1.Flex`,
+   поставь **1 OCPU / 6 GB RAM** (всё в рамках Always Free). Если Ampere «нет в
+   наличии» — пробуй другой момент времени или регион, либо возьми
+   `VM.Standard.E2.1.Micro` (x86, тоже Always Free, послабее).
+4. **SSH keys**: *Generate a key pair* → скачай приватный ключ (понадобится для входа).
+5. **Create**. Через минуту увидишь **Public IP address** — запиши его.
+
+## 3. Открыть порты (два места!)
+
+Oracle по умолчанию закрывает всё. Нужно открыть.
+
+**а) В облаке (Security List / NSG):**
+1. На странице инстанса → раздел **Virtual cloud network** → подсеть → **Security List**.
+2. **Add Ingress Rules**:
+   - Source `0.0.0.0/0`, IP Protocol TCP, Destination port **80** и **443**
+     (для HTTPS через Caddy).
+   - (Опционально для быстрого теста) порт **8000**.
+
+**б) На самой машине (iptables в Ubuntu).** Подключись по SSH:
+```bash
+ssh -i /путь/к/ключу ubuntu@ТВОЙ_PUBLIC_IP
+```
+И открой порты:
+```bash
+sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT
+sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
+sudo netfilter-persistent save
+```
+
+## 4. Установить Docker
+
+На машине (по SSH):
+```bash
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker ubuntu
+newgrp docker            # или выйди и зайди по SSH заново
+```
+
+## 5. Загрузить проект и запустить
+
+```bash
+# поставить git, если нет
+sudo apt-get update && sudo apt-get install -y git
+
+# забрать код (замени на свой git-репозиторий, если он на GitHub)
+git clone ВАШ_РЕПОЗИТОРИЙ yoy
+cd yoy
+
+# создать .env с паролем и часовым поясом
+cp .env.example .env
+nano .env        # впиши длинный PANEL_PASSWORD и свой TZ (напр. Europe/Moscow)
+
+# собрать и запустить (в фоне, с автоперезапуском)
+docker compose up -d --build
+```
+
+Проверка, что живо:
+```bash
+docker compose logs -f          # Ctrl+C чтобы выйти из логов
+```
+
+> Если решил пропустить HTTPS и просто проверить — открой на телефоне
+> `http://ТВОЙ_PUBLIC_IP:8000` (нужно открыть порт 8000 на шаге 3). Браузер
+> спросит логин/пароль из `.env`. **Это только для теста — пароль идёт открыто.**
+
+## 6. HTTPS + красивый адрес (рекомендуется)
+
+Чтобы заходить с телефона безопасно и по имени, а не по IP:
+
+1. **Бесплатный домен:** зарегистрируйся на https://www.duckdns.org (вход через
+   Google/GitHub), создай поддомен, например `mybot`, и пропиши в нём свой
+   **Public IP**. Получишь адрес `mybot.duckdns.org`.
+
+2. **Caddy** (автоматически получает и продлевает HTTPS-сертификат). На машине,
+   в папке `yoy`, создай файл `Caddyfile`:
+   ```
+   mybot.duckdns.org {
+       reverse_proxy scheduler:8000
+   }
+   ```
+   Затем создай `docker-compose.override.yml`:
+   ```yaml
+   services:
+     caddy:
+       image: caddy:2
+       restart: unless-stopped
+       ports:
+         - "80:80"
+         - "443:443"
+       volumes:
+         - ./Caddyfile:/etc/caddy/Caddyfile
+         - caddy_data:/data
+   volumes:
+     caddy_data:
+   ```
+   И в `docker-compose.yml` у сервиса `scheduler` **убери** проброс `ports: ["8000:8000"]`
+   (наружу теперь смотрит только Caddy). Перезапусти:
+   ```bash
+   docker compose up -d
+   ```
+
+3. Готово: открывай на телефоне **https://mybot.duckdns.org** → логин/пароль → панель.
+
+## 7. Вход в Telegram-аккаунты
+
+Профили заводятся прямо в панели (твои локальные сессии переносить не нужно):
+1. «＋ Добавить аккаунт» → введи `api_id` / `api_hash` (с https://my.telegram.org).
+2. Телефон → код из Telegram → пароль 2FA (если есть).
+3. Дальше — поиск чатов и расписания, как локально.
+
+Сессии и расписания хранятся в томе `./profiles` на сервере и переживают
+перезапуски и пересборку контейнера.
+
+---
+
+## Обслуживание
+
+| Действие | Команда (в папке `yoy` на сервере) |
+|---|---|
+| Посмотреть логи | `docker compose logs -f` |
+| Перезапустить | `docker compose restart` |
+| Остановить | `docker compose down` |
+| Обновить код | `git pull && docker compose up -d --build` |
+| Бэкап аккаунтов | скопировать папку `profiles/` к себе |
+
+## Частые вопросы
+
+- **Сообщения уходят не в то время** → проверь `TZ` в `.env` и пересоздай контейнер
+  (`docker compose up -d`).
+- **Сайт не открывается** → порт не открыт в Security List ИЛИ в iptables (шаг 3,
+  оба пункта обязательны).
+- **Аккаунт Telegram заблокировали** → userbot нельзя использовать для спама/массовых
+  рассылок, за это банят. Это ограничение Telegram, а не хостинга.

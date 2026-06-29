@@ -7,3 +7,5 @@ profiles/
 __pycache__/
 .venv/
 .DS_Store
+# Пароль панели и переменные окружения
+.env

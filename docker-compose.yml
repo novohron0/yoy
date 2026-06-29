@@ -1,0 +1,17 @@
+services:
+  scheduler:
+    build: .
+    restart: unless-stopped
+    ports:
+      # наружу слушаем 8000; через Caddy (см. DEPLOY.md) будет HTTPS
+      - "8000:8000"
+    environment:
+      # ОБЯЗАТЕЛЬНО задай пароль — без него панель открыта всем.
+      # Значения берутся из файла .env рядом с этим compose.
+      PANEL_USER: ${PANEL_USER:-admin}
+      PANEL_PASSWORD: ${PANEL_PASSWORD:?Задай PANEL_PASSWORD в .env}
+      # Часовой пояс для расписаний (иначе UTC). Пример: Europe/Moscow, Asia/Almaty
+      TZ: ${TZ:-UTC}
+    volumes:
+      # сессии и расписания переживают перезапуски/пересборку контейнера
+      - ./profiles:/app/profiles

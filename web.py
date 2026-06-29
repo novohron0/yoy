@@ -21,13 +21,15 @@ Telegram планировщик постов — веб-панель.
 """
 
 import asyncio
+import base64
 import json
 import os
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -285,6 +287,47 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Защита паролем (HTTP Basic Auth)
+# ---------------------------------------------------------------------------
+# Панель даёт доступ к Telegram-аккаунтам, поэтому в облаке её НЕЛЬЗЯ
+# выставлять без пароля. Логин/пароль берём из переменных окружения:
+#   PANEL_USER     — имя пользователя (по умолчанию "admin")
+#   PANEL_PASSWORD — пароль (если не задан, защита выключена — только для
+#                    локального запуска на 127.0.0.1)
+PANEL_USER = os.environ.get("PANEL_USER", "admin")
+PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD")
+
+if not PANEL_PASSWORD:
+    print(
+        "[auth] ВНИМАНИЕ: PANEL_PASSWORD не задан — панель открыта без пароля. "
+        "Это безопасно только для локального запуска (127.0.0.1). "
+        "Перед публикацией в интернет задай PANEL_PASSWORD."
+    )
+
+
+@app.middleware("http")
+async def basic_auth(request: Request, call_next):
+    if PANEL_PASSWORD:
+        header = request.headers.get("Authorization", "")
+        ok = False
+        if header.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(header[6:]).decode("utf-8")
+                user, _, pw = decoded.partition(":")
+                ok = secrets.compare_digest(user, PANEL_USER) and secrets.compare_digest(
+                    pw, PANEL_PASSWORD
+                )
+            except Exception:
+                ok = False
+        if not ok:
+            return Response(
+                status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="Telegram Scheduler"'},
+            )
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -634,5 +677,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 if __name__ == "__main__":
     import uvicorn
 
-    print("Открой веб-панель: http://127.0.0.1:8000")
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "8000"))
+    print(f"Открой веб-панель: http://{host}:{port}")
+    uvicorn.run(app, host=host, port=port)
