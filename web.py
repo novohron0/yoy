@@ -88,7 +88,7 @@ CRYPTOBOT_API = os.environ.get("CRYPTOBOT_API", "https://pay.crypt.bot/api")
 
 # Тарифы доступа. Цена в рублях за период `days`. Меняй цифры как нужно.
 TIERS = {
-    "start":    {"name": "Старт",    "price_rub": 1000, "days": 7, "max_accounts": 1},
+    "start":    {"name": "Старт",    "price_rub": 990, "days": 7, "max_accounts": 1},
     "standard": {"name": "Стандарт", "price_rub": 2500, "days": 7, "max_accounts": 3},
     "pro":      {"name": "Про",      "price_rub": 5000, "days": 7, "max_accounts": 20},
 }

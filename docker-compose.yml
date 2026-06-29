@@ -2,11 +2,12 @@ services:
   scheduler:
     build: .
     restart: unless-stopped
+    # все переменные из .env (CRYPTOBOT_TOKEN, TZ, SECRET_KEY и т.п.) — внутрь контейнера
+    env_file:
+      - .env
     environment:
       # Часовой пояс для расписаний (иначе UTC). Пример: Europe/Moscow, Asia/Almaty
       TZ: ${TZ:-UTC}
-      # SECRET_KEY можно не задавать — сгенерируется и сохранится в
-      # profiles/secret.key (тогда сессии входа переживают перезапуск).
     volumes:
       # профили, расписания, пользователи, ключ подписи — переживают перезапуски
       - ./profiles:/app/profiles
