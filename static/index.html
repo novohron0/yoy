@@ -211,7 +211,8 @@
   <div class="topbar"><h1>Доступ</h1><button class="btn ghost" onclick="logout()">Выйти</button></div>
   <div class="section" style="max-width:420px;margin:0 auto;text-align:center">
     <div id="pay-info"></div>
-    <button class="btn full" id="pay-btn" onclick="startPay()" style="margin-top:16px">Оплатить криптой</button>
+    <a class="btn full" id="pay-btn" target="_blank" rel="noopener" onclick="onPayTap()"
+       style="margin-top:16px;display:none;text-decoration:none;text-align:center">Оплатить</a>
     <button class="btn ghost full" id="pay-check" onclick="checkPayOnce()" style="margin-top:10px;display:none">Я оплатил — проверить</button>
     <div class="hint" id="pay-status" style="margin-top:14px"></div>
   </div>
@@ -998,24 +999,39 @@ function showPay() {
      </div>`;
   el("pay-status").textContent = "";
   el("pay-check").style.display = "none";
+  const a = el("pay-btn");
+  a.style.display = "none";
+  a.removeAttribute("href");
+  a.textContent = price ? `Оплатить ${price} ₽` : "Оплатить";
+  showScreen("screen-pay");
   if (b.crypto_enabled) {
-    el("pay-btn").style.display = "";
-    el("pay-btn").textContent = price ? `Оплатить ${price} ₽` : "Оплатить";
+    prepareInvoice();   // заранее готовим счёт, чтобы кнопка была прямой ссылкой
   } else {
-    el("pay-btn").style.display = "none";
     el("pay-status").innerHTML = "Автооплата пока не настроена. Напиши администратору, чтобы выдал доступ.";
   }
-  showScreen("screen-pay");
 }
 
-async function startPay() {
-  el("pay-status").textContent = "Создаю счёт…";
+async function prepareInvoice() {
+  el("pay-status").textContent = "Готовлю счёт…";
   const { ok, data } = await post("/api/billing/invoice");
-  if (!ok) { el("pay-status").textContent = data.error || "Ошибка"; return; }
-  window.open(data.pay_url, "_blank");
-  el("pay-status").innerHTML = "Счёт открыт в CryptoBot. Оплати (если нет крипты — там же «Купить»/P2P).<br>После оплаты доступ откроется сам. Жду…";
+  if (!ok) { el("pay-status").textContent = data.error || "Не удалось создать счёт"; return; }
+  const a = el("pay-btn");
+  a.href = data.pay_url;
+  a.style.display = "";
+  el("pay-status").innerHTML = "Нажми кнопку — откроется CryptoBot. Нет крипты? Там же «Купить»/P2P.";
   el("pay-check").style.display = "";
+  startPolling();
+}
+
+function onPayTap() {
+  // прямой тап по ссылке открывает CryptoBot; запускаем активный опрос оплаты
+  el("pay-status").innerHTML = "Жду оплату… После оплаты вернись сюда — доступ откроется сам.";
+  startPolling();
+}
+
+function startPolling() {
   state.payPolls = 0;
+  if (state.pollTimer) clearTimeout(state.pollTimer);
   pollPay();
 }
 
@@ -1024,7 +1040,7 @@ async function pollPay() {
   state.payPolls = (state.payPolls || 0) + 1;
   const { ok, data } = await post("/api/billing/check");
   if (ok && data.paid) { toast("Оплата получена ✓ Доступ открыт", "ok"); return enterApp(); }
-  if (state.payPolls < 120) setTimeout(pollPay, 3000);   // опрос ~6 минут
+  if (state.payPolls < 120) state.pollTimer = setTimeout(pollPay, 3000);   // опрос ~6 минут
 }
 
 async function checkPayOnce() {
