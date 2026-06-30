@@ -349,6 +349,48 @@ def _session_path(profile):
     return os.path.join(PROFILES_DIR, profile["id"])
 
 
+def _parse_proxy(raw):
+    """Разбирает строку прокси в формат python-socks для Telethon.
+    Поддержка: socks5://user:pass@host:port, host:port:user:pass, host:port."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    ptype = "socks5"
+    rest = raw
+    if "://" in raw:
+        scheme, rest = raw.split("://", 1)
+        ptype = scheme.lower()
+    user = pwd = host = port = None
+    try:
+        if "@" in rest:
+            creds, hostport = rest.rsplit("@", 1)
+            if ":" in creds:
+                user, pwd = creds.split(":", 1)
+            else:
+                user = creds
+            parts = hostport.split(":")
+            host, port = parts[0], parts[1]
+        else:
+            parts = rest.split(":")
+            host = parts[0]
+            port = parts[1] if len(parts) > 1 else None
+            if len(parts) >= 4:        # host:port:user:pass
+                user, pwd = parts[2], parts[3]
+        if not host or not port:
+            return None
+        ptype = {"socks5": "socks5", "socks4": "socks4", "http": "http", "https": "http"}.get(ptype, "socks5")
+        return {
+            "proxy_type": ptype,
+            "addr": host,
+            "port": int(port),
+            "username": user or None,
+            "password": pwd or None,
+            "rdns": True,
+        }
+    except Exception:
+        return None
+
+
 async def get_client(pid) -> TelegramClient | None:
     """Возвращает подключённый клиент для профиля (создаёт при необходимости)."""
     client = state.clients.get(pid)
@@ -361,7 +403,10 @@ async def get_client(pid) -> TelegramClient | None:
     if profile is None:
         return None
 
-    client = TelegramClient(_session_path(profile), profile["api_id"], profile["api_hash"])
+    client = TelegramClient(
+        _session_path(profile), profile["api_id"], profile["api_hash"],
+        proxy=_parse_proxy(profile.get("proxy")),
+    )
     await client.connect()
     state.clients[pid] = client
     state.entities.setdefault(pid, {})
@@ -938,6 +983,11 @@ class CreateProfileIn(BaseModel):
     name: str
     api_id: str
     api_hash: str
+    proxy: str = ""
+
+
+class ProxyIn(BaseModel):
+    proxy: str = ""
 
 
 class PhoneIn(BaseModel):
@@ -1011,7 +1061,10 @@ async def _destroy_profile(profile):
     client = state.clients.pop(pid, None)
     if client is None:
         try:
-            client = TelegramClient(_session_path(profile), profile["api_id"], profile["api_hash"])
+            client = TelegramClient(
+                _session_path(profile), profile["api_id"], profile["api_hash"],
+                proxy=_parse_proxy(profile.get("proxy")),
+            )
             await client.connect()
         except Exception:
             client = None
@@ -1055,6 +1108,7 @@ async def list_profiles(user=Depends(require_user)):
             "on_cooldown": _on_cooldown(p),
             "flagged": bool(p.get("flagged")),
             "flood_note": p.get("flood_note") or "",
+            "has_proxy": bool(p.get("proxy")),
         })
     return {"profiles": out}
 
@@ -1079,12 +1133,44 @@ async def create_profile(body: CreateProfileIn, user=Depends(require_active)):
                 status_code=403,
             )
 
+    proxy = body.proxy.strip()
+    if proxy and _parse_proxy(proxy) is None:
+        return JSONResponse({"error": "Прокси в неверном формате (нужно socks5://user:pass@host:port или host:port:user:pass)"}, status_code=400)
+
     pid = uuid.uuid4().hex[:8]
     profiles = load_profiles()
-    profiles.append({"id": pid, "name": name, "api_id": int(api_id), "api_hash": api_hash, "owner": user["id"]})
+    profiles.append({"id": pid, "name": name, "api_id": int(api_id), "api_hash": api_hash, "owner": user["id"], "proxy": proxy})
     save_profiles(profiles)
     state.login[pid] = {"phone": None, "phone_code_hash": None}
     return {"id": pid, "step": "phone"}
+
+
+@app.get("/api/profiles/{pid}/proxy")
+async def get_proxy(pid: str, user=Depends(require_user)):
+    profile = _owned_profile(pid, user)
+    return {"proxy": profile.get("proxy", "")}
+
+
+@app.post("/api/profiles/{pid}/proxy")
+async def set_proxy(pid: str, body: ProxyIn, user=Depends(require_active)):
+    _owned_profile(pid, user)
+    proxy = body.proxy.strip()
+    if proxy and _parse_proxy(proxy) is None:
+        return JSONResponse({"error": "Прокси в неверном формате"}, status_code=400)
+    # отключаем текущий клиент — пересоздастся с новым прокси
+    client = state.clients.pop(pid, None)
+    if client is not None:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    profiles = load_profiles()
+    for p in profiles:
+        if p["id"] == pid:
+            p["proxy"] = proxy
+            break
+    save_profiles(profiles)
+    return {"ok": True, "proxy": proxy}
 
 
 @app.get("/api/profiles/{pid}/status")

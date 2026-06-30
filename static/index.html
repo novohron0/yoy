@@ -360,6 +360,9 @@
       <input id="in-api-id" inputmode="numeric" placeholder="1234567" />
       <label>api_hash (32 hex-символа)</label>
       <input id="in-api-hash" placeholder="abcdef0123..." />
+      <label>Прокси (рекомендуется, SOCKS5)</label>
+      <input id="in-proxy" placeholder="socks5://user:pass@host:port" />
+      <p class="hint">Каждый аккаунт через свой прокси — меньше банов. Можно оставить пустым.</p>
     </div>
 
     <div id="add-phone" class="hidden">
@@ -477,11 +480,13 @@ async function loadProfiles() {
       <div>
         <div class="pname">${escapeHtml(p.name)}</div>
         <div class="pstate ${p.authorized ? "on" : "off"}">${p.authorized ? "● подключён" : "○ нужен вход"}</div>
+        <div class="pstate" style="color:var(--muted);cursor:pointer" data-proxy>🌐 ${p.has_proxy ? "прокси ✓" : "прокси не задан"}</div>
         ${flood}
       </div>
       <button class="del" title="Удалить">✕</button>`;
     card.onclick = () => openProfile(p);
     card.querySelector(".del").onclick = (e) => { e.stopPropagation(); deleteProfile(p); };
+    card.querySelector("[data-proxy]").onclick = (e) => { e.stopPropagation(); editProxy(p); };
     grid.appendChild(card);
   }
   const add = document.createElement("div");
@@ -494,6 +499,20 @@ async function loadProfiles() {
 async function deleteProfile(p) {
   if (!confirm(`Удалить профиль «${p.name}» и выйти из аккаунта?`)) return;
   await api(`/api/profiles/${p.id}`, { method: "DELETE" });
+  loadProfiles();
+}
+
+async function editProxy(p) {
+  const { data } = await api(`/api/profiles/${p.id}/proxy`);
+  const cur = (data && data.proxy) || "";
+  const val = prompt(
+    "Прокси для этого аккаунта (SOCKS5).\nФормат: socks5://user:pass@host:port\nПусто — без прокси:",
+    cur
+  );
+  if (val === null) return;
+  const { ok, data: r } = await post(`/api/profiles/${p.id}/proxy`, { proxy: val.trim() });
+  if (!ok) return toast(r.error || "Ошибка", "bad");
+  toast(val.trim() ? "Прокси сохранён ✓ (переподключение)" : "Прокси убран", "ok");
   loadProfiles();
 }
 
@@ -533,7 +552,7 @@ function openAdd(existingId, step) {
     showAddStep(step || "phone");
   } else {
     state.profileId = null;
-    el("in-name").value = ""; el("in-api-id").value = ""; el("in-api-hash").value = "";
+    el("in-name").value = ""; el("in-api-id").value = ""; el("in-api-hash").value = ""; el("in-proxy").value = "";
     el("in-phone").value = ""; el("in-code").value = ""; el("in-password").value = "";
     showAddStep("credentials");
   }
@@ -579,6 +598,7 @@ async function addNext() {
   if (state.addStep === "credentials") {
     const { ok, data } = await post("/api/profiles", {
       name: el("in-name").value, api_id: el("in-api-id").value, api_hash: el("in-api-hash").value,
+      proxy: el("in-proxy").value,
     });
     if (!ok) return (el("add-err").textContent = data.error);
     state.profileId = data.id;
