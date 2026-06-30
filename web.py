@@ -653,40 +653,87 @@ def _join_err(e):
     return name
 
 
+async def _interruptible_sleep(job, seconds):
+    """Спит, периодически проверяя флаг отмены."""
+    slept = 0
+    while slept < seconds:
+        if job.get("cancel"):
+            return
+        await asyncio.sleep(2)
+        slept += 2
+
+
 async def _join_job(pid, links):
     job = state.join_jobs[pid]
     client = await get_client(pid)
     if client is None or not await client.is_user_authorized():
         job["running"] = False
+        job["status"] = "не авторизован"
         return
+
+    # собрать уже вступленные публичные username — чтобы пропускать без попытки
+    joined_usernames = set()
+    try:
+        async for d in client.iter_dialogs():
+            u = getattr(d.entity, "username", None)
+            if u:
+                joined_usernames.add(u.lower())
+    except Exception:
+        pass
+
     for i, link in enumerate(links):
-        reason = None
-        if _on_cooldown(get_profile(pid)):
-            reason = "аккаунт на паузе (флуд)"
-        else:
-            parsed = _parse_join_link(link)
-            if not parsed:
-                reason = "не похоже на ссылку"
-            else:
-                kind, val = parsed
-                try:
-                    if kind == "private":
-                        await client(ImportChatInviteRequest(val))
-                    else:
-                        ent = await client.get_entity(val)
-                        await client(JoinChannelRequest(ent))
-                except FloodWaitError as e:
-                    _set_cooldown(pid, e.seconds + 30, note=f"FloodWait {e.seconds}s при вступлении")
-                    job["failed"].append({"link": link, "reason": f"flood {e.seconds}s — стоп"})
-                    job["done"] += 1
+        if job.get("cancel"):
+            break
+        parsed = _parse_join_link(link)
+        if not parsed:
+            job["failed"].append({"link": link, "reason": "не похоже на ссылку"})
+            job["done"] += 1
+            continue
+        kind, val = parsed
+
+        # пропуск уже вступленных публичных каналов
+        if kind == "public" and val.lower() in joined_usernames:
+            job["skipped"].append({"link": link, "reason": "уже участник"})
+            job["done"] += 1
+            continue
+
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                if kind == "private":
+                    await client(ImportChatInviteRequest(val))
+                else:
+                    ent = await client.get_entity(val)
+                    await client(JoinChannelRequest(ent))
+                job["joined"].append({"link": link})
+                if kind == "public":
+                    joined_usernames.add(val.lower())
+                break
+            except FloodWaitError as e:
+                # авто-продолжение: ждём флуд и пробуем снова (если не слишком долго)
+                if e.seconds > 3600 or attempts > 3:
+                    job["failed"].append({"link": link, "reason": f"flood {e.seconds}s — слишком долго, пропуск"})
                     break
-                except Exception as e:
-                    reason = _join_err(e)
-        job["failed" if reason else "joined"].append({"link": link, "reason": reason} if reason else {"link": link})
+                job["status"] = f"флуд: жду {e.seconds}с и продолжаю…"
+                await _interruptible_sleep(job, e.seconds + 5)
+                if job.get("cancel"):
+                    break
+                job["status"] = "running"
+                continue
+            except Exception as e:
+                reason = _join_err(e)
+                job["skipped" if reason == "уже участник" else "failed"].append({"link": link, "reason": reason})
+                break
+
         job["done"] += 1
+        if job.get("cancel"):
+            break
         if i < len(links) - 1:
-            await asyncio.sleep(random.uniform(JOIN_GAP_MIN, JOIN_GAP_MAX))
+            await _interruptible_sleep(job, random.uniform(JOIN_GAP_MIN, JOIN_GAP_MAX))
+
     job["running"] = False
+    job["status"] = "остановлено" if job.get("cancel") else "готово"
 
 
 async def _join_job_safe(pid, links):
@@ -1722,8 +1769,12 @@ async def join_chats(pid: str, body: JoinIn, user=Depends(require_active)):
         return JSONResponse({"error": "За раз не больше 200 ссылок"}, status_code=400)
     existing = state.join_jobs.get(pid)
     if existing and existing.get("running"):
-        return JSONResponse({"error": "Вступление уже идёт — дождись окончания"}, status_code=409)
-    state.join_jobs[pid] = {"total": len(links), "done": 0, "joined": [], "failed": [], "running": True}
+        return JSONResponse({"error": "Вступление уже идёт — дождись окончания или нажми Стоп"}, status_code=409)
+    state.join_jobs[pid] = {
+        "total": len(links), "done": 0,
+        "joined": [], "skipped": [], "failed": [],
+        "running": True, "cancel": False, "status": "running",
+    }
     asyncio.create_task(_join_job_safe(pid, links))
     return {"ok": True, "total": len(links)}
 
@@ -1733,8 +1784,71 @@ async def join_chats_status(pid: str, user=Depends(require_user)):
     _owned_profile(pid, user)
     job = state.join_jobs.get(pid)
     if not job:
-        return {"running": False, "total": 0, "done": 0, "joined": [], "failed": []}
+        return {"running": False, "total": 0, "done": 0, "joined": [], "skipped": [], "failed": [], "status": ""}
     return job
+
+
+@app.post("/api/profiles/{pid}/join/stop")
+async def join_chats_stop(pid: str, user=Depends(require_user)):
+    _owned_profile(pid, user)
+    job = state.join_jobs.get(pid)
+    if job:
+        job["cancel"] = True
+    return {"ok": True}
+
+
+@app.get("/api/profiles/{pid}/tgfolders")
+async def list_tg_folders(pid: str, user=Depends(require_user)):
+    """Список папок Telegram аккаунта с чатами внутри (для импорта в получателей)."""
+    _owned_profile(pid, user)
+    client = await get_client(pid)
+    if client is None or not await client.is_user_authorized():
+        return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    try:
+        res = await client(GetDialogFiltersRequest())
+        filters = getattr(res, "filters", res) or []
+    except Exception as e:
+        return JSONResponse({"error": f"Не удалось получить папки: {e}"}, status_code=400)
+    out = []
+    for f in filters:
+        peers = getattr(f, "include_peers", None)
+        if peers is None:   # DialogFilterDefault (папка «Все чаты») — пропускаем
+            continue
+        title = getattr(f, "title", "")
+        title_text = getattr(title, "text", title) if title else ""
+        chats = []
+        for p in peers:
+            try:
+                ent = await client.get_entity(p)
+                _cache(pid, ent)
+                chats.append(_brief(ent))
+            except Exception:
+                pass
+        out.append({"name": title_text or "Папка", "chats": chats})
+    return {"folders": out}
+
+
+@app.get("/api/profiles/{pid}/alldialogs")
+async def all_dialogs(pid: str, user=Depends(require_user)):
+    """Все группы и каналы аккаунта (для кнопки «Выбрать все»)."""
+    _owned_profile(pid, user)
+    client = await get_client(pid)
+    if client is None or not await client.is_user_authorized():
+        return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    out, seen = [], set()
+    try:
+        async for d in client.iter_dialogs():
+            e = d.entity
+            if isinstance(e, (Chat, Channel)):
+                _cache(pid, e)
+                peer_id = utils.get_peer_id(e)
+                if peer_id in seen:
+                    continue
+                seen.add(peer_id)
+                out.append(_brief(e))
+    except Exception as e:
+        return JSONResponse({"error": f"Ошибка: {e}"}, status_code=400)
+    return {"results": out}
 
 
 @app.post("/api/profiles/{pid}/folder")

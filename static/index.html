@@ -256,6 +256,11 @@
     <div class="chips" id="recipients">
       <div class="add-chat" onclick="openSearch()">＋ Добавить чат</div>
     </div>
+    <div class="row" style="gap:8px;margin-top:8px">
+      <button class="btn ghost" type="button" onclick="openFolders()" style="flex:0 0 auto">📁 Из папки TG</button>
+      <button class="btn ghost" type="button" onclick="selectAllChats()" style="flex:0 0 auto">Выбрать все</button>
+      <button class="btn ghost" type="button" onclick="clearRecipients()" style="flex:0 0 auto">Очистить</button>
+    </div>
 
     <div style="margin-top:14px">
       <div class="hint" style="margin-bottom:6px">📁 Папки чатов — клик добавляет все чаты папки сразу:</div>
@@ -337,6 +342,7 @@
       Защищает аккаунт от блокировок. По умолчанию 10–30 сек.</p>
   </div>
 
+  <button class="btn ghost full" type="button" onclick="loadLast()" style="margin-bottom:10px">↩ Загрузить последние настройки</button>
   <div class="row" style="gap:10px">
     <button class="btn full" id="save-btn" onclick="saveSchedule()">Запланировать</button>
     <button class="btn ghost full" onclick="sendNow()">Отправить сейчас</button>
@@ -380,6 +386,7 @@ https://t.me/durov
 @channel
 https://t.me/+AbCdEf..."></textarea>
     <button class="btn full" id="join-start" onclick="startJoin()" style="margin-top:12px">Начать вступление</button>
+    <button class="btn ghost full" id="join-stop" onclick="stopJoin()" style="margin-top:8px;display:none">⏹ Стоп</button>
     <div class="hint" id="join-progress" style="margin-top:12px"></div>
   </div>
   <div class="section" id="join-stats-box" style="display:none">
@@ -456,9 +463,22 @@ https://t.me/+AbCdEf..."></textarea>
     <p class="sub">Лс, группы и каналы — как в поиске Telegram. Жми, чтобы выбрать.</p>
     <input id="search-input" placeholder="Введи имя, @username или название…" oninput="onSearchInput()" />
     <div class="results" id="search-results"></div>
+    <button class="btn ghost full" type="button" onclick="selectAllResults()" style="margin-top:8px">Выбрать все найденные</button>
     <div class="modal-actions">
       <button class="btn ghost" onclick="closeSearch()">Отмена</button>
       <button class="btn" onclick="closeSearch()">Готово</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ Модалка: папки Telegram ============ -->
+<div id="modal-folders" class="overlay hidden">
+  <div class="modal">
+    <h2>Папки Telegram</h2>
+    <p class="sub">Выбери папку — все её чаты добавятся в получателей.</p>
+    <div class="results" id="folders-list"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeFolders()">Закрыть</button>
     </div>
   </div>
 </div>
@@ -483,6 +503,7 @@ let state = {
   tiers: null,
   payPolls: 0,
   editingSid: null,
+  lastSearch: [],
 };
 
 // ---------- helpers ----------
@@ -852,19 +873,30 @@ async function pollJoin() {
 }
 
 function renderJoin(job) {
-  if (!job.total) { el("join-progress").textContent = ""; return; }
-  el("join-progress").textContent = `${job.done}/${job.total}` + (job.running ? " — идёт…" : " — готово ✓");
+  const stopBtn = el("join-stop");
+  if (!job.total) { el("join-progress").textContent = ""; stopBtn.style.display = "none"; return; }
+  const st = (job.status && job.status !== "running") ? ` — ${escapeHtml(job.status)}` : (job.running ? " — идёт…" : "");
+  el("join-progress").textContent = `${job.done}/${job.total}${st}`;
+  stopBtn.style.display = job.running ? "" : "none";
+  el("join-start").disabled = !!job.running;
+  const j = (job.joined || []).length, sk = (job.skipped || []).length, fl = (job.failed || []).length;
   const box = el("join-stats-box");
-  if ((job.joined || []).length || (job.failed || []).length) {
+  if (j || sk || fl) {
     box.style.display = "";
-    const fails = (job.failed || []).map(f =>
-      `<div class="hint">• ${escapeHtml(f.link)} — ${escapeHtml(f.reason || "")}</div>`).join("");
+    const fails = (job.failed || []).map(f => `<div class="hint">• ${escapeHtml(f.link)} — ${escapeHtml(f.reason || "")}</div>`).join("");
+    const skips = (job.skipped || []).map(f => `<div class="hint">• ${escapeHtml(f.link)} — ${escapeHtml(f.reason || "")}</div>`).join("");
     el("join-stats").innerHTML =
-      `<div style="color:var(--ok)">✅ Вступил: ${(job.joined || []).length}</div>
-       <div style="color:var(--err);margin:6px 0 4px">❌ Не вступил: ${(job.failed || []).length}</div>${fails}`;
+      `<div style="color:var(--ok)">✅ Вступил: ${j}</div>
+       <div style="color:var(--muted);margin-top:4px">⏭ Пропущено (уже участник): ${sk}</div>${skips}
+       <div style="color:var(--err);margin:6px 0 4px">❌ Не вступил: ${fl}</div>${fails}`;
   } else {
     box.style.display = "none";
   }
+}
+
+async function stopJoin() {
+  await post(`/api/profiles/${state.profileId}/join/stop`);
+  toast("Останавливаю…", "ok");
 }
 
 async function collectFolder() {
@@ -888,6 +920,65 @@ function renderRecipients() {
     box.insertBefore(chip, addBtn);
   }
 }
+
+function clearRecipients() {
+  state.recipients = {};
+  renderRecipients();
+}
+
+async function selectAllChats() {
+  toast("Загружаю все чаты…", "ok");
+  const { ok, data } = await api(`/api/profiles/${state.profileId}/alldialogs`);
+  if (!ok) return toast(data.error || "Ошибка", "bad");
+  const results = data.results || [];
+  if (!results.length) return toast("Чатов не найдено", "bad");
+  if (!confirm(`Добавить все чаты (${results.length})?`)) return;
+  let added = 0;
+  for (const r of results) {
+    if (!state.recipients[r.id]) { state.recipients[r.id] = { id: r.id, name: r.name, kind: r.kind }; added++; }
+  }
+  renderRecipients();
+  toast(`Добавлено: ${added}`, "ok");
+}
+
+function selectAllResults() {
+  let added = 0;
+  for (const r of (state.lastSearch || [])) {
+    if (!state.recipients[r.id]) { state.recipients[r.id] = { id: r.id, name: r.name, kind: r.kind }; added++; }
+  }
+  renderRecipients();
+  toast(`Добавлено: ${added}`, "ok");
+}
+
+// ---------- импорт папки Telegram ----------
+async function openFolders() {
+  el("modal-folders").classList.remove("hidden");
+  const box = el("folders-list");
+  box.innerHTML = `<div style="color:var(--muted);padding:10px">Загрузка папок…</div>`;
+  const { ok, data } = await api(`/api/profiles/${state.profileId}/tgfolders`);
+  if (!ok) { box.innerHTML = `<div style="color:var(--err);padding:10px">${escapeHtml(data.error || "Ошибка")}</div>`; return; }
+  const folders = data.folders || [];
+  if (!folders.length) { box.innerHTML = `<div style="color:var(--muted);padding:10px">Папок нет. Создай папку в Telegram и добавь в неё чаты.</div>`; return; }
+  box.innerHTML = "";
+  folders.forEach(f => {
+    const row = document.createElement("div");
+    row.className = "result";
+    row.innerHTML = `<div class="ava">📁</div>
+      <div style="flex:1;min-width:0"><div class="rname">${escapeHtml(f.name)}</div>
+      <div class="rkind">${(f.chats || []).length} чатов</div></div><div style="font-size:18px">＋</div>`;
+    row.onclick = () => applyTgFolder(f);
+    box.appendChild(row);
+  });
+}
+function applyTgFolder(f) {
+  let added = 0;
+  for (const c of (f.chats || [])) {
+    if (!state.recipients[c.id]) { state.recipients[c.id] = { id: c.id, name: c.name, kind: c.kind }; added++; }
+  }
+  renderRecipients();
+  toast(`Из «${f.name}»: +${added}`, "ok");
+}
+function closeFolders() { el("modal-folders").classList.add("hidden"); }
 
 function renderWeekdays() {
   const box = el("weekdays");
@@ -963,6 +1054,7 @@ async function runSearch(q) {
   const { ok, data } = await api(`/api/profiles/${state.profileId}/search?q=${encodeURIComponent(q)}`);
   box.innerHTML = "";
   if (!ok) { box.innerHTML = `<div style="color:var(--err);padding:10px">${escapeHtml(data.error || "Ошибка")}</div>`; return; }
+  state.lastSearch = data.results || [];
   if (!data.results.length) { box.innerHTML = `<div style="color:var(--muted);padding:10px">Ничего не найдено</div>`; return; }
   for (const r of data.results) {
     const row = document.createElement("div");
@@ -1021,6 +1113,43 @@ function validateCommon() {
   return { targets, text };
 }
 
+// ---------- последние настройки (шаблон) ----------
+function saveLast() {
+  try {
+    const snap = {
+      text: el("msg").value,
+      recipients: state.recipients,
+      schedMode: state.schedMode,
+      time: el("sched-time").value,
+      weekdays: [...state.weekdays],
+      dates: [...state.dates],
+      int_min: el("int-min").value, int_max: el("int-max").value,
+      gap_min: el("gap-min").value, gap_max: el("gap-max").value,
+    };
+    localStorage.setItem("yoy_last_" + state.profileId, JSON.stringify(snap));
+  } catch (e) {}
+}
+function loadLast() {
+  let s;
+  try { s = JSON.parse(localStorage.getItem("yoy_last_" + state.profileId)); } catch (e) {}
+  if (!s) { toast("Нет сохранённых настроек", "bad"); return; }
+  el("msg").value = s.text || "";
+  state.recipients = s.recipients || {};
+  el("gap-min").value = (s.gap_min ?? 10);
+  el("gap-max").value = (s.gap_max ?? 30);
+  if (s.schedMode === "interval") {
+    setSchedMode("interval");
+    el("int-min").value = s.int_min || 30; el("int-max").value = s.int_max || 30;
+  } else {
+    setSchedMode("daily");
+    el("sched-time").value = s.time || "12:00";
+    state.weekdays = new Set(s.weekdays || []);
+    state.dates = new Set(s.dates || []);
+  }
+  renderRecipients(); renderWeekdays(); renderDates(); updateModeNote();
+  toast("Последние настройки загружены ✓", "ok");
+}
+
 function readGap() {
   let lo = parseInt(el("gap-min").value);
   let hi = parseInt(el("gap-max").value);
@@ -1033,6 +1162,7 @@ async function saveSchedule() {
   const base = validateCommon();
   if (!base) return;
   const gap = readGap();
+  saveLast();
   let body;
   if (state.schedMode === "interval") {
     const lo = parseInt(el("int-min").value) || 0;
@@ -1064,6 +1194,7 @@ async function sendNow() {
   const base = validateCommon();
   if (!base) return;
   const gap = readGap();
+  saveLast();
   const { ok, data } = await post(`/api/profiles/${state.profileId}/send`, { ...base, ...gap });
   if (!ok) {
     el("compose-err").textContent = data.error || "Ошибка";

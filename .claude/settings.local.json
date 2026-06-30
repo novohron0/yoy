@@ -113,7 +113,29 @@
       "Bash(git commit -m 'Большие файлы: надёжнее \\(берём последнее сообщение от бота\\) + точная причина ошибки в чат *)",
       "Bash(git commit -m '/postnow: пробует все площадки заново \\(сброс fails\\) — чтобы протестить IG Stories под новым кодом *)",
       "Bash(git commit -m 'Фикс TG-истории \\(прямая загрузка, без двухшага\\) + deploy.sh синхронизирует YT-ключи на Railway *)",
-      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Авто-вступление в чаты по ссылкам + сбор каналов в папку *)"
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Авто-вступление в чаты по ссылкам + сбор каналов в папку *)",
+      "Bash(git commit -m 'TG-история: прикладываю превью-кадр \\(thumb\\) — фикс MEDIA_FILE_INVALID для видео-сторис *)",
+      "Bash(grep -nE \"^import os$|^import random$|^import asyncio$\" bot.py)",
+      "Bash(route get *)",
+      "Bash(awk '/interface:/{print $2}')",
+      "Bash(networksetup -listallnetworkservices)",
+      "Bash(networksetup -getwebproxy \"Wi-Fi\")",
+      "Bash(pkill -f spoofdpi)",
+      "Bash(nohup spoofdpi -port 8080)",
+      "Bash(spoofdpi -h)",
+      "Bash(spoofdpi --help)",
+      "Bash(grep -iA1 \"port\\\\|listen\\\\|addr\\\\|proxy\")",
+      "Bash(grep -iB1 \"system-wide proxy\")",
+      "Bash(nohup spoofdpi)",
+      "Bash(grep -iB1 \"tui\\\\|headless\\\\|no-tui\\\\|silent\\\\|log-level\\\\|interactive\")",
+      "Bash(nohup spoofdpi --no-tui)",
+      "Bash(lsof -nP -iTCP:8080 -sTCP:LISTEN)",
+      "Bash(networksetup -setwebproxy \"Wi-Fi\" 127.0.0.1 8080)",
+      "Bash(networksetup -setsecurewebproxy \"Wi-Fi\" 127.0.0.1 8080)",
+      "Bash(networksetup -getsecurewebproxy \"Wi-Fi\")",
+      "Bash(networksetup -setwebproxystate \"Wi-Fi\" off)",
+      "Bash(networksetup -setsecurewebproxystate \"Wi-Fi\" off)",
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Доработки рассылки и вступления *)"
     ]
   }
 }
