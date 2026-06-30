@@ -93,7 +93,11 @@
       "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Экран оплаты: пошаговая инструкция как оплатить без крипты \\(P2P/СБП\\) *)",
       "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Прокси на каждый аккаунт \\(анти-бан\\): свой SOCKS5 на профиль *)",
       "Bash(grep -n \"^import re$\\\\|^import random$\" web.py)",
-      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Spintax: вариативность текста сообщений \\(анти-спам\\) *)"
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Spintax: вариативность текста сообщений \\(анти-спам\\) *)",
+      "Bash(chmod +x backup.sh)",
+      "Bash(bash backup.sh)",
+      "Bash(rm -rf /Users/kamilimangulov/yoy-backups)",
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Авто-бэкап данных: backup.sh \\(архив profiles/, хранит 14 копий\\) *)"
     ]
   }
 }
