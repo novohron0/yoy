@@ -27,6 +27,7 @@ import io
 import json
 import os
 import random
+import re
 import secrets
 import uuid
 from contextlib import asynccontextmanager
@@ -542,11 +543,25 @@ def _clear_cooldown(pid):
         save_profiles(profiles)
 
 
+_SPIN_RE = re.compile(r"\{([^{}]*)\}")
+
+
+def _spin(text):
+    """Spintax: {привет|здравствуй} → случайный вариант (с поддержкой вложенности)."""
+    out = text or ""
+    for _ in range(50):
+        new = _SPIN_RE.sub(lambda m: random.choice(m.group(1).split("|")), out)
+        if new == out:
+            break
+        out = new
+    return out
+
+
 async def _send_one(client, pid, target, text):
     """Отправляет одно сообщение. Возвращает ('ok'|'flood'|'spam'|'error', detail)."""
     try:
         entity = await _resolve(pid, target["id"])
-        await client.send_message(entity, text)
+        await client.send_message(entity, _spin(text))   # каждый раз свой вариант текста
         return "ok", None
     except FloodWaitError as e:
         wait = e.seconds + 30  # запас сверху

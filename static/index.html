@@ -263,6 +263,16 @@
   <div class="section">
     <h3>Сообщение</h3>
     <textarea id="msg" placeholder="Текст поста…"></textarea>
+    <p class="hint" style="margin-top:8px;line-height:1.5">
+      🎲 <b>Spintax</b>: варианты в фигурных скобках через <b>|</b> —
+      <span style="font-family:monospace">{Привет|Здравствуй|Хай}</span> — каждому чату уйдёт
+      случайный вариант. Так рассылка меньше похожа на спам.
+    </p>
+    <div class="row" style="align-items:center;gap:8px">
+      <button class="btn ghost" type="button" onclick="spinPreview()" style="flex:0 0 auto">🎲 Пример</button>
+      <span class="hint" id="spin-info"></span>
+    </div>
+    <div class="mode-note" id="spin-preview" style="display:none;margin-top:8px"></div>
   </div>
 
   <!-- Расписание -->
@@ -843,6 +853,29 @@ async function runSearch(q) {
 }
 
 // ---------- сохранение / отправка ----------
+// ---------- spintax (предпросмотр) ----------
+function spinText(t) {
+  const re = /\{([^{}]*)\}/;
+  let out = t || "", i = 0;
+  while (re.test(out) && i++ < 50) {
+    out = out.replace(re, (m, g) => { const o = g.split("|"); return o[Math.floor(Math.random() * o.length)]; });
+  }
+  return out;
+}
+function countVariants(t) {
+  let total = 1, m; const re = /\{([^{}]*)\}/g;
+  while ((m = re.exec(t))) total *= Math.max(1, m[1].split("|").length);
+  return total;
+}
+function spinPreview() {
+  const t = el("msg").value;
+  if (!t.trim()) { el("spin-info").textContent = "Сначала введи текст"; return; }
+  el("spin-preview").style.display = "";
+  el("spin-preview").textContent = spinText(t);
+  const n = countVariants(t);
+  el("spin-info").textContent = n > 1 ? `вариантов: ~${n}` : "вариантов нет — добавь {а|б}";
+}
+
 function collectTargets() {
   return Object.values(state.recipients).map(r => ({ id: r.id, name: r.name, kind: r.kind }));
 }
