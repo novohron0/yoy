@@ -337,8 +337,11 @@
   </div>
 
   <div class="row" style="gap:10px">
-    <button class="btn full" onclick="saveSchedule()">Запланировать</button>
+    <button class="btn full" id="save-btn" onclick="saveSchedule()">Запланировать</button>
     <button class="btn ghost full" onclick="sendNow()">Отправить сейчас</button>
+  </div>
+  <div id="edit-cancel" class="hidden" style="margin-top:8px;text-align:center">
+    <a href="#" onclick="cancelEdit();return false">Отменить редактирование</a>
   </div>
   <div class="err" id="compose-err"></div>
 
@@ -444,6 +447,7 @@ let state = {
   billing: null,
   tiers: null,
   payPolls: 0,
+  editingSid: null,
 };
 
 // ---------- helpers ----------
@@ -659,9 +663,46 @@ function enterCompose(pid, name) {
   renderWeekdays();
   renderDates();
   setSchedMode("daily");
+  state.editingSid = null;
+  el("save-btn").textContent = "Запланировать";
+  el("edit-cancel").classList.add("hidden");
   renderFloodBanner();
   loadPacks();
   loadSchedules();
+}
+
+function editSchedule(s) {
+  state.editingSid = s.id;
+  state.recipients = {};
+  for (const t of (s.targets || [])) state.recipients[t.id] = { id: t.id, name: t.name, kind: t.kind };
+  el("msg").value = s.text || "";
+  el("gap-min").value = (s.gap_min ?? 10);
+  el("gap-max").value = (s.gap_max ?? 30);
+  if (s.interval_min) {
+    setSchedMode("interval");
+    el("int-min").value = s.interval_min;
+    el("int-max").value = s.interval_max || s.interval_min;
+    state.weekdays = new Set(); state.dates = new Set();
+  } else {
+    setSchedMode("daily");
+    el("sched-time").value = s.time || "12:00";
+    state.weekdays = new Set(s.weekdays || []);
+    state.dates = new Set(s.dates || []);
+  }
+  renderRecipients(); renderWeekdays(); renderDates(); updateModeNote();
+  el("save-btn").textContent = "Сохранить изменения";
+  el("edit-cancel").classList.remove("hidden");
+  el("compose-err").textContent = "";
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function cancelEdit() {
+  state.editingSid = null;
+  el("save-btn").textContent = "Запланировать";
+  el("edit-cancel").classList.add("hidden");
+  el("msg").value = "";
+  state.recipients = {}; state.dates = new Set();
+  renderRecipients(); renderDates(); updateModeNote();
 }
 
 // ---------- папки чатов ----------
@@ -914,12 +955,20 @@ async function saveSchedule() {
   } else {
     body = { ...base, ...gap, time: el("sched-time").value, weekdays: [...state.weekdays], dates: [...state.dates] };
   }
-  const { ok, data } = await post(`/api/profiles/${state.profileId}/schedules`, body);
+  const editing = state.editingSid;
+  const url = editing
+    ? `/api/profiles/${state.profileId}/schedules/${editing}/update`
+    : `/api/profiles/${state.profileId}/schedules`;
+  const { ok, data } = await post(url, body);
   if (!ok) return (el("compose-err").textContent = data.error);
-  toast("Запланировано ✓", "ok");
-  el("msg").value = "";
-  state.dates = new Set();
-  renderDates(); updateModeNote();
+  toast(editing ? "Изменено ✓" : "Запланировано ✓", "ok");
+  if (editing) {
+    cancelEdit();
+  } else {
+    el("msg").value = "";
+    state.dates = new Set();
+    renderDates(); updateModeNote();
+  }
   loadSchedules();
 }
 
@@ -976,9 +1025,17 @@ async function loadSchedules() {
         <div class="si-to">→ ${escapeHtml(to)}</div>
       </div>
       <div style="display:flex;flex-direction:column;gap:6px">
+        <button class="btn ghost" data-act="edit">✏️ Изменить</button>
+        <button class="btn ghost" data-act="dup">📋 Копия</button>
         <button class="btn ghost" data-act="toggle">${paused ? "▶ Запустить" : "⏸ Пауза"}</button>
         <button class="btn danger" data-act="del">Удалить</button>
       </div>`;
+    item.querySelector('[data-act="edit"]').onclick = () => editSchedule(s);
+    item.querySelector('[data-act="dup"]').onclick = async () => {
+      await post(`/api/profiles/${state.profileId}/schedules/${s.id}/duplicate`);
+      toast("Копия создана ✓", "ok");
+      loadSchedules();
+    };
     item.querySelector('[data-act="toggle"]').onclick = async () => {
       await post(`/api/profiles/${state.profileId}/schedules/${s.id}/toggle`);
       loadSchedules();

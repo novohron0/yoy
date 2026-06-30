@@ -582,6 +582,8 @@ async def _send_bulk(pid, targets, text, gap_lo=None, gap_hi=None):
     client = await get_client(pid)
     if client is None or not await client.is_user_authorized():
         return
+    targets = list(targets)
+    random.shuffle(targets)   # случайный порядок чатов — меньше похоже на бота
     n = len(targets)
     for i, target in enumerate(targets):
         if _on_cooldown(get_profile(pid)):
@@ -1447,50 +1449,94 @@ async def get_schedules(pid: str, user=Depends(require_user)):
     return {"schedules": [s for s in load_schedules() if s["profile_id"] == pid]}
 
 
+def _schedule_fields(body):
+    """Собирает поля расписания из тела запроса. Возвращает (fields, None) или (None, error)."""
+    if not body.text.strip():
+        return None, JSONResponse({"error": "Пустое сообщение"}, status_code=400)
+    if not body.targets:
+        return None, JSONResponse({"error": "Не выбран ни один чат"}, status_code=400)
+    fields = {
+        "targets": [t.model_dump() for t in body.targets],
+        "text": body.text,
+        "gap_min": body.gap_min,
+        "gap_max": body.gap_max,
+        "next_fire": None,
+    }
+    if body.interval_min is not None:
+        lo = int(body.interval_min)
+        hi = int(body.interval_max) if body.interval_max is not None else lo
+        if lo < 1:
+            return None, JSONResponse({"error": "Минимальный интервал — 1 минута"}, status_code=400)
+        if hi < lo:
+            hi = lo
+        fields.update({"interval_min": lo, "interval_max": hi, "time": None, "weekdays": [], "dates": []})
+    else:
+        if not _validate_time(body.time):
+            return None, JSONResponse({"error": "Неверное время (нужен формат ЧЧ:ММ)"}, status_code=400)
+        fields.update({
+            "interval_min": None, "interval_max": None,
+            "time": body.time,
+            "weekdays": sorted(set(w for w in body.weekdays if 0 <= w <= 6)),
+            "dates": sorted(set(body.dates)),
+        })
+    return fields, None
+
+
 @app.post("/api/profiles/{pid}/schedules")
 async def create_schedule(pid: str, body: ScheduleIn, user=Depends(require_active)):
     _owned_profile(pid, user)
-    if not body.text.strip():
-        return JSONResponse({"error": "Пустое сообщение"}, status_code=400)
-    if not body.targets:
-        return JSONResponse({"error": "Не выбран ни один чат"}, status_code=400)
-
+    fields, err = _schedule_fields(body)
+    if err:
+        return err
     rule = {
         "id": uuid.uuid4().hex[:8],
         "profile_id": pid,
         "owner": user["id"],
-        "targets": [t.model_dump() for t in body.targets],
-        "text": body.text,
         "enabled": True,
         "last_fired": None,
-        "gap_min": body.gap_min,
-        "gap_max": body.gap_max,
         "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        **fields,
     }
-
-    if body.interval_min is not None:
-        # Режим «каждые N минут» (опционально случайно в диапазоне)
-        lo = int(body.interval_min)
-        hi = int(body.interval_max) if body.interval_max is not None else lo
-        if lo < 1:
-            return JSONResponse({"error": "Минимальный интервал — 1 минута"}, status_code=400)
-        if hi < lo:
-            hi = lo
-        rule["interval_min"] = lo
-        rule["interval_max"] = hi
-        rule["next_fire"] = None   # None → отправит на ближайшем тике (сразу)
-    else:
-        # Режим «по времени»
-        if not _validate_time(body.time):
-            return JSONResponse({"error": "Неверное время (нужен формат ЧЧ:ММ)"}, status_code=400)
-        rule["time"] = body.time
-        rule["weekdays"] = sorted(set(w for w in body.weekdays if 0 <= w <= 6))
-        rule["dates"] = sorted(set(body.dates))
-
     schedules = load_schedules()
     schedules.append(rule)
     save_schedules(schedules)
     return {"ok": True, "schedule": rule}
+
+
+@app.post("/api/profiles/{pid}/schedules/{sid}/update")
+async def update_schedule(pid: str, sid: str, body: ScheduleIn, user=Depends(require_active)):
+    """Изменяет существующее расписание (текст/чаты/время/режим)."""
+    _owned_profile(pid, user)
+    fields, err = _schedule_fields(body)
+    if err:
+        return err
+    schedules = load_schedules()
+    target = next((s for s in schedules if s["id"] == sid and s["profile_id"] == pid), None)
+    if target is None:
+        return JSONResponse({"error": "Расписание не найдено"}, status_code=404)
+    target.update(fields)
+    target["last_fired"] = None   # сброс, чтобы новое время отработало
+    save_schedules(schedules)
+    return {"ok": True, "schedule": target}
+
+
+@app.post("/api/profiles/{pid}/schedules/{sid}/duplicate")
+async def duplicate_schedule(pid: str, sid: str, user=Depends(require_active)):
+    """Создаёт копию расписания."""
+    _owned_profile(pid, user)
+    schedules = load_schedules()
+    src = next((s for s in schedules if s["id"] == sid and s["profile_id"] == pid), None)
+    if src is None:
+        return JSONResponse({"error": "Расписание не найдено"}, status_code=404)
+    new = dict(src)
+    new["id"] = uuid.uuid4().hex[:8]
+    new["enabled"] = True
+    new["last_fired"] = None
+    new["next_fire"] = None
+    new["created"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    schedules.append(new)
+    save_schedules(schedules)
+    return {"ok": True, "schedule": new}
 
 
 @app.delete("/api/profiles/{pid}/schedules/{sid}")
