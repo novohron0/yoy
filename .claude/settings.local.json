@@ -98,7 +98,8 @@
       "Bash(bash backup.sh)",
       "Bash(rm -rf /Users/kamilimangulov/yoy-backups)",
       "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Авто-бэкап данных: backup.sh \\(архив profiles/, хранит 14 копий\\) *)",
-      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Пауза/возобновление расписаний без удаления *)"
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Пауза/возобновление расписаний без удаления *)",
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Напоминание о продлении: баннер когда доступ кончается \\(<=3 дн\\) *)"
     ]
   }
 }

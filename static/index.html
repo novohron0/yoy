@@ -228,6 +228,10 @@
     <button class="btn ghost" id="btn-admin" onclick="openAdmin()" style="display:none">Пользователи</button>
     <button class="btn ghost" onclick="logout()">Выйти</button>
   </div>
+  <div id="renew-banner" class="hidden" style="background:var(--panel-3);border-left:3px solid var(--accent-3);padding:12px 14px;border-radius:10px;margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+    <span id="renew-text" style="flex:1;font-size:14px"></span>
+    <button class="btn" onclick="showPay()">Продлить</button>
+  </div>
   <div class="hint" style="margin-bottom:16px">Выбери аккаунт, чтобы настроить отправку постов по чатам. Или добавь новый.</div>
   <div class="profiles" id="profiles-grid"></div>
 </div>
@@ -1038,6 +1042,7 @@ async function enterApp() {
   renderDaysLeft();
   if (!state.billing.active) { showPay(); return; }
   showScreen("screen-profiles");
+  renderRenewBanner();
   loadProfiles();
 }
 
@@ -1045,7 +1050,22 @@ function renderDaysLeft() {
   const b = state.billing || {};
   const span = el("days-left");
   if (state.me && state.me.is_admin) { span.textContent = "админ"; return; }
-  span.textContent = b.active ? `доступ: ${b.days_left} дн` : "не оплачен";
+  if (!b.active) { span.textContent = "не оплачен"; span.style.color = "var(--err)"; return; }
+  span.textContent = `доступ: ${b.days_left} дн`;
+  span.style.color = b.days_left <= 3 ? "var(--err)" : "";
+}
+
+function renderRenewBanner() {
+  const b = state.billing || {};
+  const banner = el("renew-banner");
+  const isAdmin = state.me && state.me.is_admin;
+  if (!isAdmin && b.active && b.days_left <= 3) {
+    el("renew-text").textContent =
+      `⏰ Доступ кончается через ${b.days_left} дн — продли, чтобы рассылки не прервались.`;
+    banner.classList.remove("hidden");
+  } else {
+    banner.classList.add("hidden");
+  }
 }
 
 // ---------- оплата ----------
