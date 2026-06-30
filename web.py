@@ -31,6 +31,7 @@ import secrets
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse, parse_qs, urlencode
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
@@ -89,9 +90,9 @@ PANEL_DOMAIN = os.environ.get("PANEL_DOMAIN", "")
 
 # Тарифы доступа. Цена в рублях за период `days`. Меняй цифры как нужно.
 TIERS = {
-    "start":    {"name": "Старт",    "price_rub": 990, "days": 7, "max_accounts": 1},
-    "standard": {"name": "Стандарт", "price_rub": 2500, "days": 7, "max_accounts": 3},
-    "pro":      {"name": "Про",      "price_rub": 5000, "days": 7, "max_accounts": 20},
+    "start":    {"name": "1 неделя",      "price_rub": 990,  "days": 7,  "max_accounts": 1},
+    "standard": {"name": "2 недели",      "price_rub": 1790, "days": 14, "max_accounts": 2},
+    "pro":      {"name": "1 месяц (Про)", "price_rub": 2990, "days": 30, "max_accounts": 5},
 }
 DEFAULT_TIER = "start"
 
@@ -832,11 +833,35 @@ async def billing_info(user=Depends(require_user)):
     }
 
 
+class BillIn(BaseModel):
+    tier: str | None = None
+
+
+def _tme_to_tg(url):
+    """Конвертирует https://t.me/... в tg://resolve?... — открывает приложение Telegram
+    напрямую, минуя браузер (обход блокировки t.me у провайдеров)."""
+    try:
+        u = urlparse(url or "")
+        if u.netloc not in ("t.me", "telegram.me"):
+            return None
+        parts = [p for p in u.path.split("/") if p]
+        if not parts:
+            return None
+        params = {"domain": parts[0]}
+        if len(parts) >= 2:
+            params["appname"] = parts[1]
+        for k, v in parse_qs(u.query).items():
+            params[k] = v[0]
+        return "tg://resolve?" + urlencode(params)
+    except Exception:
+        return None
+
+
 @app.post("/api/billing/invoice")
-async def billing_invoice(user=Depends(require_user)):
+async def billing_invoice(body: BillIn, user=Depends(require_user)):
     if not CRYPTOBOT_TOKEN:
         return JSONResponse({"error": "Оплата криптой не настроена (нет CRYPTOBOT_TOKEN)"}, status_code=400)
-    tkey = _tier_key(user)
+    tkey = body.tier if (body.tier in TIERS) else _tier_key(user)
     tier = TIERS[tkey]
     import httpx
 
@@ -844,11 +869,10 @@ async def billing_invoice(user=Depends(require_user)):
         "currency_type": "fiat",
         "fiat": "RUB",
         "amount": str(tier["price_rub"]),
-        "description": f"Доступ «{tier['name']}» на {tier['days']} дн.",
+        "description": f"Доступ «{tier['name']}» ({tier['days']} дн.)",
         "payload": f"{user['id']}:{tkey}",
         "expires_in": 3600,
     }
-    # Кнопка возврата в панель после оплаты
     if PANEL_DOMAIN:
         data["paid_btn_name"] = "callback"
         data["paid_btn_url"] = f"https://{PANEL_DOMAIN}"
@@ -866,11 +890,19 @@ async def billing_invoice(user=Depends(require_user)):
     for u in users:
         if u["id"] == user["id"]:
             u["pending_invoice"] = inv["invoice_id"]
+            u["pending_tier"] = tkey
             break
     save_users(users)
-    # mini_app — самый гладкий экран оплаты прямо в Telegram
-    pay_url = inv.get("mini_app_invoice_url") or inv.get("bot_invoice_url") or inv.get("pay_url")
-    return {"pay_url": pay_url, "invoice_id": inv["invoice_id"], "amount": tier["price_rub"]}
+    bot_url = inv.get("bot_invoice_url") or inv.get("pay_url")
+    pay_url = inv.get("mini_app_invoice_url") or bot_url
+    # tg:// — прямое открытие приложения (обход блокировки t.me в браузере)
+    deeplink = _tme_to_tg(bot_url) or _tme_to_tg(inv.get("mini_app_invoice_url"))
+    return {
+        "pay_url": pay_url,
+        "pay_deeplink": deeplink,
+        "invoice_id": inv["invoice_id"],
+        "amount": tier["price_rub"],
+    }
 
 
 @app.post("/api/billing/check")
@@ -892,7 +924,8 @@ async def billing_check(user=Depends(require_user)):
     items = (j.get("result") or {}).get("items") or []
     paid = any(it.get("status") == "paid" for it in items)
     if paid:
-        _extend_subscription(user["id"], _tier_key(u), TIERS[_tier_key(u)]["days"], clear_invoice=inv_id)
+        bought = u.get("pending_tier") if (u.get("pending_tier") in TIERS) else _tier_key(u)
+        _extend_subscription(user["id"], bought, TIERS[bought]["days"], clear_invoice=inv_id)
         u2 = get_user(user["id"])
         return {"active": True, "paid": True, "paid_until": u2.get("paid_until"), "days_left": _days_left(u2)}
     return {"active": _sub_active(u), "paid": False, "days_left": _days_left(u)}

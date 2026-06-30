@@ -209,12 +209,13 @@
 <!-- ============ Экран оплаты ============ -->
 <div id="screen-pay" class="wrap hidden">
   <div class="topbar"><h1>Доступ</h1><button class="btn ghost" onclick="logout()">Выйти</button></div>
-  <div class="section" style="max-width:420px;margin:0 auto;text-align:center">
+  <div class="section" style="max-width:440px;margin:0 auto">
     <div id="pay-info"></div>
-    <a class="btn full" id="pay-btn" target="_blank" rel="noopener" onclick="onPayTap()"
-       style="margin-top:16px;display:none;text-decoration:none;text-align:center">Оплатить</a>
+    <div id="pay-plans" style="display:flex;flex-direction:column;gap:10px;margin-top:14px"></div>
+    <a class="btn full" id="pay-btn" rel="noopener" onclick="onPayTap()"
+       style="margin-top:14px;display:none;text-decoration:none;text-align:center">Открыть CryptoBot →</a>
     <button class="btn ghost full" id="pay-check" onclick="checkPayOnce()" style="margin-top:10px;display:none">Я оплатил — проверить</button>
-    <div class="hint" id="pay-status" style="margin-top:14px"></div>
+    <div class="hint" id="pay-status" style="margin-top:14px;text-align:center"></div>
   </div>
 </div>
 
@@ -984,42 +985,51 @@ function renderDaysLeft() {
 }
 
 // ---------- оплата ----------
-function showPay() {
+async function showPay() {
   const b = state.billing || {};
-  const t = b.tier || {};
-  const price = t.price_rub || "";
   el("pay-info").innerHTML =
-    `<div style="font-size:18px;margin-bottom:6px">Доступ к боту</div>
-     <div style="font-size:15px;margin-bottom:10px">Тариф «${escapeHtml(t.name || "Старт")}» — <b>${price} ₽</b> на ${t.days || 7} дней</div>
-     <div class="hint" style="text-align:left;line-height:1.6">
-       Как оплатить:<br>
-       1. Жми «Оплатить» — откроется CryptoBot.<br>
-       2. Нет крипты? Прямо там нажми <b>«Купить»/P2P</b> — купишь за пару минут картой/СБП.<br>
-       3. Подтверди оплату и вернись сюда — доступ откроется сам.
+    `<div style="font-size:18px;margin-bottom:6px;text-align:center">Доступ к боту</div>
+     <div class="hint" style="line-height:1.6">
+       Выбери срок → откроется CryptoBot → оплати.<br>
+       Нет крипты? Прямо там «<b>Купить</b>»/P2P — купишь картой/СБП за пару минут.
      </div>`;
   el("pay-status").textContent = "";
   el("pay-check").style.display = "none";
-  const a = el("pay-btn");
-  a.style.display = "none";
-  a.removeAttribute("href");
-  a.textContent = price ? `Оплатить ${price} ₽` : "Оплатить";
+  el("pay-btn").style.display = "none";
+  el("pay-plans").innerHTML = "";
   showScreen("screen-pay");
-  if (b.crypto_enabled) {
-    prepareInvoice();   // заранее готовим счёт, чтобы кнопка была прямой ссылкой
-  } else {
+  if (!b.crypto_enabled) {
     el("pay-status").innerHTML = "Автооплата пока не настроена. Напиши администратору, чтобы выдал доступ.";
+    return;
+  }
+  if (!state.tiers) {
+    const { data } = await api("/api/tiers");
+    state.tiers = (data && data.tiers) || {};
+  }
+  const box = el("pay-plans");
+  for (const [key, t] of Object.entries(state.tiers)) {
+    const btn = document.createElement("button");
+    btn.className = "btn full";
+    btn.style.cssText = "display:flex;justify-content:space-between;align-items:center";
+    btn.innerHTML = `<span>${escapeHtml(t.name)}</span><b>${t.price_rub} ₽</b>`;
+    btn.onclick = () => choosePlan(key, btn);
+    box.appendChild(btn);
   }
 }
 
-async function prepareInvoice() {
+async function choosePlan(tierKey, btn) {
   el("pay-status").textContent = "Готовлю счёт…";
-  const { ok, data } = await post("/api/billing/invoice");
+  document.querySelectorAll("#pay-plans .btn").forEach(b => b.disabled = true);
+  const { ok, data } = await post("/api/billing/invoice", { tier: tierKey });
+  document.querySelectorAll("#pay-plans .btn").forEach(b => b.disabled = false);
   if (!ok) { el("pay-status").textContent = data.error || "Не удалось создать счёт"; return; }
   const a = el("pay-btn");
-  a.href = data.pay_url;
+  const deeplink = data.pay_deeplink;
+  if (deeplink) { a.href = deeplink; a.removeAttribute("target"); }      // открыть приложение напрямую
+  else { a.href = data.pay_url; a.target = "_blank"; }                    // запасной https-вариант
   a.style.display = "";
-  el("pay-status").innerHTML = "Нажми кнопку — откроется CryptoBot. Нет крипты? Там же «Купить»/P2P.";
   el("pay-check").style.display = "";
+  el("pay-status").innerHTML = `Счёт на <b>${data.amount} ₽</b> готов. Жми «Открыть CryptoBot» и оплати.`;
   startPolling();
 }
 

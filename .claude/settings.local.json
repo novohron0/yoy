@@ -87,7 +87,8 @@
       "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Платный доступ: подписка по тарифам + оплата криптой \\(CryptoBot\\) *)",
       "Bash(.venv/bin/python -c \"import web; print\\('web.py OK, routes:', len\\(web.app.routes\\), '| PANEL_DOMAIN read:', repr\\(web.PANEL_DOMAIN\\)\\)\")",
       "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Удобная оплата: мини-апп CryptoBot, кнопка возврата, понятные шаги *)",
-      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Починка открытия CryptoBot: кнопка-ссылка вместо window.open *)"
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Починка открытия CryptoBot: кнопка-ссылка вместо window.open *)",
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Тарифы по сроку \\(990/1790/2990\\), выбор плана + открытие CryptoBot через tg:// *)"
     ]
   }
 }
