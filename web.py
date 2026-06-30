@@ -1504,6 +1504,19 @@ async def delete_schedule(pid: str, sid: str, user=Depends(require_user)):
     return {"ok": True}
 
 
+@app.post("/api/profiles/{pid}/schedules/{sid}/toggle")
+async def toggle_schedule(pid: str, sid: str, user=Depends(require_user)):
+    """Ставит расписание на паузу / снимает с паузы."""
+    _owned_profile(pid, user)
+    schedules = load_schedules()
+    target = next((s for s in schedules if s["id"] == sid and s["profile_id"] == pid), None)
+    if target is None:
+        return JSONResponse({"error": "Расписание не найдено"}, status_code=404)
+    target["enabled"] = not target.get("enabled", True)
+    save_schedules(schedules)
+    return {"ok": True, "enabled": target["enabled"]}
+
+
 # ---------------------------------------------------------------------------
 # Папки чатов (сохранённые наборы получателей)
 # ---------------------------------------------------------------------------

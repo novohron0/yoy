@@ -957,20 +957,30 @@ async function loadSchedules() {
   const { data } = await api(`/api/profiles/${state.profileId}/schedules`);
   const list = el("sched-list");
   list.innerHTML = "";
-  const items = (data.schedules || []).filter(s => s.enabled !== false);
+  const items = data.schedules || [];
   if (!items.length) { list.innerHTML = `<div class="hint">Пока ничего не запланировано.</div>`; return; }
   for (const s of items) {
     const to = (s.targets || []).map(t => `${KIND_ICON[t.kind] || "💬"} ${t.name}`).join(", ");
+    const paused = s.enabled === false;
     const item = document.createElement("div");
     item.className = "sched-item";
+    item.style.opacity = paused ? "0.55" : "1";
     item.innerHTML = `
       <div class="si-main">
-        <div class="si-when">${escapeHtml(describeWhen(s))}</div>
+        <div class="si-when">${escapeHtml(describeWhen(s))}${paused ? " · ⏸ на паузе" : ""}</div>
         <div class="si-text">${escapeHtml(s.text)}</div>
         <div class="si-to">→ ${escapeHtml(to)}</div>
       </div>
-      <button class="btn danger">Удалить</button>`;
-    item.querySelector("button").onclick = async () => {
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <button class="btn ghost" data-act="toggle">${paused ? "▶ Запустить" : "⏸ Пауза"}</button>
+        <button class="btn danger" data-act="del">Удалить</button>
+      </div>`;
+    item.querySelector('[data-act="toggle"]').onclick = async () => {
+      await post(`/api/profiles/${state.profileId}/schedules/${s.id}/toggle`);
+      loadSchedules();
+    };
+    item.querySelector('[data-act="del"]').onclick = async () => {
+      if (!confirm("Удалить это расписание?")) return;
       await api(`/api/profiles/${state.profileId}/schedules/${s.id}`, { method: "DELETE" });
       loadSchedules();
     };
