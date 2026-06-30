@@ -241,6 +241,7 @@
   <div class="topbar">
     <button class="back" onclick="goProfiles()">←</button>
     <h1 id="compose-title">…</h1>
+    <button class="btn ghost" onclick="openJoin()">➕ Вступить в чаты</button>
   </div>
 
   <!-- Баннер паузы (флуд-защита) -->
@@ -360,6 +361,40 @@
   </div>
   <div class="hint" style="margin-bottom:16px">Одобряй или блокируй тех, кто зарегистрировался. Войти и пользоваться могут только одобренные.</div>
   <div class="section"><div class="sched-list" id="admin-list"></div></div>
+</div>
+
+<!-- ============ Экран: вступить в чаты ============ -->
+<div id="screen-join" class="wrap hidden">
+  <div class="topbar">
+    <button class="back" onclick="goCompose()">←</button>
+    <h1>Вступить в чаты</h1>
+  </div>
+  <div class="mode-note" style="margin-bottom:14px;border-left:3px solid var(--err);line-height:1.6">
+    ⚠️ <b>Массовое вступление — высокий риск бана</b>, особенно на новых аккаунтах.
+    Гони мало за раз (10–20 ссылок). Между вступлениями паузы 25–60 сек — это специально, чтобы аккаунт жил.
+  </div>
+  <div class="section">
+    <h3>Ссылки на чаты/каналы</h3>
+    <textarea id="join-links" style="min-height:130px" placeholder="По одной ссылке в строке:
+https://t.me/durov
+@channel
+https://t.me/+AbCdEf..."></textarea>
+    <button class="btn full" id="join-start" onclick="startJoin()" style="margin-top:12px">Начать вступление</button>
+    <div class="hint" id="join-progress" style="margin-top:12px"></div>
+  </div>
+  <div class="section" id="join-stats-box" style="display:none">
+    <h3>Статистика</h3>
+    <div id="join-stats"></div>
+  </div>
+  <div class="section">
+    <h3>Собрать каналы в папку</h3>
+    <p class="hint">Создаст в Telegram отдельную папку со всеми каналами/группами этого аккаунта.</p>
+    <div class="row" style="align-items:flex-end">
+      <div style="flex:2"><label>Название папки</label><input id="folder-name" value="Каналы" /></div>
+      <button class="btn" type="button" onclick="collectFolder()" style="flex:0 0 auto">Собрать</button>
+    </div>
+    <div class="hint" id="folder-status" style="margin-top:10px"></div>
+  </div>
 </div>
 
 <!-- ============ Модалка: добавить аккаунт ============ -->
@@ -788,6 +823,59 @@ function goProfiles() {
   loadProfiles();
 }
 
+function goCompose() { showScreen("screen-compose"); }
+
+// ---------- вступление в чаты ----------
+function openJoin() {
+  showScreen("screen-join");
+  el("folder-status").textContent = "";
+  pollJoin();   // покажет прогресс, если задача уже идёт
+}
+
+async function startJoin() {
+  const links = el("join-links").value.trim();
+  if (!links) { el("join-progress").textContent = "Вставь ссылки"; return; }
+  el("join-start").disabled = true;
+  const { ok, data } = await post(`/api/profiles/${state.profileId}/join`, { links });
+  el("join-start").disabled = false;
+  if (!ok) { el("join-progress").textContent = data.error || "Ошибка"; return; }
+  el("join-progress").textContent = `Запущено: ${data.total}. Идёт медленно (анти-бан)…`;
+  pollJoin();
+}
+
+async function pollJoin() {
+  if (el("screen-join").classList.contains("hidden")) return;
+  const { ok, data } = await api(`/api/profiles/${state.profileId}/join/status`);
+  if (!ok) return;
+  renderJoin(data);
+  if (data.running) setTimeout(pollJoin, 4000);
+}
+
+function renderJoin(job) {
+  if (!job.total) { el("join-progress").textContent = ""; return; }
+  el("join-progress").textContent = `${job.done}/${job.total}` + (job.running ? " — идёт…" : " — готово ✓");
+  const box = el("join-stats-box");
+  if ((job.joined || []).length || (job.failed || []).length) {
+    box.style.display = "";
+    const fails = (job.failed || []).map(f =>
+      `<div class="hint">• ${escapeHtml(f.link)} — ${escapeHtml(f.reason || "")}</div>`).join("");
+    el("join-stats").innerHTML =
+      `<div style="color:var(--ok)">✅ Вступил: ${(job.joined || []).length}</div>
+       <div style="color:var(--err);margin:6px 0 4px">❌ Не вступил: ${(job.failed || []).length}</div>${fails}`;
+  } else {
+    box.style.display = "none";
+  }
+}
+
+async function collectFolder() {
+  el("folder-status").textContent = "Собираю каналы…";
+  const name = el("folder-name").value.trim() || "Каналы";
+  const { ok, data } = await post(`/api/profiles/${state.profileId}/folder`, { name });
+  el("folder-status").textContent = ok
+    ? `✅ Папка «${data.name}» создана, каналов: ${data.count}. Открой Telegram → папки.`
+    : (data.error || "Ошибка");
+}
+
 function renderRecipients() {
   const box = el("recipients");
   box.querySelectorAll(".chip").forEach(c => c.remove());
@@ -1053,7 +1141,7 @@ async function loadSchedules() {
 let authMode = "login";
 
 function showScreen(id) {
-  for (const s of ["screen-auth", "screen-pay", "screen-profiles", "screen-compose", "screen-admin"])
+  for (const s of ["screen-auth", "screen-pay", "screen-profiles", "screen-compose", "screen-admin", "screen-join"])
     el(s).classList.toggle("hidden", s !== id);
 }
 

@@ -41,6 +41,12 @@ from pydantic import BaseModel
 
 from telethon import TelegramClient, utils
 from telethon.tl.functions.contacts import SearchRequest
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import (
+    ImportChatInviteRequest,
+    GetDialogFiltersRequest,
+    UpdateDialogFilterRequest,
+)
 from telethon.tl.types import User, Chat, Channel
 from telethon.errors import (
     ApiIdInvalidError,
@@ -339,6 +345,8 @@ class State:
     login: dict[str, dict] = {}
     # profile_id -> {peer_id: entity}
     entities: dict[str, dict] = {}
+    # profile_id -> {"total","done","joined":[],"failed":[],"running"}
+    join_jobs: dict[str, dict] = {}
     scheduler_task = None
 
 
@@ -600,6 +608,94 @@ async def _send_bulk_safe(pid, targets, text, gap_lo=None, gap_hi=None):
         await _send_bulk(pid, targets, text, gap_lo, gap_hi)
     except Exception as e:
         print(f"[send] фоновая отправка {pid}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Авто-вступление в чаты/каналы по ссылкам
+# ---------------------------------------------------------------------------
+# Вступление — операция с ВЫСОКИМ риском бана, поэтому паузы большие.
+JOIN_GAP_MIN = float(os.environ.get("JOIN_GAP_MIN", "25"))
+JOIN_GAP_MAX = float(os.environ.get("JOIN_GAP_MAX", "60"))
+
+
+def _parse_join_link(link):
+    """('private', invite_hash) | ('public', username) | None."""
+    s = (link or "").strip()
+    if not s:
+        return None
+    s = s.replace("https://", "").replace("http://", "")
+    s = s.replace("t.me/", "").replace("telegram.me/", "").strip("/")
+    if s.startswith("@"):
+        s = s[1:]
+    if s.startswith("joinchat/"):
+        return ("private", s[len("joinchat/"):])
+    if s.startswith("+"):
+        return ("private", s[1:])
+    username = s.split("/")[0].split("?")[0]
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", username):
+        return ("public", username)
+    return None
+
+
+def _join_err(e):
+    name = type(e).__name__
+    low = (str(e) + name).lower()
+    if "already" in low:
+        return "уже участник"
+    if "expired" in low:
+        return "ссылка истекла"
+    if "invalid" in low or "invitehashempty" in low:
+        return "ссылка недействительна"
+    if "toomuch" in low or "too much" in low:
+        return "лимит каналов аккаунта исчерпан"
+    if "privacy" in low or "ban" in low or "kick" in low:
+        return "нет доступа (бан/приват)"
+    return name
+
+
+async def _join_job(pid, links):
+    job = state.join_jobs[pid]
+    client = await get_client(pid)
+    if client is None or not await client.is_user_authorized():
+        job["running"] = False
+        return
+    for i, link in enumerate(links):
+        reason = None
+        if _on_cooldown(get_profile(pid)):
+            reason = "аккаунт на паузе (флуд)"
+        else:
+            parsed = _parse_join_link(link)
+            if not parsed:
+                reason = "не похоже на ссылку"
+            else:
+                kind, val = parsed
+                try:
+                    if kind == "private":
+                        await client(ImportChatInviteRequest(val))
+                    else:
+                        ent = await client.get_entity(val)
+                        await client(JoinChannelRequest(ent))
+                except FloodWaitError as e:
+                    _set_cooldown(pid, e.seconds + 30, note=f"FloodWait {e.seconds}s при вступлении")
+                    job["failed"].append({"link": link, "reason": f"flood {e.seconds}s — стоп"})
+                    job["done"] += 1
+                    break
+                except Exception as e:
+                    reason = _join_err(e)
+        job["failed" if reason else "joined"].append({"link": link, "reason": reason} if reason else {"link": link})
+        job["done"] += 1
+        if i < len(links) - 1:
+            await asyncio.sleep(random.uniform(JOIN_GAP_MIN, JOIN_GAP_MAX))
+    job["running"] = False
+
+
+async def _join_job_safe(pid, links):
+    try:
+        await _join_job(pid, links)
+    except Exception as e:
+        print(f"[join] {pid}: {e}")
+        if pid in state.join_jobs:
+            state.join_jobs[pid]["running"] = False
 
 
 async def _fire_rule(rule):
@@ -1047,6 +1143,14 @@ class ScheduleIn(BaseModel):
 class PackIn(BaseModel):
     name: str
     targets: list[Target]
+
+
+class JoinIn(BaseModel):
+    links: str
+
+
+class FolderIn(BaseModel):
+    name: str = "Каналы"
 
 
 # ---------------------------------------------------------------------------
@@ -1603,6 +1707,85 @@ async def delete_pack(pid: str, packid: str, user=Depends(require_user)):
         return JSONResponse({"error": "Папка не найдена"}, status_code=404)
     save_packs(new)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Вступление в чаты по ссылкам + сбор каналов в папку Telegram
+# ---------------------------------------------------------------------------
+@app.post("/api/profiles/{pid}/join")
+async def join_chats(pid: str, body: JoinIn, user=Depends(require_active)):
+    _owned_profile(pid, user)
+    links = [x for x in re.split(r"[\s,]+", body.links or "") if x.strip()]
+    if not links:
+        return JSONResponse({"error": "Вставь хотя бы одну ссылку"}, status_code=400)
+    if len(links) > 200:
+        return JSONResponse({"error": "За раз не больше 200 ссылок"}, status_code=400)
+    existing = state.join_jobs.get(pid)
+    if existing and existing.get("running"):
+        return JSONResponse({"error": "Вступление уже идёт — дождись окончания"}, status_code=409)
+    state.join_jobs[pid] = {"total": len(links), "done": 0, "joined": [], "failed": [], "running": True}
+    asyncio.create_task(_join_job_safe(pid, links))
+    return {"ok": True, "total": len(links)}
+
+
+@app.get("/api/profiles/{pid}/join/status")
+async def join_chats_status(pid: str, user=Depends(require_user)):
+    _owned_profile(pid, user)
+    job = state.join_jobs.get(pid)
+    if not job:
+        return {"running": False, "total": 0, "done": 0, "joined": [], "failed": []}
+    return job
+
+
+@app.post("/api/profiles/{pid}/folder")
+async def collect_folder(pid: str, body: FolderIn, user=Depends(require_active)):
+    """Собирает все каналы/супергруппы аккаунта в отдельную папку Telegram."""
+    _owned_profile(pid, user)
+    client = await get_client(pid)
+    if client is None or not await client.is_user_authorized():
+        return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    name = (body.name or "Каналы").strip() or "Каналы"
+
+    peers = []
+    try:
+        async for d in client.iter_dialogs():
+            e = d.entity
+            if isinstance(e, Channel):   # каналы и супергруппы
+                try:
+                    peers.append(await client.get_input_entity(e))
+                except Exception:
+                    pass
+    except Exception as e:
+        return JSONResponse({"error": f"Не удалось получить чаты: {e}"}, status_code=400)
+    if not peers:
+        return JSONResponse({"error": "Каналов не найдено"}, status_code=400)
+
+    try:
+        from telethon.tl.types import DialogFilter
+        # свободный id папки
+        used = set()
+        try:
+            res = await client(GetDialogFiltersRequest())
+            existing = getattr(res, "filters", res) or []
+            for f in existing:
+                fid = getattr(f, "id", None)
+                if isinstance(fid, int):
+                    used.add(fid)
+        except Exception:
+            pass
+        new_id = next(i for i in range(2, 250) if i not in used)
+        # title в новых версиях — TextWithEntities, в старых — строка
+        try:
+            from telethon.tl.types import TextWithEntities
+            title = TextWithEntities(text=name, entities=[])
+        except Exception:
+            title = name
+        flt = DialogFilter(id=new_id, title=title, pinned_peers=[], include_peers=peers, exclude_peers=[])
+        await client(UpdateDialogFilterRequest(id=new_id, filter=flt))
+    except Exception as e:
+        return JSONResponse({"error": f"Не удалось создать папку: {type(e).__name__}: {e}"}, status_code=400)
+
+    return {"ok": True, "count": len(peers), "name": name}
 
 
 # ---------------------------------------------------------------------------

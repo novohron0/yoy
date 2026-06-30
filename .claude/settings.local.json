@@ -100,7 +100,20 @@
       "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Авто-бэкап данных: backup.sh \\(архив profiles/, хранит 14 копий\\) *)",
       "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Пауза/возобновление расписаний без удаления *)",
       "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Напоминание о продлении: баннер когда доступ кончается \\(<=3 дн\\) *)",
-      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Расписания: редактирование, дублирование + рандом порядка чатов *)"
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Расписания: редактирование, дублирование + рандом порядка чатов *)",
+      "Bash(python3 -c \"from telethon.tl.functions.messages import UploadMediaRequest; from telethon.tl.types import InputMediaDocument, InputDocument; print\\('✅ API ок'\\)\")",
+      "Bash(git commit -m 'Фикс TG-истории \\(MEDIA_FILE_INVALID\\): двухшаговая загрузка медиа + без B-кадров + логи *)",
+      "WebSearch",
+      "Bash(git commit -m 'Умный планировщик: ролик из очереди раскладывается по площадкам в лучшие слоты *)",
+      "Bash(git commit -m 'Планировщик: лимит 2 ролика в сутки \\(стабильные выходы\\) + постоянный счётчик по дням *)",
+      "Bash(git commit -m 'Большие ролики \\(>20МБ\\): скачивание через главный аккаунт \\(до 2ГБ\\) + защита от спама-повторов *)",
+      "Bash(git commit -m 'Накрутка по-минимуму: 1 просмотр + 1 реакция с живого аккаунта на пост; лимит 12/сутки *)",
+      "Bash(git commit -m '/accounts подробнее: юзернейм + имя + телефон + id у каждого аккаунта *)",
+      "Bash(git commit -m 'Аккаунты: циклы терпят дырки в нумерации слотов \\(2,5,7\\) — после чистки мусорных *)",
+      "Bash(git commit -m 'Большие файлы: надёжнее \\(берём последнее сообщение от бота\\) + точная причина ошибки в чат *)",
+      "Bash(git commit -m '/postnow: пробует все площадки заново \\(сброс fails\\) — чтобы протестить IG Stories под новым кодом *)",
+      "Bash(git commit -m 'Фикс TG-истории \\(прямая загрузка, без двухшага\\) + deploy.sh синхронизирует YT-ключи на Railway *)",
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Авто-вступление в чаты по ссылкам + сбор каналов в папку *)"
     ]
   }
 }
