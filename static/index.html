@@ -216,6 +216,7 @@
        style="margin-top:14px;display:none;text-decoration:none;text-align:center">Открыть CryptoBot →</a>
     <button class="btn ghost full" id="pay-check" onclick="checkPayOnce()" style="margin-top:10px;display:none">Я оплатил — проверить</button>
     <div class="hint" id="pay-status" style="margin-top:14px;text-align:center"></div>
+    <div id="pay-guide" style="margin-top:18px"></div>
   </div>
 </div>
 
@@ -989,9 +990,15 @@ async function showPay() {
   const b = state.billing || {};
   el("pay-info").innerHTML =
     `<div style="font-size:18px;margin-bottom:6px;text-align:center">Доступ к боту</div>
-     <div class="hint" style="line-height:1.6">
-       Выбери срок → откроется CryptoBot → оплати.<br>
-       Нет крипты? Прямо там «<b>Купить</b>»/P2P — купишь картой/СБП за пару минут.
+     <div class="hint" style="text-align:center">Выбери срок — оплата через CryptoBot (USDT)</div>`;
+  el("pay-guide").innerHTML =
+    `<div class="mode-note" style="line-height:1.7">
+       <b>📋 Как оплатить (даже если крипты нет):</b><br>
+       <b>1.</b> Выбери срок выше → жми «Открыть CryptoBot».<br>
+       <b>2.</b> Нет USDT? В CryptoBot внизу открой <b>«P2P»</b> → <b>«Купить»</b> →
+       выбери оплату <b>СБП или картой</b> → купи нужную сумму у продавца (2–3 мин).<br>
+       <b>3.</b> Вернись к счёту в CryptoBot и нажми <b>«Оплатить»</b>.<br>
+       <b>4.</b> Возвращайся сюда — доступ откроется сам.
      </div>`;
   el("pay-status").textContent = "";
   el("pay-check").style.display = "none";
