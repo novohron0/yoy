@@ -135,7 +135,9 @@
       "Bash(networksetup -getsecurewebproxy \"Wi-Fi\")",
       "Bash(networksetup -setwebproxystate \"Wi-Fi\" off)",
       "Bash(networksetup -setsecurewebproxystate \"Wi-Fi\" off)",
-      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Доработки рассылки и вступления *)"
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Доработки рассылки и вступления *)",
+      "Bash(git commit -m 'Превью ВСЕГДА: оба режима \\(сейчас/в очередь\\) идут через превью+подтверждение; '\\\\''сейчас'\\\\'' = слот сразу после ✅ *)",
+      "Bash(git -c user.name=kamilimangulov -c user.email=mfskamil@gmail.com commit -q -m 'Режим прогрева аккаунта \\(анти-бан для новых акков\\) *)"
     ]
   }
 }

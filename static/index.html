@@ -422,6 +422,14 @@ https://t.me/+AbCdEf..."></textarea>
       <label>Прокси (рекомендуется, SOCKS5)</label>
       <input id="in-proxy" placeholder="socks5://user:pass@host:port" />
       <p class="hint">Каждый аккаунт через свой прокси — меньше банов. Можно оставить пустым.</p>
+
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:14px;color:var(--text)">
+        <input type="checkbox" id="in-warmup" style="width:auto" />
+        <span>🔥 Включить прогрев аккаунта</span>
+      </label>
+      <p class="hint">Если аккаунт <b>новый</b> — включи. Бот будет вступать в чаты и рассылать
+        медленно и понемногу (безопасные лимиты в час/сутки), чтобы Telegram не забанил свежий акк.
+        Потом, когда акк «прогреется», прогрев можно выключить.</p>
     </div>
 
     <div id="add-phone" class="hidden">
@@ -555,12 +563,14 @@ async function loadProfiles() {
         <div class="pname">${escapeHtml(p.name)}</div>
         <div class="pstate ${p.authorized ? "on" : "off"}">${p.authorized ? "● подключён" : "○ нужен вход"}</div>
         <div class="pstate" style="color:var(--muted);cursor:pointer" data-proxy>🌐 ${p.has_proxy ? "прокси ✓" : "прокси не задан"}</div>
+        <div class="pstate" style="cursor:pointer;color:${p.warmup ? "var(--accent-3)" : "var(--muted)"}" data-warmup>🔥 прогрев: ${p.warmup ? "вкл" : "выкл"}</div>
         ${flood}
       </div>
       <button class="del" title="Удалить">✕</button>`;
     card.onclick = () => openProfile(p);
     card.querySelector(".del").onclick = (e) => { e.stopPropagation(); deleteProfile(p); };
     card.querySelector("[data-proxy]").onclick = (e) => { e.stopPropagation(); editProxy(p); };
+    card.querySelector("[data-warmup]").onclick = (e) => { e.stopPropagation(); toggleWarmup(p); };
     grid.appendChild(card);
   }
   const add = document.createElement("div");
@@ -587,6 +597,15 @@ async function editProxy(p) {
   const { ok, data: r } = await post(`/api/profiles/${p.id}/proxy`, { proxy: val.trim() });
   if (!ok) return toast(r.error || "Ошибка", "bad");
   toast(val.trim() ? "Прокси сохранён ✓ (переподключение)" : "Прокси убран", "ok");
+  loadProfiles();
+}
+
+async function toggleWarmup(p) {
+  const on = !p.warmup;
+  if (on && !confirm("Включить прогрев?\n\nАккаунт будет вступать и рассылать медленно и понемногу (безопасные лимиты в час/сутки), чтобы не словить бан. Рекомендуется для новых аккаунтов.")) return;
+  const { ok, data } = await post(`/api/profiles/${p.id}/warmup`, { warmup: on });
+  if (!ok) return toast(data.error || "Ошибка", "bad");
+  toast(on ? "🔥 Прогрев включён" : "Прогрев выключен", "ok");
   loadProfiles();
 }
 
@@ -627,6 +646,7 @@ function openAdd(existingId, step) {
   } else {
     state.profileId = null;
     el("in-name").value = ""; el("in-api-id").value = ""; el("in-api-hash").value = ""; el("in-proxy").value = "";
+    el("in-warmup").checked = false;
     el("in-phone").value = ""; el("in-code").value = ""; el("in-password").value = "";
     showAddStep("credentials");
   }
@@ -672,7 +692,7 @@ async function addNext() {
   if (state.addStep === "credentials") {
     const { ok, data } = await post("/api/profiles", {
       name: el("in-name").value, api_id: el("in-api-id").value, api_hash: el("in-api-hash").value,
-      proxy: el("in-proxy").value,
+      proxy: el("in-proxy").value, warmup: el("in-warmup").checked,
     });
     if (!ok) return (el("add-err").textContent = data.error);
     state.profileId = data.id;

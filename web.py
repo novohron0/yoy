@@ -551,6 +551,44 @@ def _clear_cooldown(pid):
         save_profiles(profiles)
 
 
+# ---------------------------------------------------------------------------
+# Прогрев аккаунта (мягкий старт для новых акков — анти-бан)
+# ---------------------------------------------------------------------------
+# Лимиты в режиме прогрева: (в час, в сутки). Консервативно, чтобы не забанили.
+WARMUP_LIMITS = {
+    "join": (int(os.environ.get("WARMUP_JOIN_HOUR", "5")), int(os.environ.get("WARMUP_JOIN_DAY", "20"))),
+    "send": (int(os.environ.get("WARMUP_SEND_HOUR", "10")), int(os.environ.get("WARMUP_SEND_DAY", "30"))),
+}
+
+
+def _wu_allow(pid, kind):
+    """True, если действие (kind='join'|'send') разрешено. При прогреве считает лимиты в час/сутки."""
+    profile = get_profile(pid)
+    if not profile or not profile.get("warmup"):
+        return True  # прогрев выключен — без ограничений
+    now = datetime.now()
+    hour_key = now.strftime("%Y-%m-%d-%H")
+    day_key = now.strftime("%Y-%m-%d")
+    per_hour, per_day = WARMUP_LIMITS.get(kind, (999999, 999999))
+    profiles = load_profiles()
+    for p in profiles:
+        if p["id"] != pid:
+            continue
+        ctr = p.setdefault("wu", {})
+        hk, dk = f"{kind}_h", f"{kind}_d"
+        if ctr.get(hk, {}).get("k") != hour_key:
+            ctr[hk] = {"k": hour_key, "n": 0}
+        if ctr.get(dk, {}).get("k") != day_key:
+            ctr[dk] = {"k": day_key, "n": 0}
+        if ctr[hk]["n"] >= per_hour or ctr[dk]["n"] >= per_day:
+            return False
+        ctr[hk]["n"] += 1
+        ctr[dk]["n"] += 1
+        save_profiles(profiles)
+        return True
+    return True
+
+
 _SPIN_RE = re.compile(r"\{([^{}]*)\}")
 
 
@@ -566,7 +604,9 @@ def _spin(text):
 
 
 async def _send_one(client, pid, target, text):
-    """Отправляет одно сообщение. Возвращает ('ok'|'flood'|'spam'|'error', detail)."""
+    """Отправляет одно сообщение. Возвращает ('ok'|'flood'|'spam'|'limit'|'error', detail)."""
+    if not _wu_allow(pid, "send"):
+        return "limit", None   # достигнут лимит прогрева
     try:
         entity = await _resolve(pid, target["id"])
         await client.send_message(entity, _spin(text))   # каждый раз свой вариант текста
@@ -597,8 +637,8 @@ async def _send_bulk(pid, targets, text, gap_lo=None, gap_hi=None):
         if _on_cooldown(get_profile(pid)):
             return
         status, _ = await _send_one(client, pid, target, text)
-        if status in ("flood", "spam"):
-            return  # профиль на паузе — дальше не шлём
+        if status in ("flood", "spam", "limit"):
+            return  # пауза/лимит прогрева — дальше не шлём
         if i < n - 1:
             await asyncio.sleep(_send_gap(gap_lo, gap_hi))
 
@@ -697,6 +737,11 @@ async def _join_job(pid, links):
             job["done"] += 1
             continue
 
+        # лимит прогрева на вступления
+        if not _wu_allow(pid, "join"):
+            job["status"] = "достигнут лимит прогрева — продолжи позже"
+            break
+
         attempts = 0
         while True:
             attempts += 1
@@ -733,7 +778,10 @@ async def _join_job(pid, links):
             await _interruptible_sleep(job, random.uniform(JOIN_GAP_MIN, JOIN_GAP_MAX))
 
     job["running"] = False
-    job["status"] = "остановлено" if job.get("cancel") else "готово"
+    if job.get("cancel"):
+        job["status"] = "остановлено"
+    elif not str(job.get("status", "")).startswith("достигнут лимит"):
+        job["status"] = "готово"
 
 
 async def _join_job_safe(pid, links):
@@ -1144,10 +1192,15 @@ class CreateProfileIn(BaseModel):
     api_id: str
     api_hash: str
     proxy: str = ""
+    warmup: bool = False
 
 
 class ProxyIn(BaseModel):
     proxy: str = ""
+
+
+class WarmupIn(BaseModel):
+    warmup: bool
 
 
 class PhoneIn(BaseModel):
@@ -1277,6 +1330,7 @@ async def list_profiles(user=Depends(require_user)):
             "flagged": bool(p.get("flagged")),
             "flood_note": p.get("flood_note") or "",
             "has_proxy": bool(p.get("proxy")),
+            "warmup": bool(p.get("warmup")),
         })
     return {"profiles": out}
 
@@ -1307,7 +1361,7 @@ async def create_profile(body: CreateProfileIn, user=Depends(require_active)):
 
     pid = uuid.uuid4().hex[:8]
     profiles = load_profiles()
-    profiles.append({"id": pid, "name": name, "api_id": int(api_id), "api_hash": api_hash, "owner": user["id"], "proxy": proxy})
+    profiles.append({"id": pid, "name": name, "api_id": int(api_id), "api_hash": api_hash, "owner": user["id"], "proxy": proxy, "warmup": bool(body.warmup)})
     save_profiles(profiles)
     state.login[pid] = {"phone": None, "phone_code_hash": None}
     return {"id": pid, "step": "phone"}
@@ -1339,6 +1393,19 @@ async def set_proxy(pid: str, body: ProxyIn, user=Depends(require_active)):
             break
     save_profiles(profiles)
     return {"ok": True, "proxy": proxy}
+
+
+@app.post("/api/profiles/{pid}/warmup")
+async def set_warmup(pid: str, body: WarmupIn, user=Depends(require_user)):
+    """Включает/выключает режим прогрева (безопасные лимиты в час/сутки)."""
+    _owned_profile(pid, user)
+    profiles = load_profiles()
+    for p in profiles:
+        if p["id"] == pid:
+            p["warmup"] = bool(body.warmup)
+            break
+    save_profiles(profiles)
+    return {"ok": True, "warmup": bool(body.warmup), "limits": WARMUP_LIMITS}
 
 
 @app.get("/api/profiles/{pid}/status")
@@ -1566,6 +1633,8 @@ async def send_now(pid: str, body: SendIn, user=Depends(require_active)):
             return {"ok": True, "sent": [], "paused": f"Telegram просит подождать {detail}с."}
         if status == "spam":
             return {"ok": True, "sent": [], "paused": "Telegram пометил аккаунт как спам."}
+        if status == "limit":
+            return {"ok": True, "sent": [], "paused": "Достигнут лимит прогрева на сейчас — попробуй позже."}
         if status == "error":
             return {"ok": True, "sent": [], "errors": [f"{targets[0]['name']}: {detail}"]}
         return {"ok": True, "sent": [targets[0]["name"]], "errors": []}
