@@ -64,6 +64,9 @@ PROFILES_JSON = os.path.join(PROFILES_DIR, "profiles.json")
 SCHEDULES_JSON = os.path.join(PROFILES_DIR, "schedules.json")
 PACKS_JSON = os.path.join(PROFILES_DIR, "packs.json")
 USERS_JSON = os.path.join(PROFILES_DIR, "users.json")
+SENDS_JSON = os.path.join(PROFILES_DIR, "sends.json")
+SENDS_KEEP = int(os.environ.get("SENDS_KEEP", "300"))  # сколько последних запусков хранить
+QUEUE_JSON = os.path.join(PROFILES_DIR, "queue.json")  # активные рассылки (докатка при рестарте)
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 os.makedirs(PROFILES_DIR, exist_ok=True)
@@ -163,6 +166,35 @@ def load_packs():
 
 def save_packs(packs):
     _write_json(PACKS_JSON, {"packs": packs})
+
+
+def load_sends():
+    return _read_json(SENDS_JSON, {"sends": []})["sends"]
+
+
+# --- очередь активных рассылок: чтобы недоотправленное докатилось после рестарта ---
+def _queue_load():
+    return _read_json(QUEUE_JSON, {"jobs": []})["jobs"]
+
+
+def _queue_put(entry):
+    jobs = [j for j in _queue_load() if j.get("pid") != entry.get("pid")]
+    jobs.append(entry)
+    _write_json(QUEUE_JSON, {"jobs": jobs})
+
+
+def _queue_clear(pid):
+    jobs = [j for j in _queue_load() if j.get("pid") != pid]
+    _write_json(QUEUE_JSON, {"jobs": jobs})
+
+
+def _log_send_run(record):
+    """Добавляет запись о завершённой рассылке в историю (newest-first), с ограничением объёма."""
+    sends = load_sends()
+    sends.insert(0, record)
+    if len(sends) > SENDS_KEEP:
+        sends = sends[:SENDS_KEEP]
+    _write_json(SENDS_JSON, {"sends": sends})
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +379,8 @@ class State:
     entities: dict[str, dict] = {}
     # profile_id -> {"total","done","joined":[],"failed":[],"running"}
     join_jobs: dict[str, dict] = {}
+    # profile_id -> {"total","done","ok","failed":[],"running","cancel","status",...}
+    send_jobs: dict[str, dict] = {}
     scheduler_task = None
 
 
@@ -589,6 +623,33 @@ def _wu_allow(pid, kind):
     return True
 
 
+def _send_gate(pid):
+    """True, если отправка сейчас разрешена.
+    Прогрев → лимиты прогрева. Иначе → дневной лимит профиля (daily_limit, 0 = без лимита).
+    В любом случае ведёт дневной счётчик sent_today для показа пользователю."""
+    profile = get_profile(pid) or {}
+    if profile.get("warmup"):
+        return _wu_allow(pid, "send")
+    limit = int(profile.get("daily_limit") or 0)
+    day_key = datetime.now().strftime("%Y-%m-%d")
+    profiles = load_profiles()
+    for p in profiles:
+        if p["id"] != pid:
+            continue
+        ctr = p.get("sent_today") or {}
+        if ctr.get("k") != day_key:
+            ctr = {"k": day_key, "n": 0}
+        if limit > 0 and ctr["n"] >= limit:
+            p["sent_today"] = ctr
+            save_profiles(profiles)
+            return False
+        ctr["n"] += 1
+        p["sent_today"] = ctr
+        save_profiles(profiles)
+        return True
+    return True
+
+
 _SPIN_RE = re.compile(r"\{([^{}]*)\}")
 
 
@@ -603,13 +664,33 @@ def _spin(text):
     return out
 
 
+def _spin_issue(text):
+    """Проверяет spintax на пустые варианты. Возвращает текст ошибки или None."""
+    for m in _SPIN_RE.finditer(text or ""):
+        opts = m.group(1).split("|")
+        if any(o.strip() == "" for o in opts):
+            return "В фигурных скобках {…} есть пустой вариант — сообщение может уйти пустым. Убери лишний «|» или заполни вариант."
+    return None
+
+
+# имитация набора текста перед отправкой (человечнее — меньше похоже на бота)
+HUMAN_TYPING = os.environ.get("HUMAN_TYPING", "1") != "0"
+
+
 async def _send_one(client, pid, target, text):
     """Отправляет одно сообщение. Возвращает ('ok'|'flood'|'spam'|'limit'|'error', detail)."""
-    if not _wu_allow(pid, "send"):
-        return "limit", None   # достигнут лимит прогрева
+    if not _send_gate(pid):
+        return "limit", None   # достигнут лимит (прогрев или дневной)
     try:
         entity = await _resolve(pid, target["id"])
-        await client.send_message(entity, _spin(text))   # каждый раз свой вариант текста
+        msg = _spin(text)   # каждый раз свой вариант текста
+        if HUMAN_TYPING:
+            try:
+                async with client.action(entity, "typing"):
+                    await asyncio.sleep(random.uniform(0.8, 2.2))
+            except Exception:
+                pass  # имитация не критична — при сбое просто шлём
+        await client.send_message(entity, msg)
         return "ok", None
     except FloodWaitError as e:
         wait = e.seconds + 30  # запас сверху
@@ -625,27 +706,106 @@ async def _send_one(client, pid, target, text):
         return "error", str(e)
 
 
-async def _send_bulk(pid, targets, text, gap_lo=None, gap_hi=None):
-    """Последовательная отправка по чатам с паузой между ними и защитой от флуда."""
+# статус завершения bulk-рассылки → человекочитаемая метка
+_BULK_STATUS = {
+    "cancel": "остановлено",
+    "flood": "флуд-пауза",
+    "spam": "спам-флаг",
+    "limit": "дневной лимит",
+    "cooldown": "на паузе",
+    None: "готово",
+}
+
+
+async def _send_bulk(pid, targets, text, gap_lo=None, gap_hi=None, source="ручная",
+                     label="", started=None, done=0, ok=0, failed=None, fresh=True):
+    """Последовательная отправка по чатам: пауза между ними, защита от флуда,
+    живой прогресс (state.send_jobs), отмена, докатка при рестарте и запись в историю.
+    targets — оставшиеся к отправке чаты (при докатке — недоотправленный хвост)."""
     client = await get_client(pid)
     if client is None or not await client.is_user_authorized():
+        _queue_clear(pid)
         return
-    targets = list(targets)
-    random.shuffle(targets)   # случайный порядок чатов — меньше похоже на бота
-    n = len(targets)
-    for i, target in enumerate(targets):
-        if _on_cooldown(get_profile(pid)):
-            return
-        status, _ = await _send_one(client, pid, target, text)
-        if status in ("flood", "spam", "limit"):
-            return  # пауза/лимит прогрева — дальше не шлём
-        if i < n - 1:
-            await asyncio.sleep(_send_gap(gap_lo, gap_hi))
+    remaining = list(targets)
+    if fresh:
+        random.shuffle(remaining)   # случайный порядок чатов — меньше похоже на бота
+    started = started or datetime.now().isoformat(timespec="seconds")
+    n = done + len(remaining)   # общий размер рассылки (с учётом уже отправленных при докатке)
+    job = {
+        "running": True, "cancel": False,
+        "total": n, "done": done, "ok": ok, "failed": failed or [],
+        "status": "running", "source": source, "label": label,
+        "started": started,
+        "text_preview": (text or "")[:80],
+    }
+    state.send_jobs[pid] = job
+    owner = (get_profile(pid) or {}).get("owner")
 
+    def _persist():
+        _queue_put({
+            "pid": pid, "text": text, "gap_lo": gap_lo, "gap_hi": gap_hi,
+            "source": source, "label": label, "owner": owner, "started": started,
+            "done": job["done"], "ok": job["ok"], "failed": job["failed"],
+            "remaining": remaining,
+        })
 
-async def _send_bulk_safe(pid, targets, text, gap_lo=None, gap_hi=None):
+    _persist()
+    interrupted = None   # None | cancel | flood | spam | limit | cooldown
+    shutdown = False
     try:
-        await _send_bulk(pid, targets, text, gap_lo, gap_hi)
+        while remaining:
+            if job.get("cancel"):
+                interrupted = "cancel"
+                break
+            if _on_cooldown(get_profile(pid)):
+                interrupted = "cooldown"
+                break
+            target = remaining[0]
+            status, detail = await _send_one(client, pid, target, text)
+            if status in ("flood", "spam", "limit"):
+                interrupted = status
+                break   # пауза/лимит — дальше не шлём
+            remaining.pop(0)
+            job["done"] += 1
+            if status == "ok":
+                job["ok"] += 1
+            else:  # error
+                job["failed"].append({"name": target.get("name") or "", "reason": (detail or "")[:120]})
+            _persist()   # прогресс на диск → докатится после краша
+            if remaining and not job.get("cancel"):
+                await asyncio.sleep(_send_gap(gap_lo, gap_hi))
+    except asyncio.CancelledError:
+        shutdown = True   # выключение сервера — оставляем хвост в очереди для докатки
+        raise
+    finally:
+        job["running"] = False
+        if shutdown:
+            _persist()   # сохраняем недоотправленное, историю не пишем — рассылка не завершена
+        else:
+            _queue_clear(pid)
+            job["status"] = _BULK_STATUS.get(interrupted, "готово")
+            job["finished"] = datetime.now().isoformat(timespec="seconds")
+            _log_send_run({
+                "id": secrets.token_hex(6),
+                "profile_id": pid,
+                "owner": owner,
+                "started": job["started"],
+                "finished": job["finished"],
+                "total": n,
+                "ok": job["ok"],
+                "failed": job["failed"],
+                "status": job["status"],
+                "source": source,
+                "label": label,
+                "text_preview": job["text_preview"],
+            })
+
+
+async def _send_bulk_safe(pid, targets, text, gap_lo=None, gap_hi=None, source="ручная",
+                          label="", started=None, done=0, ok=0, failed=None, fresh=True):
+    try:
+        await _send_bulk(pid, targets, text, gap_lo, gap_hi, source, label,
+                         started, done, ok, failed, fresh)
     except Exception as e:
         print(f"[send] фоновая отправка {pid}: {e}")
 
@@ -798,8 +958,10 @@ async def _fire_rule(rule):
     pid = rule["profile_id"]
     if _on_cooldown(get_profile(pid)):
         return
+    label = rule.get("name") or rule.get("time") or "по интервалу"
     await _send_bulk(pid, rule.get("targets", []), rule["text"],
-                     rule.get("gap_min"), rule.get("gap_max"))
+                     rule.get("gap_min"), rule.get("gap_max"),
+                     source="расписание", label=label)
 
 
 async def _scheduler_loop():
@@ -876,9 +1038,33 @@ async def _scheduler_loop():
         await asyncio.sleep(20)
 
 
+async def _resume_queued_sends():
+    """Докатка: после рестарта продолжает рассылки, прерванные на середине."""
+    jobs = _queue_load()
+    for j in jobs:
+        remaining = j.get("remaining") or []
+        if not remaining:
+            _queue_clear(j.get("pid"))
+            continue
+        # владелец должен быть активен, иначе не возобновляем
+        ou = get_user(j.get("owner")) if j.get("owner") else None
+        if j.get("owner") and (ou is None or ou.get("status") != "approved" or not _sub_active(ou)):
+            _queue_clear(j.get("pid"))
+            continue
+        print(f"[resume] докатка рассылки {j.get('pid')}: осталось {len(remaining)} чат(ов)")
+        asyncio.create_task(_send_bulk_safe(
+            j["pid"], remaining, j.get("text", ""),
+            j.get("gap_lo"), j.get("gap_hi"),
+            j.get("source", "ручная"), j.get("label", ""),
+            j.get("started"), int(j.get("done") or 0), int(j.get("ok") or 0),
+            j.get("failed") or [], False,   # fresh=False — хвост не перемешиваем
+        ))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     state.scheduler_task = asyncio.create_task(_scheduler_loop())
+    await _resume_queued_sends()
     yield
     if state.scheduler_task:
         state.scheduler_task.cancel()
@@ -1203,6 +1389,10 @@ class WarmupIn(BaseModel):
     warmup: bool
 
 
+class LimitIn(BaseModel):
+    daily_limit: int = 0   # макс. отправок в сутки (0 = без лимита)
+
+
 class PhoneIn(BaseModel):
     phone: str
 
@@ -1331,6 +1521,9 @@ async def list_profiles(user=Depends(require_user)):
             "flood_note": p.get("flood_note") or "",
             "has_proxy": bool(p.get("proxy")),
             "warmup": bool(p.get("warmup")),
+            "daily_limit": int(p.get("daily_limit") or 0),
+            "sent_today": (p.get("sent_today") or {}).get("n", 0)
+                if (p.get("sent_today") or {}).get("k") == datetime.now().strftime("%Y-%m-%d") else 0,
         })
     return {"profiles": out}
 
@@ -1406,6 +1599,44 @@ async def set_warmup(pid: str, body: WarmupIn, user=Depends(require_user)):
             break
     save_profiles(profiles)
     return {"ok": True, "warmup": bool(body.warmup), "limits": WARMUP_LIMITS}
+
+
+@app.post("/api/profiles/{pid}/limit")
+async def set_daily_limit(pid: str, body: LimitIn, user=Depends(require_user)):
+    """Дневной лимит отправок вне прогрева (анти-бан на объёме). 0 = без лимита."""
+    _owned_profile(pid, user)
+    lim = max(0, int(body.daily_limit or 0))
+    profiles = load_profiles()
+    for p in profiles:
+        if p["id"] == pid:
+            p["daily_limit"] = lim
+            break
+    save_profiles(profiles)
+    return {"ok": True, "daily_limit": lim}
+
+
+@app.post("/api/profiles/{pid}/health")
+async def check_health(pid: str, user=Depends(require_user)):
+    """Проверка здоровья аккаунта через @SpamBot — не в теневом ли бане."""
+    _owned_profile(pid, user)
+    client = await get_client(pid)
+    if client is None or not await client.is_user_authorized():
+        return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    try:
+        async with client.conversation("SpamBot", timeout=25) as conv:
+            await conv.send_message("/start")
+            resp = await conv.get_response()
+            text = (resp.text or "").strip()
+    except Exception as e:
+        return JSONResponse({"error": f"Не удалось спросить @SpamBot: {e}"}, status_code=502)
+    low = text.lower()
+    if "no limits" in low or "free as a bird" in low or "не ограничен" in low or "ограничения сняты" in low:
+        verdict = "ok"
+    elif "limited" in low or "ограничен" in low or "restrict" in low or "banned" in low or "заблокирован" in low:
+        verdict = "limited"
+    else:
+        verdict = "unknown"
+    return {"verdict": verdict, "text": text[:1000]}
 
 
 @app.get("/api/profiles/{pid}/status")
@@ -1622,26 +1853,67 @@ async def send_now(pid: str, body: SendIn, user=Depends(require_active)):
         return JSONResponse({"error": "Не авторизован"}, status_code=401)
     if not body.text.strip():
         return JSONResponse({"error": "Пустое сообщение"}, status_code=400)
+    spin_err = _spin_issue(body.text)
+    if spin_err:
+        return JSONResponse({"error": spin_err}, status_code=400)
     if not body.targets:
         return JSONResponse({"error": "Не выбран ни один чат"}, status_code=400)
+
+    active = state.send_jobs.get(pid)
+    if active and active.get("running"):
+        return JSONResponse({"error": "Рассылка уже идёт — дождись окончания или нажми Стоп"}, status_code=409)
 
     targets = [{"id": t.id, "name": t.name, "kind": t.kind} for t in body.targets]
     if len(targets) == 1:
         # один чат — шлём сразу, чтобы дать мгновенный ответ
         status, detail = await _send_one(client, pid, targets[0], body.text)
+        # запись в историю (одиночная отправка тоже учитывается)
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        rec = {
+            "id": secrets.token_hex(6), "profile_id": pid, "owner": profile.get("owner"),
+            "started": now_iso, "finished": now_iso, "total": 1,
+            "ok": 1 if status == "ok" else 0,
+            "failed": [] if status == "ok" else [{"name": targets[0]["name"], "reason": (detail or status)[:120] if status == "error" else status}],
+            "status": {"ok": "готово", "flood": "флуд-пауза", "spam": "спам-флаг", "limit": "дневной лимит"}.get(status, "ошибка"),
+            "source": "ручная", "label": "", "text_preview": (body.text or "")[:80],
+        }
+        _log_send_run(rec)
         if status == "flood":
             return {"ok": True, "sent": [], "paused": f"Telegram просит подождать {detail}с."}
         if status == "spam":
             return {"ok": True, "sent": [], "paused": "Telegram пометил аккаунт как спам."}
         if status == "limit":
-            return {"ok": True, "sent": [], "paused": "Достигнут лимит прогрева на сейчас — попробуй позже."}
+            return {"ok": True, "sent": [], "paused": "Достигнут дневной лимит отправок — попробуй позже."}
         if status == "error":
             return {"ok": True, "sent": [], "errors": [f"{targets[0]['name']}: {detail}"]}
         return {"ok": True, "sent": [targets[0]["name"]], "errors": []}
 
     # несколько чатов — отправляем в фоне с паузой между ними
-    asyncio.create_task(_send_bulk_safe(pid, targets, body.text, body.gap_min, body.gap_max))
+    asyncio.create_task(_send_bulk_safe(pid, targets, body.text, body.gap_min, body.gap_max, source="ручная"))
     return {"ok": True, "started": len(targets)}
+
+
+class TestIn(BaseModel):
+    text: str
+
+
+@app.post("/api/profiles/{pid}/test")
+async def send_test(pid: str, body: TestIn, user=Depends(require_active)):
+    """Тест-режим: шлёт один вариант текста в «Избранное» (Saved Messages) — проверить перед рассылкой."""
+    _owned_profile(pid, user)
+    if not body.text.strip():
+        return JSONResponse({"error": "Пустое сообщение"}, status_code=400)
+    spin_err = _spin_issue(body.text)
+    if spin_err:
+        return JSONResponse({"error": spin_err}, status_code=400)
+    client = await get_client(pid)
+    if client is None or not await client.is_user_authorized():
+        return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    try:
+        await client.send_message("me", _spin(body.text))   # 'me' = Избранное
+    except Exception as e:
+        return JSONResponse({"error": f"Не удалось отправить: {e}"}, status_code=400)
+    return {"ok": True}
 
 
 @app.post("/api/profiles/{pid}/resume")
@@ -1673,6 +1945,9 @@ def _schedule_fields(body):
     """Собирает поля расписания из тела запроса. Возвращает (fields, None) или (None, error)."""
     if not body.text.strip():
         return None, JSONResponse({"error": "Пустое сообщение"}, status_code=400)
+    spin_err = _spin_issue(body.text)
+    if spin_err:
+        return None, JSONResponse({"error": spin_err}, status_code=400)
     if not body.targets:
         return None, JSONResponse({"error": "Не выбран ни один чат"}, status_code=400)
     fields = {
@@ -1864,6 +2139,35 @@ async def join_chats_stop(pid: str, user=Depends(require_user)):
     if job:
         job["cancel"] = True
     return {"ok": True}
+
+
+@app.get("/api/profiles/{pid}/send/status")
+async def send_status(pid: str, user=Depends(require_user)):
+    """Живой прогресс текущей/последней bulk-рассылки профиля."""
+    _owned_profile(pid, user)
+    job = state.send_jobs.get(pid)
+    if not job:
+        return {"running": False, "total": 0, "done": 0, "ok": 0, "failed": [], "status": ""}
+    return job
+
+
+@app.post("/api/profiles/{pid}/send/stop")
+async def send_stop(pid: str, user=Depends(require_user)):
+    """Останавливает активную bulk-рассылку (после текущего чата)."""
+    _owned_profile(pid, user)
+    job = state.send_jobs.get(pid)
+    if job:
+        job["cancel"] = True
+    return {"ok": True}
+
+
+@app.get("/api/profiles/{pid}/sends")
+async def send_history(pid: str, user=Depends(require_user), limit: int = 30):
+    """История завершённых рассылок профиля (newest-first)."""
+    _owned_profile(pid, user)
+    limit = max(1, min(int(limit or 30), 100))
+    rows = [s for s in load_sends() if s.get("profile_id") == pid][:limit]
+    return {"sends": rows}
 
 
 @app.get("/api/profiles/{pid}/tgfolders")

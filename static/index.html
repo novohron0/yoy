@@ -175,6 +175,11 @@
     background: var(--panel-2); border-radius: 11px; padding: 13px 14px;
     display: flex; gap: 12px; align-items: flex-start;
   }
+  .send-item {
+    background: var(--panel-2); border-radius: 11px; padding: 11px 14px;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .send-item + .send-item { margin-top: 8px; }
   .sched-item .si-main { flex: 1; min-width: 0; }
   .sched-item .si-when { font-size: 13px; color: var(--accent-3); font-weight: 600; margin-bottom: 4px; }
   .sched-item .si-text { font-size: 14px; margin-bottom: 5px; white-space: pre-wrap; word-break: break-word; }
@@ -347,15 +352,31 @@
     <button class="btn full" id="save-btn" onclick="saveSchedule()">Запланировать</button>
     <button class="btn ghost full" onclick="sendNow()">Отправить сейчас</button>
   </div>
+  <button class="btn ghost full" type="button" onclick="sendTest()" style="margin-top:10px">🧪 Тест: отправить себе (в Избранное)</button>
   <div id="edit-cancel" class="hidden" style="margin-top:8px;text-align:center">
     <a href="#" onclick="cancelEdit();return false">Отменить редактирование</a>
   </div>
   <div class="err" id="compose-err"></div>
 
+  <!-- Прогресс текущей рассылки -->
+  <div id="send-progress-box" class="section hidden" style="margin-top:16px">
+    <div class="row" style="justify-content:space-between;align-items:center;gap:10px">
+      <div id="send-progress" style="font-weight:600"></div>
+      <button class="btn ghost" id="send-stop" style="display:none" onclick="stopSend()">■ Стоп</button>
+    </div>
+    <div id="send-progress-fails" style="margin-top:6px"></div>
+  </div>
+
   <!-- Активные расписания -->
   <div class="section" id="sched-section" style="margin-top:24px">
     <h3>Запланированные отправки</h3>
     <div class="sched-list" id="sched-list"></div>
+  </div>
+
+  <!-- История рассылок -->
+  <div class="section" id="send-history-section" style="margin-top:24px">
+    <h3>История рассылок</h3>
+    <div class="sched-list" id="send-history"></div>
   </div>
 </div>
 
@@ -564,6 +585,8 @@ async function loadProfiles() {
         <div class="pstate ${p.authorized ? "on" : "off"}">${p.authorized ? "● подключён" : "○ нужен вход"}</div>
         <div class="pstate" style="color:var(--muted);cursor:pointer" data-proxy>🌐 ${p.has_proxy ? "прокси ✓" : "прокси не задан"}</div>
         <div class="pstate" style="cursor:pointer;color:${p.warmup ? "var(--accent-3)" : "var(--muted)"}" data-warmup>🔥 прогрев: ${p.warmup ? "вкл" : "выкл"}</div>
+        <div class="pstate" style="cursor:pointer;color:var(--muted)" data-limit>📊 лимит/сутки: ${p.daily_limit ? p.daily_limit : "∞"}${p.sent_today ? ` · сегодня ${p.sent_today}` : ""}</div>
+        ${p.authorized ? `<div class="pstate" style="cursor:pointer;color:var(--muted)" data-health>🩺 проверить аккаунт (@SpamBot)</div>` : ""}
         ${flood}
       </div>
       <button class="del" title="Удалить">✕</button>`;
@@ -571,6 +594,9 @@ async function loadProfiles() {
     card.querySelector(".del").onclick = (e) => { e.stopPropagation(); deleteProfile(p); };
     card.querySelector("[data-proxy]").onclick = (e) => { e.stopPropagation(); editProxy(p); };
     card.querySelector("[data-warmup]").onclick = (e) => { e.stopPropagation(); toggleWarmup(p); };
+    card.querySelector("[data-limit]").onclick = (e) => { e.stopPropagation(); editLimit(p); };
+    const hEl = card.querySelector("[data-health]");
+    if (hEl) hEl.onclick = (e) => { e.stopPropagation(); checkHealth(p, hEl); };
     grid.appendChild(card);
   }
   const add = document.createElement("div");
@@ -607,6 +633,33 @@ async function toggleWarmup(p) {
   if (!ok) return toast(data.error || "Ошибка", "bad");
   toast(on ? "🔥 Прогрев включён" : "Прогрев выключен", "ok");
   loadProfiles();
+}
+
+async function editLimit(p) {
+  const cur = p.daily_limit || 0;
+  const val = prompt(
+    "Дневной лимит отправок для этого аккаунта (анти-бан на объёме).\nНапример 40. 0 — без лимита:",
+    String(cur)
+  );
+  if (val === null) return;
+  const n = parseInt(val.trim(), 10);
+  if (isNaN(n) || n < 0) return toast("Нужно число ≥ 0", "bad");
+  const { ok, data } = await post(`/api/profiles/${p.id}/limit`, { daily_limit: n });
+  if (!ok) return toast(data.error || "Ошибка", "bad");
+  toast(n ? `📊 Лимит: ${n}/сутки` : "Лимит снят (без ограничения)", "ok");
+  loadProfiles();
+}
+
+async function checkHealth(p, elLink) {
+  const old = elLink.textContent;
+  elLink.textContent = "🩺 спрашиваю @SpamBot…";
+  const { ok, data } = await post(`/api/profiles/${p.id}/health`, {});
+  elLink.textContent = old;
+  if (!ok) return toast(data.error || "Не удалось проверить", "bad");
+  const icon = data.verdict === "ok" ? "✅" : (data.verdict === "limited" ? "⛔" : "ℹ️");
+  const head = data.verdict === "ok" ? "Аккаунт чистый — ограничений нет"
+    : (data.verdict === "limited" ? "Аккаунт ограничен Telegram!" : "Ответ @SpamBot");
+  alert(`${icon} ${head}\n\n${data.text || ""}`);
 }
 
 async function openProfile(p) {
@@ -735,6 +788,9 @@ function enterCompose(pid, name) {
   el("compose-title").textContent = name;
   el("msg").value = "";
   el("compose-err").textContent = "";
+  el("send-progress-box").classList.add("hidden");
+  loadSendHistory();
+  pollSend();   // если рассылка по этому профилю уже идёт — покажем прогресс
   renderRecipients();
   renderWeekdays();
   renderDates();
@@ -864,7 +920,11 @@ function goProfiles() {
   loadProfiles();
 }
 
-function goCompose() { showScreen("screen-compose"); }
+function goCompose() {
+  showScreen("screen-compose");
+  loadSendHistory();
+  pollSend();   // покажет прогресс, если рассылка уже идёт
+}
 
 // ---------- вступление в чаты ----------
 function openJoin() {
@@ -1223,6 +1283,7 @@ async function sendNow() {
   }
   if (data.started) {
     toast(`📨 Отправка запущена: ${data.started} чат(ов), пауза ${gap.gap_min}–${gap.gap_max}с между ними`, "ok");
+    pollSend();   // показать живой прогресс + кнопку Стоп
     return;
   }
   if (data.paused) {
@@ -1232,6 +1293,84 @@ async function sendNow() {
   }
   const errs = (data.errors || []).length;
   toast(errs ? `Отправлено ${data.sent.length}, ошибок ${errs}` : `Отправлено в ${data.sent.length} чат(ов) ✓`, errs ? "bad" : "ok");
+  loadSendHistory();   // одиночная отправка тоже попадает в историю
+}
+
+async function sendTest() {
+  el("compose-err").textContent = "";
+  const text = el("msg").value.trim();
+  if (!text) { el("compose-err").textContent = "Введи текст сообщения для теста."; return; }
+  const { ok, data } = await post(`/api/profiles/${state.profileId}/test`, { text });
+  if (!ok) { el("compose-err").textContent = data.error || "Ошибка"; return; }
+  toast("🧪 Отправил в «Избранное» — проверь, как выглядит текст", "ok");
+}
+
+// ---------- прогресс и история рассылок ----------
+function _hhmm(iso) {
+  try { const d = new Date(iso); return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
+  catch (e) { return ""; }
+}
+
+async function pollSend() {
+  if (el("screen-compose").classList.contains("hidden")) return;
+  const { ok, data } = await api(`/api/profiles/${state.profileId}/send/status`);
+  if (!ok) return;
+  renderSend(data);
+  if (data.running) {
+    setTimeout(pollSend, 3000);
+  } else if (data.total) {
+    loadSendHistory();   // завершилась — обновим историю
+  }
+}
+
+function renderSend(job) {
+  const box = el("send-progress-box"), stopBtn = el("send-stop");
+  if (!job || !job.total || !job.running) {
+    box.classList.add("hidden");
+    return;
+  }
+  box.classList.remove("hidden");
+  el("send-progress").textContent = `📨 Рассылка: ${job.done}/${job.total} (доставлено ${job.ok}) — идёт…`;
+  stopBtn.style.display = "";
+  const fails = (job.failed || []);
+  el("send-progress-fails").innerHTML = fails.length
+    ? `<div class="hint" style="color:var(--err)">Ошибок: ${fails.length}</div>`
+    : "";
+}
+
+async function stopSend() {
+  await post(`/api/profiles/${state.profileId}/send/stop`);
+  el("send-stop").disabled = true;
+  toast("Останавливаю рассылку…", "ok");
+  setTimeout(() => { el("send-stop").disabled = false; }, 1500);
+}
+
+async function loadSendHistory() {
+  const list = el("send-history");
+  if (!list) return;
+  const { ok, data } = await api(`/api/profiles/${state.profileId}/sends?limit=20`);
+  if (!ok) return;
+  const items = data.sends || [];
+  if (!items.length) { list.innerHTML = `<div class="hint">Пока не было рассылок.</div>`; return; }
+  list.innerHTML = items.map(s => {
+    const failed = (s.failed || []);
+    const okColor = failed.length ? "var(--muted)" : "var(--ok)";
+    const src = s.source === "расписание" ? `📅 ${escapeHtml(s.label || "расписание")}` : "✍️ вручную";
+    const failsHtml = failed.length
+      ? `<div class="hint" style="color:var(--err);margin-top:4px">❌ ${failed.length}: ` +
+        failed.slice(0, 5).map(f => escapeHtml(f.name || "?")).join(", ") +
+        (failed.length > 5 ? " …" : "") + `</div>`
+      : "";
+    const preview = s.text_preview ? `<div class="hint" style="margin-top:2px;opacity:.8">«${escapeHtml(s.text_preview)}»</div>` : "";
+    return `<div class="send-item">
+      <div class="row" style="justify-content:space-between;align-items:baseline;gap:8px">
+        <div style="font-weight:600;color:${okColor}">✅ ${s.ok}/${s.total}</div>
+        <div class="hint">${_hhmm(s.finished || s.started)} · ${escapeHtml(s.status || "")}</div>
+      </div>
+      <div class="hint" style="margin-top:2px">${src}</div>
+      ${preview}${failsHtml}
+    </div>`;
+  }).join("");
 }
 
 // ---------- список расписаний ----------
