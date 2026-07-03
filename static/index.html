@@ -237,6 +237,13 @@
     <span id="renew-text" style="flex:1;font-size:14px"></span>
     <button class="btn" onclick="showPay()">Продлить</button>
   </div>
+  <div id="notif-banner" class="hidden" style="background:var(--panel-3);border-left:3px solid var(--err);padding:12px 14px;border-radius:10px;margin-bottom:14px">
+    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:8px">
+      <b style="font-size:14px">🔔 Уведомления</b>
+      <a href="#" onclick="markNotifsRead();return false" class="hint">отметить прочитанными</a>
+    </div>
+    <div id="notif-list"></div>
+  </div>
   <div class="hint" style="margin-bottom:16px">Выбери аккаунт, чтобы настроить отправку постов по чатам. Или добавь новый.</div>
   <div class="profiles" id="profiles-grid"></div>
 </div>
@@ -566,6 +573,7 @@ function toast(msg, kind) {
 
 // ---------- экран профилей ----------
 async function loadProfiles() {
+  loadNotifs();
   const { data } = await api("/api/profiles");
   const grid = el("profiles-grid");
   grid.innerHTML = "";
@@ -659,7 +667,30 @@ async function checkHealth(p, elLink) {
   const icon = data.verdict === "ok" ? "✅" : (data.verdict === "limited" ? "⛔" : "ℹ️");
   const head = data.verdict === "ok" ? "Аккаунт чистый — ограничений нет"
     : (data.verdict === "limited" ? "Аккаунт ограничен Telegram!" : "Ответ @SpamBot");
-  alert(`${icon} ${head}\n\n${data.text || ""}`);
+  const tail = data.auto_paused ? "\n\n⏸ Рассылки этого аккаунта авто-остановлены на 6 ч." : "";
+  alert(`${icon} ${head}\n\n${data.text || ""}${tail}`);
+  if (data.auto_paused) loadProfiles();   // обновить статус карточки (встал на паузу)
+}
+
+// ---------- уведомления о ЧП ----------
+async function loadNotifs() {
+  const { ok, data } = await api("/api/notifications");
+  if (!ok) return;
+  const items = data.items || [];
+  const banner = el("notif-banner");
+  const unread = items.filter(n => !n.read);
+  if (!unread.length) { banner.classList.add("hidden"); return; }
+  banner.classList.remove("hidden");
+  const color = (lv) => lv === "error" ? "var(--err)" : (lv === "warn" ? "var(--accent-3)" : "var(--muted)");
+  el("notif-list").innerHTML = unread.slice(0, 10).map(n =>
+    `<div style="font-size:13px;margin:4px 0;color:${color(n.level)}">${escapeHtml(n.text)}
+       <span class="hint" style="opacity:.6"> · ${_hhmm(n.ts)}</span></div>`
+  ).join("");
+}
+
+async function markNotifsRead() {
+  await post(`/api/notifications/read`, {});
+  el("notif-banner").classList.add("hidden");
 }
 
 async function openProfile(p) {
