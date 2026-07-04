@@ -430,6 +430,14 @@ https://t.me/+AbCdEf..."></textarea>
     </div>
     <div class="hint" id="folder-status" style="margin-top:10px"></div>
   </div>
+
+  <div class="section">
+    <h3>🔗 Перенести каналы на другой аккаунт</h3>
+    <p class="hint">Забирает ссылки на все каналы/группы ЭТОГО аккаунта. Публичные вставишь в поле «Ссылки» вверху на НОВОМ аккаунте и нажмёшь «Начать вступление» — он вступит сам. Приватные откроешь по ссылке вручную.</p>
+    <button class="btn full" type="button" onclick="exportLinks()">Показать ссылки на мои каналы</button>
+    <div class="hint" id="export-status" style="margin-top:10px"></div>
+    <div id="export-result" style="margin-top:12px"></div>
+  </div>
 </div>
 
 <!-- ============ Модалка: добавить аккаунт ============ -->
@@ -1017,6 +1025,52 @@ async function collectFolder() {
   el("folder-status").textContent = ok
     ? `✅ Папка «${data.name}» создана, каналов: ${data.count}. Открой Telegram → папки.`
     : (data.error || "Ошибка");
+}
+
+async function exportLinks() {
+  const box = el("export-result");
+  el("export-status").textContent = "Читаю каналы аккаунта…";
+  box.innerHTML = "";
+  const { ok, data } = await api(`/api/profiles/${state.profileId}/export_links`);
+  el("export-status").textContent = "";
+  if (!ok) { el("export-status").textContent = data.error || "Ошибка"; return; }
+  const c = data.counts || {};
+  const blk = (inner) => `<div class="section" style="background:var(--panel-2);margin-top:10px">${inner}</div>`;
+  let html = "";
+  if ((data.public || []).length) {
+    const links = data.public.map(x => x.link).join("\n");
+    html += blk(`<b style="color:var(--ok)">🌐 Публичные каналы: ${c.public}</b>
+      <p class="hint">Скопируй → вставь в поле «Ссылки» вверху на НОВОМ аккаунте → «Начать вступление» (он вступит сам).</p>
+      <textarea id="export-public" readonly style="min-height:110px">${escapeHtml(links)}</textarea>
+      <button class="btn ghost full" type="button" onclick="copyExport('export-public')" style="margin-top:8px">📋 Скопировать ${c.public} ссылок</button>`);
+  }
+  if ((data.private_invite || []).length) {
+    const links = data.private_invite.map(x => x.link).join("\n");
+    const rows = data.private_invite.map(x => `<div style="font-size:13px;margin:3px 0">🔒 <a href="${x.link}" target="_blank" rel="noopener">${escapeHtml(x.name)}</a></div>`).join("");
+    html += blk(`<b style="color:var(--accent-3)">🔒 Приватные (есть invite-ссылка): ${c.private_invite}</b>
+      <p class="hint">Открывай каждую на новом аккаунте вручную (тапом), либо скопируй все ссылки.</p>
+      ${rows}
+      <textarea id="export-priv" readonly style="min-height:70px;margin-top:6px">${escapeHtml(links)}</textarea>
+      <button class="btn ghost full" type="button" onclick="copyExport('export-priv')" style="margin-top:8px">📋 Скопировать ссылки</button>`);
+  }
+  if ((data.private_nolink || []).length) {
+    const rows = data.private_nolink.map(x => `<div class="hint" style="margin:2px 0">• ${escapeHtml(x.name)}</div>`).join("");
+    html += blk(`<b style="color:var(--err)">⚠️ Приватные без ссылки: ${c.private_nolink}</b>
+      <p class="hint">Здесь ты не админ — автоссылку не достать. Доступ придётся получить вручную (попроси инвайт у владельца).</p>
+      ${rows}`);
+  }
+  box.innerHTML = html || `<div class="hint">Каналов не найдено.</div>`;
+}
+
+function copyExport(id) {
+  const ta = el(id);
+  ta.select();
+  const done = () => toast("Скопировано ✓", "ok");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(ta.value).then(done).catch(() => { document.execCommand("copy"); done(); });
+  } else {
+    document.execCommand("copy"); done();
+  }
 }
 
 function renderRecipients() {

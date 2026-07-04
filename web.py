@@ -46,6 +46,7 @@ from telethon.tl.functions.messages import (
     ImportChatInviteRequest,
     GetDialogFiltersRequest,
     UpdateDialogFilterRequest,
+    ExportChatInviteRequest,
 )
 from telethon.tl.types import User, Chat, Channel
 from telethon.errors import (
@@ -2340,6 +2341,50 @@ async def all_dialogs(pid: str, user=Depends(require_user)):
     except Exception as e:
         return JSONResponse({"error": f"Ошибка: {e}"}, status_code=400)
     return {"results": out}
+
+
+@app.get("/api/profiles/{pid}/export_links")
+async def export_links(pid: str, user=Depends(require_user)):
+    """Собирает ссылки на все каналы/группы аккаунта — для переноса на другой аккаунт.
+    public: публичные (@username) — можно массово вступить.
+    private_invite: приватные, где удалось достать invite-ссылку (ты админ/есть право).
+    private_nolink: приватные без ссылки (нет прав) — только по названию."""
+    _owned_profile(pid, user)
+    client = await get_client(pid)
+    if client is None or not await client.is_user_authorized():
+        return JSONResponse(
+            {"error": "Аккаунт не авторизован (возможно, заморожен/забанен) — прочитать его каналы не выйдет."},
+            status_code=401,
+        )
+    public, private_invite, private_nolink = [], [], []
+    try:
+        async for d in client.iter_dialogs():
+            e = d.entity
+            if not isinstance(e, (Chat, Channel)):
+                continue   # только группы и каналы
+            name = _name(e)
+            uname = getattr(e, "username", None)
+            if uname:
+                public.append({"name": name, "username": uname, "link": f"https://t.me/{uname}"})
+                continue
+            # приватный — пробуем достать invite-ссылку (нужно право приглашать)
+            try:
+                res = await client(ExportChatInviteRequest(e))
+                link = getattr(res, "link", None) or getattr(res, "invite", None)
+                if link:
+                    private_invite.append({"name": name, "link": link})
+                else:
+                    private_nolink.append({"name": name})
+            except Exception:
+                private_nolink.append({"name": name})
+    except Exception as e:
+        return JSONResponse({"error": f"Не удалось прочитать чаты: {e}"}, status_code=400)
+    return {
+        "public": public,
+        "private_invite": private_invite,
+        "private_nolink": private_nolink,
+        "counts": {"public": len(public), "private_invite": len(private_invite), "private_nolink": len(private_nolink)},
+    }
 
 
 @app.post("/api/profiles/{pid}/folder")
