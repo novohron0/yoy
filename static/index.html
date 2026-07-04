@@ -1442,9 +1442,11 @@ async function loadSendHistory() {
     const okColor = failed.length ? "var(--muted)" : "var(--ok)";
     const src = s.source === "расписание" ? `📅 ${escapeHtml(s.label || "расписание")}` : "✍️ вручную";
     const failsHtml = failed.length
-      ? `<div class="hint" style="color:var(--err);margin-top:4px">❌ ${failed.length}: ` +
-        failed.slice(0, 5).map(f => escapeHtml(f.name || "?")).join(", ") +
-        (failed.length > 5 ? " …" : "") + `</div>`
+      ? `<div class="hint" style="color:var(--err);margin-top:4px">❌ Не дошло (${failed.length}):</div>` +
+        failed.slice(0, 6).map(f =>
+          `<div class="hint" style="color:var(--err);opacity:.85;margin-left:8px">• ${escapeHtml(f.name || "?")}${f.reason ? ` — ${escapeHtml(f.reason)}` : ""}</div>`
+        ).join("") +
+        (failed.length > 6 ? `<div class="hint" style="margin-left:8px">…ещё ${failed.length - 6}</div>` : "")
       : "";
     const preview = s.text_preview ? `<div class="hint" style="margin-top:2px;opacity:.8">«${escapeHtml(s.text_preview)}»</div>` : "";
     return `<div class="send-item">
