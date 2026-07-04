@@ -603,6 +603,8 @@ async function loadProfiles() {
         <div class="pstate" style="cursor:pointer;color:${p.warmup ? "var(--accent-3)" : "var(--muted)"}" data-warmup>🔥 прогрев: ${p.warmup ? "вкл" : "выкл"}</div>
         <div class="pstate" style="cursor:pointer;color:var(--muted)" data-limit>📊 лимит/сутки: ${p.daily_limit ? p.daily_limit : "∞"}${p.sent_today ? ` · сегодня ${p.sent_today}` : ""}</div>
         ${p.authorized ? `<div class="pstate" style="cursor:pointer;color:var(--muted)" data-health>🩺 проверить аккаунт (@SpamBot)</div>` : ""}
+        ${p.authorized ? `<div class="pstate" style="cursor:pointer;color:var(--muted)" data-clone-save>💾 сохранить настройки (клон)</div>` : ""}
+        ${p.authorized ? `<div class="pstate" style="cursor:pointer;color:var(--accent-3)" data-clone-apply>📥 применить настройки с другого</div>` : ""}
         ${flood}
       </div>
       <button class="del" title="Удалить">✕</button>`;
@@ -613,6 +615,10 @@ async function loadProfiles() {
     card.querySelector("[data-limit]").onclick = (e) => { e.stopPropagation(); editLimit(p); };
     const hEl = card.querySelector("[data-health]");
     if (hEl) hEl.onclick = (e) => { e.stopPropagation(); checkHealth(p, hEl); };
+    const csEl = card.querySelector("[data-clone-save]");
+    if (csEl) csEl.onclick = (e) => { e.stopPropagation(); cloneSave(p); };
+    const caEl = card.querySelector("[data-clone-apply]");
+    if (caEl) caEl.onclick = (e) => { e.stopPropagation(); cloneApply(p); };
     grid.appendChild(card);
   }
   const add = document.createElement("div");
@@ -678,6 +684,45 @@ async function checkHealth(p, elLink) {
   const tail = data.auto_paused ? "\n\n⏸ Рассылки этого аккаунта авто-остановлены на 6 ч." : "";
   alert(`${icon} ${head}\n\n${data.text || ""}${tail}`);
   if (data.auto_paused) loadProfiles();   // обновить статус карточки (встал на паузу)
+}
+
+// ---------- клонирование настроек аккаунта ----------
+async function cloneSave(p) {
+  toast("Снимаю настройки аккаунта…", "ok");
+  const { ok, data } = await post(`/api/profiles/${p.id}/clone/export`, {});
+  if (!ok) return toast(data.error || "Ошибка", "bad");
+  const s = data.snapshot || {};
+  alert(`💾 Настройки «${p.name}» сохранены:\n\n`
+    + `• Имя: ${(s.first_name || "—")} ${s.last_name || ""}\n`
+    + `• Био: ${s.about ? "есть" : "нет"}\n`
+    + `• Фото: ${s.has_photo ? "есть" : "нет"}\n`
+    + `• Приватность: ${s.privacy_count} настроек\n`
+    + `• Папки: ${s.folders_count}\n\n`
+    + `Теперь на НОВОМ аккаунте нажми «📥 применить настройки с другого».`);
+}
+
+async function cloneApply(p) {
+  const { ok, data } = await api(`/api/clone/snapshots`);
+  if (!ok) return toast(data.error || "Ошибка", "bad");
+  const snaps = (data.snapshots || []).filter(s => s.source_pid !== p.id);
+  if (!snaps.length) {
+    return alert("Нет сохранённых настроек.\n\nСначала на СТАРОМ аккаунте нажми «💾 сохранить настройки (клон)».");
+  }
+  let pick = snaps[0];
+  if (snaps.length > 1) {
+    const list = snaps.map((s, i) => `${i + 1}) ${s.source_name || s.source_pid} — ${(s.ts || "").slice(0, 16).replace("T", " ")}`).join("\n");
+    const n = prompt(`Чьи настройки применить к «${p.name}»?\n\n${list}\n\nВведи номер:`, "1");
+    if (n === null) return;
+    const idx = parseInt(n, 10) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= snaps.length) return toast("Неверный номер", "bad");
+    pick = snaps[idx];
+  }
+  if (!confirm(`Применить настройки «${pick.source_name}» к «${p.name}»?\n\nПерезапишет имя, био, фото, приватность и создаст папки (по чатам, куда этот аккаунт уже вступил).`)) return;
+  toast("Применяю настройки…", "ok");
+  const { ok: ok2, data: r } = await post(`/api/profiles/${p.id}/clone/apply`, { source_pid: pick.source_pid });
+  if (!ok2) return toast(r.error || "Ошибка", "bad");
+  alert(`✅ Применено к «${p.name}» (из «${r.from}»):\n\n${(r.applied || []).map(x => "• " + x).join("\n") || "— ничего"}`);
+  loadProfiles();
 }
 
 // ---------- уведомления о ЧП ----------

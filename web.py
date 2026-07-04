@@ -69,6 +69,7 @@ SENDS_JSON = os.path.join(PROFILES_DIR, "sends.json")
 SENDS_KEEP = int(os.environ.get("SENDS_KEEP", "300"))  # сколько последних запусков хранить
 QUEUE_JSON = os.path.join(PROFILES_DIR, "queue.json")  # активные рассылки (докатка при рестарте)
 NOTIFS_JSON = os.path.join(PROFILES_DIR, "notifications.json")  # уведомления владельцу о ЧП
+CLONES_DIR = os.path.join(PROFILES_DIR, "clones")  # снимки настроек аккаунта для клонирования
 NOTIFS_KEEP = int(os.environ.get("NOTIFS_KEEP", "100"))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
@@ -2463,6 +2464,253 @@ async def export_links(pid: str, user=Depends(require_user)):
         "private_nolink": private_nolink,
         "counts": {"public": len(public), "private_invite": len(private_invite), "private_nolink": len(private_nolink)},
     }
+
+
+# ---------------------------------------------------------------------------
+# Клонирование настроек аккаунта (имя/био/фото/приватность/папки) на новый акк
+# ---------------------------------------------------------------------------
+def _privacy_keys():
+    """Ключи приватности, которые умеем переносить: наш_код -> (класс ключа)."""
+    from telethon.tl import types as T
+    return {
+        "phone":    T.InputPrivacyKeyPhoneNumber,
+        "lastseen": T.InputPrivacyKeyStatusTimestamp,
+        "photo":    T.InputPrivacyKeyProfilePhoto,
+        "calls":    T.InputPrivacyKeyPhoneCall,
+        "forwards": T.InputPrivacyKeyForwards,
+        "groups":   T.InputPrivacyKeyChatInvite,
+        "bio":      T.InputPrivacyKeyAbout,
+    }
+
+
+def _privacy_to_token(rules):
+    """Правила приватности от Telegram → простой токен all|contacts|none."""
+    names = " ".join(type(r).__name__.lower() for r in (rules or []))
+    if "disallowall" in names:   # проверяем раньше 'allowall' (это его подстрока)
+        return "none"
+    if "allowall" in names:
+        return "all"
+    if "allowcontacts" in names:
+        return "contacts"
+    return "contacts"
+
+
+def _token_to_rules(token):
+    """Токен → список InputPrivacyValue* для установки на новом аккаунте."""
+    from telethon.tl import types as T
+    if token == "all":
+        return [T.InputPrivacyValueAllowAll()]
+    if token == "none":
+        return [T.InputPrivacyValueDisallowAll()]
+    return [T.InputPrivacyValueAllowContacts()]
+
+
+def _snap_path(pid):
+    return os.path.join(CLONES_DIR, f"{pid}.json")
+
+
+def _snap_photo(pid):
+    return os.path.join(CLONES_DIR, f"{pid}.jpg")
+
+
+@app.post("/api/profiles/{pid}/clone/export")
+async def clone_export(pid: str, user=Depends(require_user)):
+    """Снимок настроек аккаунта (имя, био, фото, приватность, папки) — для переноса на другой аккаунт."""
+    prof = _owned_profile(pid, user)
+    client = await get_client(pid)
+    if client is None or not await client.is_user_authorized():
+        return JSONResponse({"error": "Аккаунт не авторизован (возможно, заморожен) — снять настройки не выйдет."}, status_code=401)
+    os.makedirs(CLONES_DIR, exist_ok=True)
+    from telethon.tl.functions.account import GetPrivacyRequest
+    from telethon.tl.functions.users import GetFullUserRequest
+
+    snap = {"source_pid": pid, "source_name": prof.get("name", ""), "ts": datetime.now().isoformat(timespec="seconds"),
+            "first_name": "", "last_name": "", "about": "", "has_photo": False, "privacy": {}, "folders": []}
+    try:
+        me = await client.get_me()
+        snap["first_name"] = me.first_name or ""
+        snap["last_name"] = me.last_name or ""
+    except Exception as e:
+        return JSONResponse({"error": f"Не удалось прочитать профиль: {e}"}, status_code=400)
+    # био
+    try:
+        full = await client(GetFullUserRequest("me"))
+        snap["about"] = getattr(full.full_user, "about", "") or ""
+    except Exception:
+        pass
+    # фото
+    try:
+        got = await client.download_profile_photo("me", file=_snap_photo(pid))
+        snap["has_photo"] = bool(got)
+    except Exception:
+        snap["has_photo"] = False
+    # приватность
+    try:
+        for code, KeyCls in _privacy_keys().items():
+            try:
+                r = await client(GetPrivacyRequest(KeyCls()))
+                snap["privacy"][code] = _privacy_to_token(r.rules)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # папки (структура + чаты по username/id)
+    try:
+        res = await client(GetDialogFiltersRequest())
+        filters = getattr(res, "filters", res) or []
+        for f in filters:
+            peers = getattr(f, "include_peers", None)
+            if peers is None:
+                continue
+            title = getattr(f, "title", "")
+            title_text = getattr(title, "text", title) if title else ""
+            chats = []
+            for p in peers:
+                try:
+                    ent = await client.get_entity(p)
+                    chats.append({"username": getattr(ent, "username", None) or "",
+                                  "id": utils.get_peer_id(ent), "title": _name(ent)})
+                except Exception:
+                    pass
+            snap["folders"].append({"name": title_text or "Папка", "chats": chats})
+    except Exception:
+        pass
+
+    _write_json(_snap_path(pid), snap)
+    return {"ok": True, "snapshot": {
+        "source_pid": pid, "source_name": snap["source_name"], "ts": snap["ts"],
+        "first_name": snap["first_name"], "last_name": snap["last_name"],
+        "about": snap["about"], "has_photo": snap["has_photo"],
+        "privacy_count": len(snap["privacy"]), "folders_count": len(snap["folders"]),
+    }}
+
+
+@app.get("/api/clone/snapshots")
+async def clone_snapshots(user=Depends(require_user)):
+    """Список сохранённых снимков настроек (по профилям этого пользователя)."""
+    out = []
+    my_pids = {p["id"] for p in load_profiles() if p.get("owner") == user["id"]}
+    if os.path.isdir(CLONES_DIR):
+        for fn in os.listdir(CLONES_DIR):
+            if not fn.endswith(".json"):
+                continue
+            spid = fn[:-5]
+            if spid not in my_pids:
+                continue
+            snap = _read_json(os.path.join(CLONES_DIR, fn), None)
+            if not snap:
+                continue
+            out.append({"source_pid": spid, "source_name": snap.get("source_name", ""), "ts": snap.get("ts", ""),
+                        "first_name": snap.get("first_name", ""), "has_photo": snap.get("has_photo", False),
+                        "privacy_count": len(snap.get("privacy", {})), "folders_count": len(snap.get("folders", []))})
+    out.sort(key=lambda x: x.get("ts", ""), reverse=True)
+    return {"snapshots": out}
+
+
+class CloneApplyIn(BaseModel):
+    source_pid: str
+    name: bool = True
+    photo: bool = True
+    privacy: bool = True
+    folders: bool = True
+
+
+@app.post("/api/profiles/{pid}/clone/apply")
+async def clone_apply(pid: str, body: CloneApplyIn, user=Depends(require_active)):
+    """Применяет снимок настроек (от другого аккаунта пользователя) к этому аккаунту."""
+    _owned_profile(pid, user)
+    _owned_profile(body.source_pid, user)   # снимок должен быть от своего же профиля
+    if body.source_pid == pid:
+        return JSONResponse({"error": "Нельзя применить настройки аккаунта к нему же"}, status_code=400)
+    snap = _read_json(_snap_path(body.source_pid), None)
+    if not snap:
+        return JSONResponse({"error": "Снимок не найден — сначала сохрани настройки на исходном аккаунте"}, status_code=404)
+    client = await get_client(pid)
+    if client is None or not await client.is_user_authorized():
+        return JSONResponse({"error": "Не авторизован"}, status_code=401)
+
+    from telethon.tl.functions.account import UpdateProfileRequest, SetPrivacyRequest, GetPrivacyRequest
+    from telethon.tl.functions.photos import UploadProfilePhotoRequest
+    done = []
+    # имя + био
+    if body.name:
+        try:
+            await client(UpdateProfileRequest(first_name=snap.get("first_name") or "",
+                                              last_name=snap.get("last_name") or "",
+                                              about=snap.get("about") or ""))
+            done.append("имя и био")
+        except Exception as e:
+            done.append(f"имя — ошибка: {e}")
+    # фото
+    if body.photo and snap.get("has_photo") and os.path.exists(_snap_photo(body.source_pid)):
+        try:
+            f = await client.upload_file(_snap_photo(body.source_pid))
+            await client(UploadProfilePhotoRequest(file=f))
+            done.append("фото профиля")
+        except Exception as e:
+            done.append(f"фото — ошибка: {e}")
+    # приватность
+    if body.privacy and snap.get("privacy"):
+        okc = 0
+        keys = _privacy_keys()
+        for code, token in snap["privacy"].items():
+            KeyCls = keys.get(code)
+            if not KeyCls:
+                continue
+            try:
+                await client(SetPrivacyRequest(key=KeyCls(), rules=_token_to_rules(token)))
+                okc += 1
+            except Exception:
+                pass
+        if okc:
+            done.append(f"приватность ({okc})")
+    # папки — только чаты, куда этот аккаунт уже вступил
+    folders_added, chats_missing = 0, 0
+    if body.folders and snap.get("folders"):
+        try:
+            from telethon.tl.types import DialogFilter
+            try:
+                from telethon.tl.types import TextWithEntities
+            except Exception:
+                TextWithEntities = None
+            res = await client(GetDialogFiltersRequest())
+            existing = getattr(res, "filters", res) or []
+            used = {getattr(f, "id", None) for f in existing if isinstance(getattr(f, "id", None), int)}
+            next_id = (lambda: next(i for i in range(2, 250) if i not in used))
+            for folder in snap["folders"]:
+                peers = []
+                for ch in folder.get("chats", []):
+                    ref = ch.get("username") or ch.get("id")
+                    if not ref:
+                        chats_missing += 1
+                        continue
+                    try:
+                        peers.append(await client.get_input_entity(ref))
+                    except Exception:
+                        chats_missing += 1
+                if not peers:
+                    continue
+                fid = next_id()
+                used.add(fid)
+                title = folder.get("name") or "Папка"
+                title_obj = TextWithEntities(text=title, entities=[]) if TextWithEntities else title
+                flt = DialogFilter(id=fid, title=title_obj, pinned_peers=[], include_peers=peers, exclude_peers=[])
+                try:
+                    await client(UpdateDialogFilterRequest(id=fid, filter=flt))
+                    folders_added += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    if folders_added:
+        msg = f"папки ({folders_added})"
+        if chats_missing:
+            msg += f", {chats_missing} чат(ов) пропущено — нет вступления"
+        done.append(msg)
+    elif body.folders and chats_missing:
+        done.append(f"папки: пропущены — новый аккаунт ещё не вступил в чаты ({chats_missing})")
+
+    return {"ok": True, "applied": done, "from": snap.get("source_name", "")}
 
 
 @app.post("/api/profiles/{pid}/folder")
