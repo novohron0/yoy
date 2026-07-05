@@ -1,3 +1,8 @@
 {$PANEL_DOMAIN} {
     reverse_proxy scheduler:8000
 }
+
+# Vita — календарь жизни; контейнер живёт в соседнем ~/vita (порт 8788 хоста)
+{$VITA_DOMAIN} {
+    reverse_proxy host.docker.internal:8788
+}

@@ -21,6 +21,11 @@ services:
     environment:
       # домен панели (берётся из .env), на него Caddy получит HTTPS-сертификат
       PANEL_DOMAIN: ${PANEL_DOMAIN:?Задай PANEL_DOMAIN в .env}
+      # домен Vita (~/vita); по умолчанию — авто-домен sslip.io, свой задаётся в .env
+      VITA_DOMAIN: ${VITA_DOMAIN:-vita.138-124-51-182.sslip.io}
+    extra_hosts:
+      # мост к контейнеру Vita, опубликованному на 127.0.0.1:8788 хоста
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data
