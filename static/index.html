@@ -261,7 +261,10 @@
            onkeydown="if(event.key==='Enter')submitAuth()" />
     <div class="err" id="auth-err"></div>
     <button class="btn full" id="auth-submit" style="margin-top:14px" onclick="submitAuth()">Войти</button>
-    <div class="hint" id="auth-switch" style="margin-top:14px;text-align:center"></div>
+    <div class="hint" id="auth-forgot" style="margin-top:12px;text-align:center">
+      <a href="#" onclick="openReset();return false">🔑 Забыли пароль?</a>
+    </div>
+    <div class="hint" id="auth-switch" style="margin-top:10px;text-align:center"></div>
     <div class="hint" style="margin-top:12px;text-align:center">
       Впервые здесь? <a href="#" onclick="openHelp();return false">📖 Открой обучение</a> — там всё по шагам.
     </div>
@@ -688,6 +691,34 @@ https://t.me/+AbCdEf..."></textarea>
 
   <div class="hint" style="text-align:center;margin-top:18px">
     Остались вопросы? Напиши администратору — поможем 🤝
+  </div>
+</div>
+
+<!-- ============ Модалка: забыли пароль ============ -->
+<div id="modal-reset" class="overlay hidden">
+  <div class="modal">
+    <h2>🔑 Забыли пароль</h2>
+    <p class="sub">Не переживай — сейчас всё восстановим. Три простых шага.</p>
+
+    <div class="help-do" style="margin:0 0 14px">
+      <b>Шаг 1.</b> Введи свой логин и нажми «Запросить сброс».<br>
+      <b>Шаг 2.</b> Напиши администратору — он нажмёт «Одобрить» у себя.<br>
+      <b>Шаг 3.</b> Вернись сюда, впиши новый пароль и нажми «Сохранить».
+    </div>
+
+    <label>Твой логин</label>
+    <input id="reset-user" placeholder="Логин, которым ты регистрировался" />
+    <button class="btn full" style="margin-top:12px" onclick="resetRequest()">1️⃣ Запросить сброс пароля</button>
+
+    <label style="margin-top:18px">Новый пароль <span class="hint">(вводи после одобрения)</span></label>
+    <input id="reset-pass" type="password" placeholder="Минимум 6 символов"
+           onkeydown="if(event.key==='Enter')resetComplete()" />
+    <button class="btn ghost full" style="margin-top:10px" onclick="resetComplete()">2️⃣ Сохранить новый пароль и войти</button>
+
+    <div class="err" id="reset-err"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeReset()">Закрыть</button>
+    </div>
   </div>
 </div>
 
@@ -2066,6 +2097,46 @@ async function logout() {
   showAuth();
 }
 
+// ---------- сброс пароля ----------
+function openReset() {
+  el("modal-reset").classList.remove("hidden");
+  el("reset-user").value = el("auth-user").value.trim() || "";
+  el("reset-pass").value = "";
+  el("reset-err").textContent = "";
+  el("reset-err").style.color = "";
+  el("reset-user").focus();
+}
+function closeReset() { el("modal-reset").classList.add("hidden"); }
+
+async function resetRequest() {
+  const username = el("reset-user").value.trim();
+  el("reset-err").style.color = "";
+  if (!username) { el("reset-err").textContent = "Введи логин"; return; }
+  const { ok, data } = await post("/api/auth/reset/request", { username });
+  if (!ok) { el("reset-err").textContent = data.error || "Ошибка"; return; }
+  el("reset-err").style.color = "var(--ok)";
+  el("reset-err").textContent = "✅ Запрос отправлен. Попроси администратора одобрить его — потом впиши новый пароль ниже.";
+}
+
+async function resetComplete() {
+  const username = el("reset-user").value.trim();
+  const password = el("reset-pass").value;
+  el("reset-err").style.color = "";
+  if (!username) { el("reset-err").textContent = "Введи логин"; return; }
+  if (password.length < 6) { el("reset-err").textContent = "Пароль — минимум 6 символов"; return; }
+  const { ok, data } = await post("/api/auth/reset/complete", { username, password });
+  if (!ok) { el("reset-err").textContent = data.error || "Ошибка"; return; }
+  if (data.step === "pending") {
+    el("reset-err").style.color = "var(--ok)";
+    el("reset-err").textContent = "Пароль сохранён. Но аккаунт ещё ждёт одобрения администратором на вход.";
+    return;
+  }
+  closeReset();
+  state.me = data.user;
+  toast("Пароль обновлён ✓ Ты вошёл", "ok");
+  enterApp();
+}
+
 // ---------- админка: пользователи ----------
 async function openAdmin() {
   showScreen("screen-admin");
@@ -2095,6 +2166,8 @@ async function loadAdminUsers() {
                       : `⛔ доступ не оплачен · тариф ${escapeHtml(u.tier)}`);
     let actions = "";
     if (!me) {
+      if (u.reset_status === "pending") actions += `<button class="btn" data-act="reset-approve">🔑 Одобрить сброс пароля</button>`;
+      if (u.reset_status === "approved") actions += `<button class="btn ghost" data-act="reset-reject">Отменить сброс пароля</button>`;
       if (u.status !== "approved") actions += `<button class="btn" data-act="approve">Одобрить</button>`;
       if (u.status !== "blocked") actions += `<button class="btn ghost" data-act="block">Заблокировать</button>`;
       if (!u.is_admin) {
@@ -2104,10 +2177,16 @@ async function loadAdminUsers() {
       }
       actions += `<button class="btn danger" data-act="delete">Удалить</button>`;
     }
+    const resetBadge = u.reset_status === "pending"
+      ? `<div class="si-to" style="color:var(--err);margin-top:2px">🔑 просит сброс пароля${u.reset_requested ? " · " + escapeHtml(u.reset_requested) : ""} — нажми «Одобрить сброс пароля»</div>`
+      : (u.reset_status === "approved"
+        ? `<div class="si-to" style="color:var(--accent-3);margin-top:2px">🔑 сброс одобрен — ждём, пока задаст новый пароль</div>`
+        : "");
     item.innerHTML = `
       <div class="si-main">
         <div class="si-when">${escapeHtml(u.username)}${u.is_admin ? " · админ" : ""}${me ? " · это ты" : ""}</div>
         <div class="si-to">${USTATUS[u.status] || u.status} · ${sub}</div>
+        ${resetBadge}
       </div>
       <div style="display:flex;flex-direction:column;gap:6px;min-width:150px">${actions}</div>`;
     const sel = item.querySelector(".adm-tier");
@@ -2126,6 +2205,11 @@ async function adminAction(u, act, item) {
     const status = act === "approve" ? "approved" : "blocked";
     const { ok, data } = await post(`/api/admin/users/${u.id}/status`, { status });
     if (!ok) return toast(data.error || "Ошибка", "bad");
+  } else if (act === "reset-approve" || act === "reset-reject") {
+    const action = act === "reset-approve" ? "approve" : "reject";
+    const { ok, data } = await post(`/api/admin/users/${u.id}/reset`, { action });
+    if (!ok) return toast(data.error || "Ошибка", "bad");
+    toast(action === "approve" ? "Сброс одобрен ✓ — пользователь задаст новый пароль" : "Сброс отменён", "ok");
   } else if (act === "week" || act === "month") {
     const tier = item.querySelector(".adm-tier") ? item.querySelector(".adm-tier").value : undefined;
     const add_days = act === "week" ? 7 : 30;

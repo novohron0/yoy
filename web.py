@@ -391,7 +391,59 @@ def _user_public(u):
         "paid_until": u.get("paid_until"),
         "sub_active": _sub_active(u),
         "days_left": _days_left(u),
+        "reset_status": u.get("reset_status"),        # None | "pending" | "approved"
+        "reset_requested": u.get("reset_requested"),
     }
+
+
+def _bootstrap_admin():
+    """Если заданы ADMIN_USER/ADMIN_PASS — гарантирует вход админа с этими данными.
+
+    Сбрасывает логин и пароль ГЛАВНОГО админа (владельца всех профилей), не создавая
+    дубля. Нужно, чтобы можно было войти, даже если пароль забыт. Запускается при
+    старте приложения (не при импорте), чтобы не трогать данные во время проверок.
+    """
+    au = (os.environ.get("ADMIN_USER") or "").strip()
+    ap = os.environ.get("ADMIN_PASS") or ""
+    if not au or not ap:
+        return
+    users = load_users()
+    # цель: пользователь с таким логином → иначе первый админ → иначе первый в списке
+    target = next((u for u in users if u["username"].lower() == au.lower()), None)
+    if target is None:
+        target = next((u for u in users if u.get("is_admin")), None)
+    if target is None and users:
+        target = users[0]
+    # уже настроено как надо — ничего не переписываем (чтобы не менять файл на пустом месте)
+    if (target and target["username"].lower() == au.lower()
+            and target.get("is_admin") and target.get("status") == "approved"
+            and _verify_pw(ap, target.get("salt", ""), target.get("pw_hash", ""))):
+        return
+    salt, pw_hash = _hash_pw(ap)
+    if target is None:
+        # пользователей ещё нет — создаём нового админа
+        target = {
+            "id": uuid.uuid4().hex[:8],
+            "username": au,
+            "salt": salt,
+            "pw_hash": pw_hash,
+            "status": "approved",
+            "is_admin": True,
+            "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+        users.append(target)
+        save_users(users)
+        _claim_orphan_data(target["id"])
+    else:
+        target["username"] = au
+        target["salt"] = salt
+        target["pw_hash"] = pw_hash
+        target["is_admin"] = True
+        target["status"] = "approved"
+        target.pop("reset_status", None)
+        target.pop("reset_requested", None)
+        save_users(users)
+    print(f"[bootstrap] админ-доступ задан из ADMIN_USER/ADMIN_PASS: логин «{au}»")
 
 
 def _current_user(request: Request):
@@ -1225,6 +1277,7 @@ async def _resume_queued_sends():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _bootstrap_admin()   # гарантируем вход админа (ADMIN_USER/ADMIN_PASS), если заданы
     state.scheduler_task = asyncio.create_task(_scheduler_loop())
     await _resume_queued_sends()
     yield
@@ -1331,6 +1384,66 @@ async def logout():
     return resp
 
 
+# ---------------------------------------------------------------------------
+# Сброс пароля (самообслуживание с одобрением администратора)
+# ---------------------------------------------------------------------------
+class ResetReqIn(BaseModel):
+    username: str
+
+
+class ResetDoneIn(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/auth/reset/request")
+async def reset_request(body: ResetReqIn):
+    """Пользователь просит сброс пароля. Ждёт одобрения админа."""
+    username = (body.username or "").strip()
+    if not username:
+        return JSONResponse({"error": "Введи логин"}, status_code=400)
+    users = load_users()
+    for u in users:
+        if u["username"].lower() == username.lower():
+            # если уже одобрено — не сбрасываем обратно в pending
+            if u.get("reset_status") != "approved":
+                u["reset_status"] = "pending"
+            u["reset_requested"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            save_users(users)
+            break
+    # не раскрываем, существует ли такой логин
+    return {"ok": True}
+
+
+@app.post("/api/auth/reset/complete")
+async def reset_complete(body: ResetDoneIn):
+    """Пользователь задаёт новый пароль — только если админ одобрил сброс."""
+    username = (body.username or "").strip()
+    password = body.password or ""
+    if len(password) < 6:
+        return JSONResponse({"error": "Пароль — минимум 6 символов"}, status_code=400)
+    users = load_users()
+    user = next((u for u in users if u["username"].lower() == username.lower()), None)
+    if not user or user.get("reset_status") != "approved":
+        return JSONResponse(
+            {"error": "Сброс ещё не одобрен. Сначала нажми «Запросить сброс» и дождись одобрения администратором."},
+            status_code=403,
+        )
+    salt, pw_hash = _hash_pw(password)
+    user["salt"] = salt
+    user["pw_hash"] = pw_hash
+    user.pop("reset_status", None)
+    user.pop("reset_requested", None)
+    save_users(users)
+    if user.get("status") == "blocked":
+        return JSONResponse({"error": "Пароль обновлён, но аккаунт заблокирован администратором."}, status_code=403)
+    if user.get("status") == "pending":
+        return JSONResponse({"step": "pending"})
+    resp = JSONResponse({"step": "ready", "user": _user_public(user)})
+    _set_session_cookie(resp, user["id"])
+    return resp
+
+
 @app.get("/api/auth/me")
 async def auth_me(request: Request):
     u = _current_user(request)
@@ -1381,6 +1494,28 @@ async def admin_delete_user(uid: str, admin=Depends(require_admin)):
     save_packs([p for p in load_packs() if p.get("owner") != uid])
     save_users([u for u in users if u["id"] != uid])
     return {"ok": True}
+
+
+class ResetActionIn(BaseModel):
+    action: str  # "approve" | "reject"
+
+
+@app.post("/api/admin/users/{uid}/reset")
+async def admin_reset(uid: str, body: ResetActionIn, admin=Depends(require_admin)):
+    """Админ одобряет ('approve') или отклоняет ('reject') запрос на сброс пароля."""
+    users = load_users()
+    target = next((u for u in users if u["id"] == uid), None)
+    if not target:
+        return JSONResponse({"error": "Пользователь не найден"}, status_code=404)
+    if body.action == "approve":
+        target["reset_status"] = "approved"
+    elif body.action == "reject":
+        target.pop("reset_status", None)
+        target.pop("reset_requested", None)
+    else:
+        return JSONResponse({"error": "Неверное действие"}, status_code=400)
+    save_users(users)
+    return {"ok": True, "user": _user_public(target)}
 
 
 class SubIn(BaseModel):
