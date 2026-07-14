@@ -393,6 +393,7 @@ def _user_public(u):
         "days_left": _days_left(u),
         "reset_status": u.get("reset_status"),        # None | "pending" | "approved"
         "reset_requested": u.get("reset_requested"),
+        "must_setup": bool(u.get("must_setup")),      # вошёл по дефолтному admin/admin — заставить сменить
     }
 
 
@@ -408,15 +409,21 @@ def _bootstrap_admin():
     if not au or not ap:
         return
     users = load_users()
+    # Владелец уже задал свои логин/пароль через одноразовую настройку —
+    # дефолтный вход (admin/admin из docker-compose) больше НЕ применяем.
+    # Так пароль, лежащий в git, перестаёт открывать доступ.
+    if any(u.get("is_admin") and u.get("admin_customized") for u in users):
+        return
     # цель: пользователь с таким логином → иначе первый админ → иначе первый в списке
     target = next((u for u in users if u["username"].lower() == au.lower()), None)
     if target is None:
         target = next((u for u in users if u.get("is_admin")), None)
     if target is None and users:
         target = users[0]
-    # уже настроено как надо — ничего не переписываем (чтобы не менять файл на пустом месте)
+    # уже приведён к дефолтному входу и ждёт настройки — файл не переписываем
     if (target and target["username"].lower() == au.lower()
             and target.get("is_admin") and target.get("status") == "approved"
+            and target.get("must_setup")
             and _verify_pw(ap, target.get("salt", ""), target.get("pw_hash", ""))):
         return
     salt, pw_hash = _hash_pw(ap)
@@ -429,6 +436,7 @@ def _bootstrap_admin():
             "pw_hash": pw_hash,
             "status": "approved",
             "is_admin": True,
+            "must_setup": True,
             "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
         users.append(target)
@@ -440,10 +448,11 @@ def _bootstrap_admin():
         target["pw_hash"] = pw_hash
         target["is_admin"] = True
         target["status"] = "approved"
+        target["must_setup"] = True   # после входа заставим задать свои логин/пароль
         target.pop("reset_status", None)
         target.pop("reset_requested", None)
         save_users(users)
-    print(f"[bootstrap] админ-доступ задан из ADMIN_USER/ADMIN_PASS: логин «{au}»")
+    print(f"[bootstrap] дефолтный админ-доступ задан из ADMIN_USER/ADMIN_PASS: логин «{au}» (потребуется смена)")
 
 
 def _current_user(request: Request):
@@ -1450,6 +1459,43 @@ async def auth_me(request: Request):
     if not u:
         return JSONResponse({"error": "Не авторизован"}, status_code=401)
     return {"user": _user_public(u)}
+
+
+class SetupCredsIn(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/auth/setup_credentials")
+async def setup_credentials(body: SetupCredsIn, user=Depends(require_user)):
+    """Одноразовая настройка своих логина/пароля (после входа по дефолтному admin/admin).
+
+    Помечает аккаунт как admin_customized — после этого дефолтный вход из
+    docker-compose (admin/admin) больше не действует.
+    """
+    username = (body.username or "").strip()
+    password = body.password or ""
+    if len(username) < 3:
+        return JSONResponse({"error": "Логин — минимум 3 символа"}, status_code=400)
+    if len(password) < 6:
+        return JSONResponse({"error": "Пароль — минимум 6 символов"}, status_code=400)
+    existing = get_user_by_name(username)
+    if existing and existing["id"] != user["id"]:
+        return JSONResponse({"error": "Такой логин уже занят"}, status_code=400)
+    users = load_users()
+    target = next((u for u in users if u["id"] == user["id"]), None)
+    if not target:
+        return JSONResponse({"error": "Пользователь не найден"}, status_code=404)
+    salt, pw_hash = _hash_pw(password)
+    target["username"] = username
+    target["salt"] = salt
+    target["pw_hash"] = pw_hash
+    target["admin_customized"] = True   # дефолтный admin/admin больше не применяется
+    target.pop("must_setup", None)
+    save_users(users)
+    resp = JSONResponse({"step": "ready", "user": _user_public(target)})
+    _set_session_cookie(resp, target["id"])   # uid не меняется, но обновим срок куки
+    return resp
 
 
 # ---------------------------------------------------------------------------

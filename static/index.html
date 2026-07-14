@@ -271,6 +271,27 @@
   </div>
 </div>
 
+<!-- ============ Экран одноразовой настройки логина/пароля ============ -->
+<div id="screen-setup" class="wrap hidden">
+  <div class="topbar"><h1>🔐 Задай свой вход</h1></div>
+  <div class="section" style="max-width:420px;margin:0 auto">
+    <div class="help-good" style="margin:0 0 16px">
+      Ты вошёл по временному паролю <b>admin/admin</b>. Придумай <b>свои</b> логин и пароль —
+      их будешь знать только ты. После этого временный <b>admin/admin</b> перестанет работать.
+    </div>
+    <label>Новый логин</label>
+    <input id="setup-user" autocomplete="username" placeholder="Придумай логин" />
+    <label>Новый пароль</label>
+    <input id="setup-pass" type="password" autocomplete="new-password" placeholder="Минимум 6 символов" />
+    <label>Повтори пароль</label>
+    <input id="setup-pass2" type="password" autocomplete="new-password" placeholder="Ещё раз тот же пароль"
+           onkeydown="if(event.key==='Enter')submitSetup()" />
+    <div class="err" id="setup-err"></div>
+    <button class="btn full" style="margin-top:14px" onclick="submitSetup()">Сохранить и продолжить</button>
+    <p class="hint" style="margin-top:12px">⚠️ Запиши эти логин и пароль в надёжном месте — восстановить их сможешь только через сервер.</p>
+  </div>
+</div>
+
 <!-- ============ Экран оплаты ============ -->
 <div id="screen-pay" class="wrap hidden">
   <div class="topbar"><h1>Доступ</h1><button class="btn ghost" onclick="logout()">Выйти</button></div>
@@ -1852,7 +1873,7 @@ async function loadSchedules() {
 // ---------- аутентификация ----------
 let authMode = "login";
 
-const SCREENS = ["screen-auth", "screen-pay", "screen-profiles", "screen-compose", "screen-admin", "screen-join", "screen-help"];
+const SCREENS = ["screen-auth", "screen-setup", "screen-pay", "screen-profiles", "screen-compose", "screen-admin", "screen-join", "screen-help"];
 function showScreen(id) {
   for (const s of SCREENS)
     el(s).classList.toggle("hidden", s !== id);
@@ -1966,6 +1987,7 @@ async function submitAuth() {
 
 async function enterApp() {
   markHelpCheck("reg");
+  if (state.me && state.me.must_setup) { showSetup(); return; }   // вошёл по admin/admin — заставить сменить
   el("btn-admin").style.display = (state.me && state.me.is_admin) ? "" : "none";
   const { data: bill } = await api("/api/billing/info");
   state.billing = bill || {};
@@ -2095,6 +2117,31 @@ async function checkAuth() {
 async function logout() {
   await post("/api/auth/logout");
   showAuth();
+}
+
+// ---------- одноразовая настройка своего входа (после admin/admin) ----------
+function showSetup() {
+  el("setup-user").value = "";
+  el("setup-pass").value = "";
+  el("setup-pass2").value = "";
+  el("setup-err").textContent = "";
+  showScreen("screen-setup");
+  el("setup-user").focus();
+}
+
+async function submitSetup() {
+  el("setup-err").textContent = "";
+  const username = el("setup-user").value.trim();
+  const password = el("setup-pass").value;
+  const password2 = el("setup-pass2").value;
+  if (username.length < 3) { el("setup-err").textContent = "Логин — минимум 3 символа"; return; }
+  if (password.length < 6) { el("setup-err").textContent = "Пароль — минимум 6 символов"; return; }
+  if (password !== password2) { el("setup-err").textContent = "Пароли не совпадают"; return; }
+  const { ok, data } = await post("/api/auth/setup_credentials", { username, password });
+  if (!ok) { el("setup-err").textContent = data.error || "Ошибка"; return; }
+  state.me = data.user;
+  toast("Готово ✓ Теперь вход только по твоим логину и паролю", "ok");
+  enterApp();
 }
 
 // ---------- сброс пароля ----------
