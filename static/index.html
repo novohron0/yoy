@@ -192,6 +192,59 @@
   }
   .toast.ok { border-left: 3px solid var(--ok); }
   .toast.bad { border-left: 3px solid var(--err); }
+
+  /* ---------- обучение ---------- */
+  .help-hero {
+    background: linear-gradient(135deg, var(--accent) 0%, var(--panel) 100%);
+    border: 1px solid var(--border); border-radius: 16px;
+    padding: 22px 20px; margin-bottom: 18px; line-height: 1.65; font-size: 15px;
+  }
+  .help-hero b { color: #fff; }
+  details.help {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; margin-bottom: 12px; overflow: hidden;
+  }
+  details.help summary {
+    cursor: pointer; padding: 15px 18px; font-weight: 600; font-size: 15px;
+    list-style: none; display: flex; align-items: center; gap: 11px; user-select: none;
+  }
+  details.help summary::-webkit-details-marker { display: none; }
+  details.help summary:hover { background: var(--panel-2); }
+  details.help summary .chev { margin-left: auto; transition: transform .15s; color: var(--muted); font-size: 13px; }
+  details.help[open] summary .chev { transform: rotate(90deg); }
+  details.help .help-body { padding: 2px 18px 18px; font-size: 14px; line-height: 1.7; }
+  .help-body p { margin: 9px 0; }
+  .help-body ul, .help-body ol { margin: 8px 0; padding-left: 22px; }
+  .help-body li { margin: 6px 0; }
+  .help-step { display: flex; gap: 12px; margin: 12px 0; align-items: flex-start; }
+  .step-num {
+    display: inline-flex; width: 27px; height: 27px; border-radius: 50%;
+    background: var(--accent-2); color: #fff; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 14px; flex-shrink: 0; margin-top: 1px;
+  }
+  .help-do   { background: var(--panel-2); border-left: 3px solid var(--accent-3); border-radius: 8px; padding: 10px 13px; margin: 11px 0; }
+  .help-warn { background: var(--panel-2); border-left: 3px solid var(--err); border-radius: 8px; padding: 10px 13px; margin: 11px 0; }
+  .help-good { background: var(--panel-2); border-left: 3px solid var(--ok); border-radius: 8px; padding: 10px 13px; margin: 11px 0; }
+  .help-body code {
+    background: var(--panel-3); padding: 1px 6px; border-radius: 6px;
+    font-size: 13px; font-family: ui-monospace, monospace;
+  }
+  .qhelp {
+    display: inline-flex; width: 20px; height: 20px; border-radius: 50%;
+    background: var(--panel-3); color: var(--muted); border: none;
+    align-items: center; justify-content: center; font-size: 12px; font-weight: 700;
+    cursor: pointer; margin-left: 7px; vertical-align: middle; padding: 0;
+  }
+  .qhelp:hover { background: var(--accent-2); color: #fff; }
+  .check-row {
+    display: flex; align-items: center; gap: 11px; padding: 9px 12px;
+    background: var(--panel-2); border-radius: 10px; margin-top: 8px; cursor: pointer;
+    font-size: 14px; user-select: none;
+  }
+  .check-row input { width: 18px; height: 18px; flex-shrink: 0; accent-color: var(--ok); cursor: pointer; }
+  .check-row.done { opacity: .6; text-decoration: line-through; }
+  .check-bar-wrap { background: var(--panel-2); border-radius: 8px; height: 10px; overflow: hidden; margin-top: 12px; }
+  .check-bar { background: var(--ok); height: 100%; width: 0; transition: width .3s; border-radius: 8px; }
 </style>
 </head>
 <body>
@@ -201,13 +254,17 @@
   <div class="topbar"><h1 id="auth-title">Вход</h1></div>
   <div class="section" style="max-width:380px;margin:0 auto">
     <label>Логин</label>
-    <input id="auth-user" autocomplete="username" placeholder="Твой логин" />
+    <input id="auth-user" autocomplete="username" placeholder="Твой логин"
+           onkeydown="if(event.key==='Enter')document.getElementById('auth-pass').focus()" />
     <label>Пароль</label>
     <input id="auth-pass" type="password" autocomplete="current-password" placeholder="Пароль"
            onkeydown="if(event.key==='Enter')submitAuth()" />
     <div class="err" id="auth-err"></div>
     <button class="btn full" id="auth-submit" style="margin-top:14px" onclick="submitAuth()">Войти</button>
     <div class="hint" id="auth-switch" style="margin-top:14px;text-align:center"></div>
+    <div class="hint" style="margin-top:12px;text-align:center">
+      Впервые здесь? <a href="#" onclick="openHelp();return false">📖 Открой обучение</a> — там всё по шагам.
+    </div>
   </div>
 </div>
 
@@ -230,8 +287,15 @@
   <div class="topbar">
     <h1>Профили Telegram</h1>
     <span id="days-left" class="hint" style="margin-right:6px"></span>
+    <button class="btn ghost" onclick="openHelp()">📖 Обучение</button>
     <button class="btn ghost" id="btn-admin" onclick="openAdmin()" style="display:none">Пользователи</button>
     <button class="btn ghost" onclick="logout()">Выйти</button>
+  </div>
+  <div id="welcome-banner" class="hidden" style="background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--ok);padding:14px 16px;border-radius:12px;margin-bottom:14px;line-height:1.6">
+    👋 <b>Привет! Ты тут впервые?</b><br>
+    Этот сайт — робот-почтальон для Telegram: сам разносит твои сообщения по чатам.
+    Начни с обучения — там всё разложено по шагам, справится даже ребёнок.
+    <div style="margin-top:10px"><button class="btn" onclick="openHelp()">📖 Открыть обучение</button></div>
   </div>
   <div id="renew-banner" class="hidden" style="background:var(--panel-3);border-left:3px solid var(--accent-3);padding:12px 14px;border-radius:10px;margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
     <span id="renew-text" style="flex:1;font-size:14px"></span>
@@ -253,6 +317,7 @@
   <div class="topbar">
     <button class="back" onclick="goProfiles()">←</button>
     <h1 id="compose-title">…</h1>
+    <button class="btn ghost" onclick="openHelp()" title="Обучение">📖</button>
     <button class="btn ghost" onclick="openJoin()">➕ Вступить в чаты</button>
   </div>
 
@@ -264,7 +329,7 @@
 
   <!-- Получатели -->
   <div class="section">
-    <h3>Кому отправить</h3>
+    <h3>Кому отправить <button class="qhelp" type="button" onclick="openHelp('recipients')" title="Как это работает?">?</button></h3>
     <div class="chips" id="recipients">
       <div class="add-chat" onclick="openSearch()">＋ Добавить чат</div>
     </div>
@@ -283,7 +348,7 @@
 
   <!-- Сообщение -->
   <div class="section">
-    <h3>Сообщение</h3>
+    <h3>Сообщение <button class="qhelp" type="button" onclick="openHelp('message')" title="Как это работает?">?</button></h3>
     <textarea id="msg" placeholder="Текст поста…"></textarea>
     <p class="hint" style="margin-top:8px;line-height:1.5">
       🎲 <b>Spintax</b>: варианты в фигурных скобках через <b>|</b> —
@@ -299,7 +364,7 @@
 
   <!-- Расписание -->
   <div class="section">
-    <h3>Когда отправить</h3>
+    <h3>Когда отправить <button class="qhelp" type="button" onclick="openHelp('schedule')" title="Как это работает?">?</button></h3>
 
     <div class="weekdays" id="mode-tabs" style="margin-bottom:8px">
       <button type="button" class="wd on" id="tab-daily" style="width:auto;padding:0 16px" onclick="setSchedMode('daily')">По времени</button>
@@ -343,7 +408,7 @@
 
   <!-- Задержка между чатами -->
   <div class="section">
-    <h3>Задержка между чатами</h3>
+    <h3>Задержка между чатами <button class="qhelp" type="button" onclick="openHelp('ban')" title="Зачем это нужно?">?</button></h3>
     <div class="row" style="align-items:center">
       <div><input type="number" id="gap-min" min="0" value="10" /></div>
       <div style="flex:0 0 auto;color:var(--muted)">—</div>
@@ -402,6 +467,7 @@
   <div class="topbar">
     <button class="back" onclick="goCompose()">←</button>
     <h1>Вступить в чаты</h1>
+    <button class="btn ghost" onclick="openHelp('join')" title="Обучение">📖</button>
   </div>
   <div class="mode-note" style="margin-bottom:14px;border-left:3px solid var(--err);line-height:1.6">
     ⚠️ <b>Массовое вступление — высокий риск бана</b>, особенно на новых аккаунтах.
@@ -437,6 +503,191 @@ https://t.me/+AbCdEf..."></textarea>
     <button class="btn full" type="button" onclick="exportLinks()">Показать ссылки на мои каналы</button>
     <div class="hint" id="export-status" style="margin-top:10px"></div>
     <div id="export-result" style="margin-top:12px"></div>
+  </div>
+</div>
+
+<!-- ============ Экран обучения ============ -->
+<div id="screen-help" class="wrap hidden">
+  <div class="topbar">
+    <button class="back" onclick="closeHelp()">←</button>
+    <h1>📖 Обучение</h1>
+  </div>
+
+  <div class="help-hero">
+    <div style="font-size:17px;font-weight:700;margin-bottom:6px">Привет! Это РитаБот 🤖</div>
+    Представь <b>робота-почтальона</b>. Ты говоришь ему три вещи:
+    <b>ЧТО</b> написать ✍️, <b>КОМУ</b> отнести 👥 и <b>КОГДА</b> ⏰.
+    Дальше он ходит по чатам Telegram и разносит твои сообщения сам —
+    даже ночью, даже когда ты отдыхаешь. Ниже — уроки. Жми на любой, он раскроется.
+  </div>
+
+  <!-- Чек-лист первых шагов -->
+  <div class="section">
+    <h3>🚀 Твои первые шаги</h3>
+    <p class="hint">Сайт сам ставит галочки, когда ты делаешь шаг. Можно тыкать и вручную.</p>
+    <div id="help-checklist"></div>
+    <div class="check-bar-wrap"><div class="check-bar" id="check-bar"></div></div>
+    <div class="hint" id="check-progress" style="margin-top:6px;text-align:center"></div>
+  </div>
+
+  <details class="help" id="help-start">
+    <summary>🤖 Урок 1. Что это вообще такое?<span class="chev">▶</span></summary>
+    <div class="help-body">
+      <p>Этот сайт управляет <b>твоим</b> аккаунтом Telegram и отправляет сообщения за тебя.</p>
+      <p>Как всё устроено, если совсем просто:</p>
+      <div class="help-step"><span class="step-num">1</span><div><b>Профили</b> — это твои Telegram-аккаунты. Как машинки в гараже: выбираешь, на какой поедешь.</div></div>
+      <div class="help-step"><span class="step-num">2</span><div>Жмёшь на профиль — попадаешь в <b>конструктор письма</b>: кому, что и когда отправить.</div></div>
+      <div class="help-step"><span class="step-num">3</span><div>Жмёшь «Отправить сейчас» или «Запланировать» — и робот делает всё сам.</div></div>
+      <div class="help-good">💡 Ничего нельзя сломать. Любое расписание можно остановить, изменить или удалить. А перед первой рассылкой можно отправить <b>тест самому себе</b> — об этом в уроке 4.</div>
+    </div>
+  </details>
+
+  <details class="help" id="help-account">
+    <summary>🔑 Урок 2. Подключаем Telegram-аккаунт<span class="chev">▶</span></summary>
+    <div class="help-body">
+      <p>Это самый «взрослый» шаг, но по шагам — легко. Нужно получить два ключика:
+        <code>api_id</code> и <code>api_hash</code>. Это как ключи от квартиры — ими программа входит в твой Telegram.</p>
+      <div class="help-step"><span class="step-num">1</span><div>Открой в браузере <a href="https://my.telegram.org" target="_blank" rel="noopener">my.telegram.org</a>. Введи свой номер телефона — <b>код придёт в Telegram</b> (не в СМС!).</div></div>
+      <div class="help-step"><span class="step-num">2</span><div>Внутри жми <b>API development tools</b>. В полях App title и Short name напиши любое слово, например <code>myapp</code>. Жми Create.</div></div>
+      <div class="help-step"><span class="step-num">3</span><div>Увидишь <b>api_id</b> (число) и <b>api_hash</b> (длинная строка букв и цифр). Скопируй их.</div></div>
+      <div class="help-step"><span class="step-num">4</span><div>Вернись сюда → на экране профилей жми <b>«＋ Добавить аккаунт»</b> → вставь ключи, придумай название профиля.</div></div>
+      <div class="help-step"><span class="step-num">5</span><div>Введи номер телефона → в Telegram придёт код → введи его. Всё, аккаунт подключён! 🎉</div></div>
+      <div class="help-warn">🔒 <b>api_id и api_hash — секрет.</b> Никому не показывай и никуда не отправляй, как пароль.</div>
+      <div class="help-do">📷 <b>Код не приходит?</b> На шаге с телефоном есть кнопка «Войти по QR-коду»: открой Telegram → Настройки → Устройства → «Подключить устройство» и наведи камеру.</div>
+      <div class="help-do">🔐 <b>Просит ещё один пароль?</b> Это твоя двухфакторная защита (2FA) — тот пароль, который ты сам ставил в Telegram. Введи его.</div>
+      <p><b>Ещё две галочки при добавлении:</b></p>
+      <ul>
+        <li>🌐 <b>Прокси</b> — «маска» для интернета: Telegram видит другой адрес, а не твой. Один-два аккаунта могут жить без прокси. Если аккаунтов много — <b>каждому свой прокси</b>, иначе забанят всех разом.</li>
+        <li>🔥 <b>Прогрев</b> — режим осторожного новичка. Если аккаунт свежий (только создан) — обязательно включи: робот будет действовать медленно и понемногу, чтобы Telegram не заподозрил спам. Когда акку месяц-два — можно выключить.</li>
+      </ul>
+    </div>
+  </details>
+
+  <details class="help" id="help-recipients">
+    <summary>👥 Урок 3. Кому отправить<span class="chev">▶</span></summary>
+    <div class="help-body">
+      <p>Получатели — это чаты-«домики», куда почтальон понесёт письмо. Добавить их можно четырьмя способами:</p>
+      <ul>
+        <li><b>«＋ Добавить чат»</b> — поиск как в самом Telegram: пиши название или @username, жми на чат — он выберется (появится галочка ✓). Ещё раз нажмёшь — уберётся.</li>
+        <li><b>«📁 Из папки TG»</b> — если в твоём Telegram уже есть папки с чатами, можно забрать всю папку одним нажатием.</li>
+        <li><b>«Выбрать все»</b> — добавит вообще все чаты аккаунта. Осторожно: письмо уйдёт и маме, и в рабочий чат 😄</li>
+        <li><b>Свои папки на сайте</b> — выбери чаты и жми «💾 Сохранить выбранные как папку». В следующий раз добавишь их все одним кликом по папке.</li>
+      </ul>
+      <div class="help-good">💡 Выбранные чаты видны сверху в виде «таблеток». Нажми ✕ на таблетке — чат уберётся из списка (из самого Telegram он никуда не денется).</div>
+    </div>
+  </details>
+
+  <details class="help" id="help-message">
+    <summary>✍️ Урок 4. Пишем сообщение (и волшебный Spintax)<span class="chev">▶</span></summary>
+    <div class="help-body">
+      <p>Просто напиши текст в поле «Сообщение». А теперь фокус 🎩:</p>
+      <p><b>Spintax</b> — это когда ты пишешь несколько вариантов слова в фигурных скобках через палочку:</p>
+      <p><code>{Привет|Здравствуй|Добрый день}! Есть {классная|интересная} новость.</code></p>
+      <p>Каждому чату робот отправит <b>случайный</b> вариант: одному «Привет! Есть классная новость», другому «Здравствуй! Есть интересная новость». Сообщения получаются разными — и Telegram думает, что пишет живой человек, а не робот. Это защита от бана!</p>
+      <div class="help-do">🎲 Жми кнопку <b>«Пример»</b> под полем — увидишь, как соберётся случайный вариант, и сколько вариантов всего.</div>
+      <div class="help-good">🧪 <b>Золотое правило:</b> перед первой рассылкой жми «Тест: отправить себе». Письмо придёт тебе в «Избранное» в Telegram (это чат с самим собой) — посмотри, красиво ли выглядит.</div>
+    </div>
+  </details>
+
+  <details class="help" id="help-schedule">
+    <summary>⏰ Урок 5. Когда отправить<span class="chev">▶</span></summary>
+    <div class="help-body">
+      <p>Три способа:</p>
+      <div class="help-step"><span class="step-num">1</span><div><b>«Отправить сейчас»</b> — робот побежал сразу. Внизу появится живой прогресс и кнопка «Стоп».</div></div>
+      <div class="help-step"><span class="step-num">2</span><div><b>«По времени»</b> — выбери время. Дальше три варианта:
+        <ul>
+          <li>ничего больше не трогаешь → письмо уходит <b>каждый день</b> в это время;</li>
+          <li>выбрал дни недели (напр. Пн и Чт) → уходит <b>только по этим дням</b>;</li>
+          <li>добавил конкретные даты → уйдёт <b>по одному разу</b> в каждую дату.</li>
+        </ul></div></div>
+      <div class="help-step"><span class="step-num">3</span><div><b>«Каждые N минут»</b> — повторять постоянно. Одинаковые числа (30 и 30) — ровно каждые 30 минут. Разные (20 и 40) — со случайной паузой 20–40 минут. <b>Разные — безопаснее</b>: меньше похоже на робота.</div></div>
+      <p>После «Запланировать» задача появится внизу в «Запланированных отправках». Там можно:</p>
+      <ul>
+        <li>✏️ <b>Изменить</b> — поправить текст, чаты или время;</li>
+        <li>⏸ <b>Пауза</b> — временно выключить (и ▶ включить обратно);</li>
+        <li>📋 <b>Копия</b> — сделать дубликат и поменять в нём что-то;</li>
+        <li>🗑 <b>Удалить</b> — убрать насовсем.</li>
+      </ul>
+      <div class="help-good">💡 Ещё ниже — «История рассылок»: видно, сколько писем дошло, а если какое-то не дошло — написана причина.</div>
+    </div>
+  </details>
+
+  <details class="help" id="help-ban">
+    <summary>🛡 Урок 6. Как НЕ получить бан (самое важное!)<span class="chev">▶</span></summary>
+    <div class="help-body">
+      <p>Telegram не любит, когда один аккаунт очень быстро шлёт много одинаковых сообщений — это похоже на спам, и за это дают бан 🚫. Наш робот умеет притворяться человеком, но и ты соблюдай правила:</p>
+      <ol>
+        <li><b>Задержка между чатами</b> (10–30 сек) — не убирай её и не ставь 0. Почтальон должен «идти пешком», а не телепортироваться.</li>
+        <li><b>Дневной лимит</b> — на карточке профиля жми «📊 лимит/сутки». Для молодого аккаунта поставь 30–50 сообщений в день.</li>
+        <li><b>Spintax</b> — всегда пиши варианты {так|вот так}, чтобы тексты были разными (урок 4).</li>
+        <li><b>🔥 Прогрев</b> — новый аккаунт первые недели держи на прогреве.</li>
+        <li><b>🌐 Прокси</b> — если аккаунтов несколько, каждому свой прокси.</li>
+        <li><b>Не жадничай со вступлениями</b> — в чаты вступай по 10–20 за раз, не по 100.</li>
+        <li><b>🩺 Проверяй здоровье</b> — на карточке профиля есть «проверить аккаунт (@SpamBot)»: робот сам спросит у Telegram, нет ли ограничений.</li>
+      </ol>
+      <div class="help-warn">⏸ Если Telegram сказал «слишком часто!» (флуд), робот <b>сам поставит аккаунт на паузу</b> и напишет, сколько ждать. Это не поломка — это подушка безопасности. Просто подожди.</div>
+    </div>
+  </details>
+
+  <details class="help" id="help-sos">
+    <summary>🚑 Урок 7. Что-то пошло не так — SOS<span class="chev">▶</span></summary>
+    <div class="help-body">
+      <ul>
+        <li><b>«⏸ пауза (флуд)» на профиле</b> — Telegram попросил передышку. Робот сам встал на паузу. Подожди, пока пройдёт время (написано в баннере), потом «Возобновить отправку». Раньше времени жать бесполезно.</li>
+        <li><b>«помечен спамом»</b> — аккаунт ограничили. Открой в Telegram бота <b>@SpamBot</b> и следуй его подсказкам (можно подать жалобу, если ты не спамил). Обычно ограничение снимают через 1–30 дней. Рассылки авто-остановлены, чтобы не сделать хуже.</li>
+        <li><b>«○ нужен вход» на профиле</b> — сессия слетела. Нажми на профиль и войди заново (код или QR).</li>
+        <li><b>Код для входа не приходит</b> — используй «📷 Войти по QR-коду».</li>
+        <li><b>Письмо не дошло в какой-то чат</b> — открой «Историю рассылок»: там написана причина (например, в чате запрещено писать, или тебя оттуда выгнали). Мёртвые чаты робот сам убирает из расписаний.</li>
+        <li><b>🔔 Красный баннер «Уведомления»</b> на экране профилей — робот пишет туда обо всех ЧП: баны, паузы, слетевшие входы. Заглядывай.</li>
+      </ul>
+      <div class="help-good">💡 Робот сам следит за здоровьем аккаунтов: при бане ставит паузу, мёртвые чаты удаляет, о ЧП — сообщает. Твоя задача — просто иногда заходить и читать уведомления.</div>
+    </div>
+  </details>
+
+  <details class="help" id="help-join">
+    <summary>➕ Урок 8. Вступить в чаты и переезд на новый аккаунт<span class="chev">▶</span></summary>
+    <div class="help-body">
+      <p><b>Вступление в чаты.</b> В конструкторе письма сверху есть «➕ Вступить в чаты». Вставь ссылки на чаты/каналы — по одной в строке — и жми «Начать вступление». Робот вступает <b>медленно, с паузами 25–60 сек</b> — это специально, чтобы аккаунт жил.</p>
+      <div class="help-warn">⚠️ Вступай по 10–20 ссылок за раз. Массовое вступление — самый быстрый способ получить бан, особенно на новом аккаунте.</div>
+      <p><b>Собрать каналы в папку</b> — создаст в твоём Telegram папку со всеми каналами аккаунта, чтобы не искать их по списку чатов.</p>
+      <p><b>Переезд на новый аккаунт</b> (если старый забанили или нужен запасной):</p>
+      <div class="help-step"><span class="step-num">1</span><div>На СТАРОМ аккаунте: «🔗 Перенести каналы» → «Показать ссылки на мои каналы» → скопируй список.</div></div>
+      <div class="help-step"><span class="step-num">2</span><div>На карточке СТАРОГО профиля: «💾 сохранить настройки (клон)» — запомнит имя, био, фото, приватность, папки.</div></div>
+      <div class="help-step"><span class="step-num">3</span><div>Подключи НОВЫЙ аккаунт (урок 2). На его карточке: «📥 применить настройки с другого» — новый акк станет копией старого.</div></div>
+      <div class="help-step"><span class="step-num">4</span><div>На НОВОМ аккаунте: «➕ Вступить в чаты» → вставь скопированные ссылки → он сам вступит (не спеши, партиями!).</div></div>
+    </div>
+  </details>
+
+  <details class="help" id="help-pay">
+    <summary>💳 Урок 9. Оплата доступа<span class="chev">▶</span></summary>
+    <div class="help-body">
+      <p>Доступ оплачивается через <b>CryptoBot</b> (бот в Telegram) монетой USDT. Крипты нет? Не страшно:</p>
+      <div class="help-step"><span class="step-num">1</span><div>Выбери срок → «Открыть CryptoBot».</div></div>
+      <div class="help-step"><span class="step-num">2</span><div>В CryptoBot открой <b>P2P → Купить</b> → способ оплаты <b>СБП или карта</b> → купи USDT на нужную сумму (2–3 минуты).</div></div>
+      <div class="help-step"><span class="step-num">3</span><div>Вернись к счёту и жми «Оплатить». Потом возвращайся на сайт — доступ откроется сам.</div></div>
+      <div class="help-do">⏰ Когда до конца доступа останется 3 дня, сверху появится напоминание «Продлить» — расписания не прервутся, если продлить вовремя.</div>
+    </div>
+  </details>
+
+  <details class="help" id="help-dict">
+    <summary>📚 Словарик — простыми словами<span class="chev">▶</span></summary>
+    <div class="help-body">
+      <ul>
+        <li><b>api_id / api_hash</b> — два ключика с my.telegram.org, которыми программа входит в твой Telegram. Секретные, как пароль.</li>
+        <li><b>Прокси</b> — «маска» для интернета: сайт ходит в Telegram с другого адреса, а не с твоего.</li>
+        <li><b>Spintax</b> — запись вариантов текста: <code>{Привет|Хай}</code>. Каждому чату — случайный вариант.</li>
+        <li><b>Флуд / флуд-пауза</b> — Telegram сказал «слишком часто пишешь!» и попросил подождать. Робот ждёт сам.</li>
+        <li><b>Прогрев</b> — щадящий режим для новых аккаунтов: всё медленно и понемногу.</li>
+        <li><b>Избранное</b> — чат с самим собой в Telegram. Туда падает тестовое сообщение.</li>
+        <li><b>@SpamBot</b> — официальный бот Telegram, который говорит, есть ли на аккаунте ограничения.</li>
+        <li><b>Сессия</b> — «пропуск» на вход в аккаунт. Если слетела — просто войди заново.</li>
+        <li><b>Рассылка</b> — одно письмо, разнесённое по многим чатам по очереди.</li>
+      </ul>
+    </div>
+  </details>
+
+  <div class="hint" style="text-align:center;margin-top:18px">
+    Остались вопросы? Напиши администратору — поможем 🤝
   </div>
 </div>
 
@@ -548,6 +799,7 @@ let state = {
   payPolls: 0,
   editingSid: null,
   lastSearch: [],
+  helpReturn: null,   // куда вернуться из обучения
 };
 
 // ---------- helpers ----------
@@ -626,6 +878,8 @@ async function loadProfiles() {
   add.innerHTML = "＋ Добавить аккаунт";
   add.onclick = openAdd;
   grid.appendChild(add);
+  // новичку без единого профиля — подсказать про обучение
+  el("welcome-banner").classList.toggle("hidden", (data.profiles || []).length > 0);
 }
 
 async function deleteProfile(p) {
@@ -855,6 +1109,7 @@ async function addNext() {
 }
 async function finishAdd() {
   el("modal-add").classList.add("hidden");
+  markHelpCheck("acc");
   const { data } = await api(`/api/profiles/${state.profileId}/status`);
   const name = (data.me && data.me.name) ? data.me.name : "Аккаунт";
   await loadProfiles();
@@ -1389,6 +1644,7 @@ async function saveSchedule() {
     : `/api/profiles/${state.profileId}/schedules`;
   const { ok, data } = await post(url, body);
   if (!ok) return (el("compose-err").textContent = data.error);
+  markHelpCheck("pick"); markHelpCheck("send");
   toast(editing ? "Изменено ✓" : "Запланировано ✓", "ok");
   if (editing) {
     cancelEdit();
@@ -1412,6 +1668,7 @@ async function sendNow() {
     return;
   }
   if (data.started) {
+    markHelpCheck("pick"); markHelpCheck("send");
     toast(`📨 Отправка запущена: ${data.started} чат(ов), пауза ${gap.gap_min}–${gap.gap_max}с между ними`, "ok");
     pollSend();   // показать живой прогресс + кнопку Стоп
     return;
@@ -1421,6 +1678,7 @@ async function sendNow() {
     await loadProfiles(); renderFloodBanner();
     return;
   }
+  markHelpCheck("pick"); markHelpCheck("send");
   const errs = (data.errors || []).length;
   toast(errs ? `Отправлено ${data.sent.length}, ошибок ${errs}` : `Отправлено в ${data.sent.length} чат(ов) ✓`, errs ? "bad" : "ok");
   loadSendHistory();   // одиночная отправка тоже попадает в историю
@@ -1432,6 +1690,7 @@ async function sendTest() {
   if (!text) { el("compose-err").textContent = "Введи текст сообщения для теста."; return; }
   const { ok, data } = await post(`/api/profiles/${state.profileId}/test`, { text });
   if (!ok) { el("compose-err").textContent = data.error || "Ошибка"; return; }
+  markHelpCheck("test");
   toast("🧪 Отправил в «Избранное» — проверь, как выглядит текст", "ok");
 }
 
@@ -1562,9 +1821,81 @@ async function loadSchedules() {
 // ---------- аутентификация ----------
 let authMode = "login";
 
+const SCREENS = ["screen-auth", "screen-pay", "screen-profiles", "screen-compose", "screen-admin", "screen-join", "screen-help"];
 function showScreen(id) {
-  for (const s of ["screen-auth", "screen-pay", "screen-profiles", "screen-compose", "screen-admin", "screen-join"])
+  for (const s of SCREENS)
     el(s).classList.toggle("hidden", s !== id);
+}
+function currentScreen() {
+  for (const s of SCREENS) if (!el(s).classList.contains("hidden")) return s;
+  return "screen-auth";
+}
+
+// ---------- обучение ----------
+const HELP_CHECKS = [
+  ["reg",  "Войти на сайт"],
+  ["acc",  "Подключить Telegram-аккаунт (урок 2)"],
+  ["test", "Отправить тест себе в Избранное (урок 4)"],
+  ["pick", "Выбрать чаты и написать текст (уроки 3–4)"],
+  ["send", "Запустить первую рассылку (урок 5)"],
+];
+function helpChecksGet() {
+  try { return JSON.parse(localStorage.getItem("yoy_help_checks")) || {}; } catch (e) { return {}; }
+}
+function helpChecksSet(v) {
+  try { localStorage.setItem("yoy_help_checks", JSON.stringify(v)); } catch (e) {}
+}
+function markHelpCheck(key) {
+  const v = helpChecksGet();
+  if (v[key]) return;
+  v[key] = true;
+  helpChecksSet(v);
+  if (!el("screen-help").classList.contains("hidden")) renderHelpChecks();
+}
+function toggleHelpCheck(key) {
+  const v = helpChecksGet();
+  v[key] = !v[key];
+  helpChecksSet(v);
+  renderHelpChecks();
+}
+function renderHelpChecks() {
+  const v = helpChecksGet();
+  if (state.me) v.reg = true;   // раз видит сайт изнутри — уже вошёл
+  const box = el("help-checklist");
+  box.innerHTML = "";
+  let done = 0;
+  for (const [key, label] of HELP_CHECKS) {
+    if (v[key]) done++;
+    const row = document.createElement("label");
+    row.className = "check-row" + (v[key] ? " done" : "");
+    row.innerHTML = `<input type="checkbox" ${v[key] ? "checked" : ""}> <span>${escapeHtml(label)}</span>`;
+    row.querySelector("input").onchange = () => toggleHelpCheck(key);
+    box.appendChild(row);
+  }
+  el("check-bar").style.width = Math.round(done / HELP_CHECKS.length * 100) + "%";
+  el("check-progress").textContent = done === HELP_CHECKS.length
+    ? "🎉 Все шаги пройдены — ты теперь профи!"
+    : `Выполнено ${done} из ${HELP_CHECKS.length}`;
+}
+function openHelp(section) {
+  const cur = currentScreen();
+  if (cur !== "screen-help") state.helpReturn = cur;
+  showScreen("screen-help");
+  renderHelpChecks();
+  document.querySelectorAll("#screen-help details.help").forEach(d => { d.open = false; });
+  if (section) {
+    const d = el("help-" + section);
+    if (d) {
+      d.open = true;
+      setTimeout(() => d.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
+      return;
+    }
+  }
+  window.scrollTo({ top: 0 });
+}
+function closeHelp() {
+  const back = (state.helpReturn && state.helpReturn !== "screen-help") ? state.helpReturn : (state.me ? "screen-profiles" : "screen-auth");
+  showScreen(back);
 }
 
 function showAuth() {
@@ -1603,6 +1934,7 @@ async function submitAuth() {
 }
 
 async function enterApp() {
+  markHelpCheck("reg");
   el("btn-admin").style.display = (state.me && state.me.is_admin) ? "" : "none";
   const { data: bill } = await api("/api/billing/info");
   state.billing = bill || {};
