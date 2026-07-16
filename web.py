@@ -397,35 +397,49 @@ def _user_public(u):
     }
 
 
-def _bootstrap_admin():
-    """Если заданы ADMIN_USER/ADMIN_PASS — гарантирует вход админа с этими данными.
+def _admin_reset_token():
+    return (os.environ.get("ADMIN_RESET_TOKEN") or "").strip()
 
-    Сбрасывает логин и пароль ГЛАВНОГО админа (владельца всех профилей), не создавая
-    дубля. Нужно, чтобы можно было войти, даже если пароль забыт. Запускается при
-    старте приложения (не при импорте), чтобы не трогать данные во время проверок.
+
+def _bootstrap_admin():
+    """Гарантирует вход админа по ADMIN_USER/ADMIN_PASS — чтобы можно было войти даже
+    с забытым паролём.
+
+    Механизм «аварийного сброса» через git: пока ADMIN_RESET_TOKEN не меняется, а
+    владелец уже задал свои логин/пароль (admin_customized) — дефолтный admin/admin
+    НЕ применяется (пароль из git не открывает доступ). Если сменить ADMIN_RESET_TOKEN
+    (в docker-compose/.env) — на следующем старте вход принудительно возвращается к
+    ADMIN_USER/ADMIN_PASS с требованием заново задать свои данные. Данные (профили,
+    расписания) при этом сохраняются — меняются только логин/пароль того же аккаунта.
+
+    Запускается при старте приложения (не при импорте), чтобы не трогать данные во
+    время локальных проверок.
     """
     au = (os.environ.get("ADMIN_USER") or "").strip()
     ap = os.environ.get("ADMIN_PASS") or ""
     if not au or not ap:
         return
+    token = _admin_reset_token()
     users = load_users()
-    # Владелец уже задал свои логин/пароль через одноразовую настройку —
-    # дефолтный вход (admin/admin из docker-compose) больше НЕ применяем.
-    # Так пароль, лежащий в git, перестаёт открывать доступ.
-    if any(u.get("is_admin") and u.get("admin_customized") for u in users):
-        return
     # цель: пользователь с таким логином → иначе первый админ → иначе первый в списке
     target = next((u for u in users if u["username"].lower() == au.lower()), None)
     if target is None:
         target = next((u for u in users if u.get("is_admin")), None)
     if target is None and users:
         target = users[0]
-    # уже приведён к дефолтному входу и ждёт настройки — файл не переписываем
-    if (target and target["username"].lower() == au.lower()
+
+    # Владелец уже задал свой вход под ТЕКУЩИМ токеном — ничего не трогаем.
+    if target and target.get("admin_customized") and target.get("admin_token") == token:
+        return
+    # Дефолт уже выдан под текущим токеном и ждёт настройки — файл не переписываем.
+    if (target and not target.get("admin_customized")
+            and target["username"].lower() == au.lower()
             and target.get("is_admin") and target.get("status") == "approved"
             and target.get("must_setup")
+            and target.get("admin_token") == token
             and _verify_pw(ap, target.get("salt", ""), target.get("pw_hash", ""))):
         return
+
     salt, pw_hash = _hash_pw(ap)
     if target is None:
         # пользователей ещё нет — создаём нового админа
@@ -437,6 +451,7 @@ def _bootstrap_admin():
             "status": "approved",
             "is_admin": True,
             "must_setup": True,
+            "admin_token": token,
             "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
         users.append(target)
@@ -448,11 +463,13 @@ def _bootstrap_admin():
         target["pw_hash"] = pw_hash
         target["is_admin"] = True
         target["status"] = "approved"
-        target["must_setup"] = True   # после входа заставим задать свои логин/пароль
+        target["must_setup"] = True        # после входа заставим задать свои логин/пароль
+        target["admin_token"] = token
+        target.pop("admin_customized", None)   # снова дефолт — требуется настройка
         target.pop("reset_status", None)
         target.pop("reset_requested", None)
         save_users(users)
-    print(f"[bootstrap] дефолтный админ-доступ задан из ADMIN_USER/ADMIN_PASS: логин «{au}» (потребуется смена)")
+    print(f"[bootstrap] аварийный админ-доступ задан из ADMIN_USER/ADMIN_PASS (токен «{token}»): логин «{au}», нужна смена")
 
 
 def _current_user(request: Request):
@@ -1491,6 +1508,7 @@ async def setup_credentials(body: SetupCredsIn, user=Depends(require_user)):
     target["salt"] = salt
     target["pw_hash"] = pw_hash
     target["admin_customized"] = True   # дефолтный admin/admin больше не применяется
+    target["admin_token"] = _admin_reset_token()   # закрепляем текущий токен сброса
     target.pop("must_setup", None)
     save_users(users)
     resp = JSONResponse({"step": "ready", "user": _user_public(target)})

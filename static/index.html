@@ -266,16 +266,19 @@
     </div>
     <div class="hint" id="auth-switch" style="margin-top:10px;text-align:center"></div>
     <div class="hint" style="margin-top:12px;text-align:center">
-      Впервые здесь? <a href="#" onclick="openHelp();return false">📖 Открой обучение</a> — там всё по шагам.
+      Впервые здесь? Зарегистрируйся — после входа откроется 📖 обучение с уроками по шагам.
     </div>
   </div>
 </div>
 
 <!-- ============ Экран одноразовой настройки логина/пароля ============ -->
 <div id="screen-setup" class="wrap hidden">
-  <div class="topbar"><h1>🔐 Задай свой вход</h1></div>
+  <div class="topbar">
+    <button class="back hidden" id="setup-back" onclick="goProfiles()">←</button>
+    <h1 id="setup-title">🔐 Задай свой вход</h1>
+  </div>
   <div class="section" style="max-width:420px;margin:0 auto">
-    <div class="help-good" style="margin:0 0 16px">
+    <div class="help-good" id="setup-note" style="margin:0 0 16px">
       Ты вошёл по временному паролю <b>admin/admin</b>. Придумай <b>свои</b> логин и пароль —
       их будешь знать только ты. После этого временный <b>admin/admin</b> перестанет работать.
     </div>
@@ -288,7 +291,7 @@
            onkeydown="if(event.key==='Enter')submitSetup()" />
     <div class="err" id="setup-err"></div>
     <button class="btn full" style="margin-top:14px" onclick="submitSetup()">Сохранить и продолжить</button>
-    <p class="hint" style="margin-top:12px">⚠️ Запиши эти логин и пароль в надёжном месте — восстановить их сможешь только через сервер.</p>
+    <p class="hint" style="margin-top:12px">⚠️ Запиши логин и пароль в надёжном месте — восстановить их сможешь только через сервер.</p>
   </div>
 </div>
 
@@ -312,6 +315,7 @@
     <h1>Профили Telegram</h1>
     <span id="days-left" class="hint" style="margin-right:6px"></span>
     <button class="btn ghost" onclick="openHelp()">📖 Обучение</button>
+    <button class="btn ghost" onclick="showSetup(false)" title="Сменить логин и пароль">🔑 Мой вход</button>
     <button class="btn ghost" id="btn-admin" onclick="openAdmin()" style="display:none">Пользователи</button>
     <button class="btn ghost" onclick="logout()">Выйти</button>
   </div>
@@ -1930,6 +1934,7 @@ function renderHelpChecks() {
     : `Выполнено ${done} из ${HELP_CHECKS.length}`;
 }
 function openHelp(section) {
+  if (!state.me) { showAuth(); return; }   // обучение — только после входа
   const cur = currentScreen();
   if (cur !== "screen-help") state.helpReturn = cur;
   showScreen("screen-help");
@@ -2119,14 +2124,23 @@ async function logout() {
   showAuth();
 }
 
-// ---------- одноразовая настройка своего входа (после admin/admin) ----------
-function showSetup() {
-  el("setup-user").value = "";
+// ---------- настройка/смена своего входа ----------
+// forced=true — обязательный экран после входа по admin/admin (без «назад»)
+// forced=false — добровольная смена логина/пароля из приложения
+function showSetup(forced) {
+  const isForced = forced !== false;
+  el("setup-title").textContent = isForced ? "🔐 Задай свой вход" : "🔑 Сменить логин и пароль";
+  el("setup-note").innerHTML = isForced
+    ? `Ты вошёл по временному паролю <b>admin/admin</b>. Придумай <b>свои</b> логин и пароль —
+       их будешь знать только ты. После этого временный <b>admin/admin</b> перестанет работать.`
+    : `Задай новый логин и пароль для входа. Старый работать перестанет — <b>запиши новые</b>.`;
+  el("setup-back").classList.toggle("hidden", isForced);
+  el("setup-user").value = isForced ? "" : ((state.me && state.me.username) || "");
   el("setup-pass").value = "";
   el("setup-pass2").value = "";
   el("setup-err").textContent = "";
   showScreen("screen-setup");
-  el("setup-user").focus();
+  (isForced ? el("setup-user") : el("setup-pass")).focus();
 }
 
 async function submitSetup() {
@@ -2140,7 +2154,7 @@ async function submitSetup() {
   const { ok, data } = await post("/api/auth/setup_credentials", { username, password });
   if (!ok) { el("setup-err").textContent = data.error || "Ошибка"; return; }
   state.me = data.user;
-  toast("Готово ✓ Теперь вход только по твоим логину и паролю", "ok");
+  toast("Готово ✓ Теперь вход по новым логину и паролю", "ok");
   enterApp();
 }
 
