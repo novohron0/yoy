@@ -295,17 +295,17 @@
   </div>
 </div>
 
-<!-- ============ Экран оплаты ============ -->
+<!-- ============ Экран доступа (оплата вне сайта) ============ -->
 <div id="screen-pay" class="wrap hidden">
   <div class="topbar"><h1>Доступ</h1><button class="btn ghost" onclick="logout()">Выйти</button></div>
   <div class="section" style="max-width:440px;margin:0 auto">
     <div id="pay-info"></div>
-    <div id="pay-plans" style="display:flex;flex-direction:column;gap:10px;margin-top:14px"></div>
-    <a class="btn full" id="pay-btn" rel="noopener" onclick="onPayTap()"
-       style="margin-top:14px;display:none;text-decoration:none;text-align:center">Открыть CryptoBot →</a>
-    <button class="btn ghost full" id="pay-check" onclick="checkPayOnce()" style="margin-top:10px;display:none">Я оплатил — проверить</button>
+    <div class="help-do" style="margin:14px 0">
+      Доступ к боту выдаёт <b>администратор</b>. Напиши ему — он включит тебе доступ.
+      Как только включит, нажми кнопку ниже.
+    </div>
+    <button class="btn full" id="pay-recheck" onclick="recheckAccess()">🔄 Проверить доступ</button>
     <div class="hint" id="pay-status" style="margin-top:14px;text-align:center"></div>
-    <div id="pay-guide" style="margin-top:18px"></div>
   </div>
 </div>
 
@@ -327,7 +327,7 @@
   </div>
   <div id="renew-banner" class="hidden" style="background:var(--panel-3);border-left:3px solid var(--accent-3);padding:12px 14px;border-radius:10px;margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
     <span id="renew-text" style="flex:1;font-size:14px"></span>
-    <button class="btn" onclick="showPay()">Продлить</button>
+    <button class="btn ghost" onclick="el('renew-banner').classList.add('hidden')">Понятно</button>
   </div>
   <div id="notif-banner" class="hidden" style="background:var(--panel-3);border-left:3px solid var(--err);padding:12px 14px;border-radius:10px;margin-bottom:14px">
     <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:8px">
@@ -687,13 +687,12 @@ https://t.me/+AbCdEf..."></textarea>
   </details>
 
   <details class="help" id="help-pay">
-    <summary>💳 Урок 9. Оплата доступа<span class="chev">▶</span></summary>
+    <summary>💳 Урок 9. Доступ к боту<span class="chev">▶</span></summary>
     <div class="help-body">
-      <p>Доступ оплачивается через <b>CryptoBot</b> (бот в Telegram) монетой USDT. Крипты нет? Не страшно:</p>
-      <div class="help-step"><span class="step-num">1</span><div>Выбери срок → «Открыть CryptoBot».</div></div>
-      <div class="help-step"><span class="step-num">2</span><div>В CryptoBot открой <b>P2P → Купить</b> → способ оплаты <b>СБП или карта</b> → купи USDT на нужную сумму (2–3 минуты).</div></div>
-      <div class="help-step"><span class="step-num">3</span><div>Вернись к счёту и жми «Оплатить». Потом возвращайся на сайт — доступ откроется сам.</div></div>
-      <div class="help-do">⏰ Когда до конца доступа останется 3 дня, сверху появится напоминание «Продлить» — расписания не прервутся, если продлить вовремя.</div>
+      <p>Доступ включает <b>администратор</b> вручную. Все возможности бота при этом одинаково доступны — никаких «тарифов» и урезанных версий нет.</p>
+      <div class="help-step"><span class="step-num">1</span><div>Зарегистрируйся и напиши администратору — он тебя одобрит и включит доступ.</div></div>
+      <div class="help-step"><span class="step-num">2</span><div>Если доступ приостановлен, откроется экран «Доступ приостановлен» — напиши админу и нажми «🔄 Проверить доступ».</div></div>
+      <div class="help-do">⏰ Когда до конца доступа останется 3 дня, сверху появится напоминание — напиши администратору заранее, чтобы рассылки не прервались.</div>
     </div>
   </details>
 
@@ -851,8 +850,6 @@ let state = {
   schedMode: "daily",   // "daily" | "interval"
   profilesById: {},
   billing: null,
-  tiers: null,
-  payPolls: 0,
   editingSid: null,
   lastSearch: [],
   helpReturn: null,   // куда вернуться из обучения
@@ -2018,93 +2015,28 @@ function renderRenewBanner() {
   const isAdmin = state.me && state.me.is_admin;
   if (!isAdmin && b.active && b.days_left <= 3) {
     el("renew-text").textContent =
-      `⏰ Доступ кончается через ${b.days_left} дн — продли, чтобы рассылки не прервались.`;
+      `⏰ Доступ кончается через ${b.days_left} дн — напиши администратору, чтобы продлить, иначе рассылки остановятся.`;
     banner.classList.remove("hidden");
   } else {
     banner.classList.add("hidden");
   }
 }
 
-// ---------- оплата ----------
-async function showPay() {
-  const b = state.billing || {};
+// ---------- доступ (оплата вне сайта) ----------
+function showPay() {
   el("pay-info").innerHTML =
-    `<div style="font-size:18px;margin-bottom:6px;text-align:center">Доступ к боту</div>
-     <div class="hint" style="text-align:center">Выбери срок — оплата через CryptoBot (USDT)</div>`;
-  el("pay-guide").innerHTML =
-    `<div class="mode-note" style="line-height:1.7">
-       <b>📋 Как оплатить (даже если крипты нет):</b><br>
-       <b>1.</b> Выбери срок выше → жми «Открыть CryptoBot».<br>
-       <b>2.</b> Нет USDT? В CryptoBot внизу открой <b>«P2P»</b> → <b>«Купить»</b> →
-       выбери оплату <b>СБП или картой</b> → купи нужную сумму у продавца (2–3 мин).<br>
-       <b>3.</b> Вернись к счёту в CryptoBot и нажми <b>«Оплатить»</b>.<br>
-       <b>4.</b> Возвращайся сюда — доступ откроется сам.
-     </div>`;
+    `<div style="font-size:18px;margin-bottom:6px;text-align:center">Доступ приостановлен</div>
+     <div class="hint" style="text-align:center">Чтобы пользоваться ботом, нужен активный доступ.</div>`;
   el("pay-status").textContent = "";
-  el("pay-check").style.display = "none";
-  el("pay-btn").style.display = "none";
-  el("pay-plans").innerHTML = "";
   showScreen("screen-pay");
-  if (!b.crypto_enabled) {
-    el("pay-status").innerHTML = "Автооплата пока не настроена. Напиши администратору, чтобы выдал доступ.";
-    return;
-  }
-  if (!state.tiers) {
-    const { data } = await api("/api/tiers");
-    state.tiers = (data && data.tiers) || {};
-  }
-  const box = el("pay-plans");
-  for (const [key, t] of Object.entries(state.tiers)) {
-    const btn = document.createElement("button");
-    btn.className = "btn full";
-    btn.style.cssText = "display:flex;justify-content:space-between;align-items:center";
-    btn.innerHTML = `<span>${escapeHtml(t.name)}</span><b>${t.price_rub} ₽</b>`;
-    btn.onclick = () => choosePlan(key, btn);
-    box.appendChild(btn);
-  }
 }
 
-async function choosePlan(tierKey, btn) {
-  el("pay-status").textContent = "Готовлю счёт…";
-  document.querySelectorAll("#pay-plans .btn").forEach(b => b.disabled = true);
-  const { ok, data } = await post("/api/billing/invoice", { tier: tierKey });
-  document.querySelectorAll("#pay-plans .btn").forEach(b => b.disabled = false);
-  if (!ok) { el("pay-status").textContent = data.error || "Не удалось создать счёт"; return; }
-  const a = el("pay-btn");
-  const deeplink = data.pay_deeplink;
-  if (deeplink) { a.href = deeplink; a.removeAttribute("target"); }      // открыть приложение напрямую
-  else { a.href = data.pay_url; a.target = "_blank"; }                    // запасной https-вариант
-  a.style.display = "";
-  el("pay-check").style.display = "";
-  el("pay-status").innerHTML = `Счёт на <b>${data.amount} ₽</b> готов. Жми «Открыть CryptoBot» и оплати.`;
-  startPolling();
-}
-
-function onPayTap() {
-  // прямой тап по ссылке открывает CryptoBot; запускаем активный опрос оплаты
-  el("pay-status").innerHTML = "Жду оплату… После оплаты вернись сюда — доступ откроется сам.";
-  startPolling();
-}
-
-function startPolling() {
-  state.payPolls = 0;
-  if (state.pollTimer) clearTimeout(state.pollTimer);
-  pollPay();
-}
-
-async function pollPay() {
-  if (el("screen-pay").classList.contains("hidden")) return;
-  state.payPolls = (state.payPolls || 0) + 1;
-  const { ok, data } = await post("/api/billing/check");
-  if (ok && data.paid) { toast("Оплата получена ✓ Доступ открыт", "ok"); return enterApp(); }
-  if (state.payPolls < 120) state.pollTimer = setTimeout(pollPay, 3000);   // опрос ~6 минут
-}
-
-async function checkPayOnce() {
-  el("pay-status").textContent = "Проверяю оплату…";
-  const { ok, data } = await post("/api/billing/check");
-  if (ok && data.paid) { toast("Оплата получена ✓", "ok"); return enterApp(); }
-  el("pay-status").textContent = "Оплата ещё не пришла. Если только что оплатил — подожди минуту и проверь снова.";
+async function recheckAccess() {
+  el("pay-status").textContent = "Проверяю доступ…";
+  const { data } = await api("/api/billing/info");
+  state.billing = data || {};
+  if (state.billing.active) { toast("Доступ активен ✓", "ok"); return enterApp(); }
+  el("pay-status").textContent = "Доступ пока не включён. Напиши администратору и проверь ещё раз чуть позже.";
 }
 
 async function handlePaywall() {
@@ -2201,10 +2133,6 @@ async function resetComplete() {
 // ---------- админка: пользователи ----------
 async function openAdmin() {
   showScreen("screen-admin");
-  if (!state.tiers) {
-    const { data } = await api("/api/tiers");
-    state.tiers = (data && data.tiers) || {};
-  }
   loadAdminUsers();
 }
 
@@ -2216,23 +2144,20 @@ async function loadAdminUsers() {
   const { ok, data } = await api("/api/admin/users");
   if (!ok) { box.innerHTML = `<div class="hint">${escapeHtml(data.error || "Ошибка")}</div>`; return; }
   box.innerHTML = "";
-  const tierOpts = Object.entries(state.tiers || {}).map(([k, t]) =>
-    `<option value="${k}">${escapeHtml(t.name)} (${t.price_rub}₽)</option>`).join("");
   for (const u of (data.users || [])) {
     const me = state.me && u.id === state.me.id;
     const item = document.createElement("div");
     item.className = "sched-item";
     const sub = u.is_admin ? "♾ админ (безлимит)"
-      : (u.sub_active ? `✅ оплачен · осталось ${u.days_left} дн · тариф ${escapeHtml(u.tier)}`
-                      : `⛔ доступ не оплачен · тариф ${escapeHtml(u.tier)}`);
+      : (u.sub_active ? `✅ доступ активен · осталось ${u.days_left} дн`
+                      : `⛔ доступ не активен`);
     let actions = "";
     if (!me) {
       if (u.reset_status === "pending") actions += `<button class="btn" data-act="reset-approve">🔑 Одобрить сброс пароля</button>`;
       if (u.reset_status === "approved") actions += `<button class="btn ghost" data-act="reset-reject">Отменить сброс пароля</button>`;
       if (u.status !== "approved") actions += `<button class="btn" data-act="approve">Одобрить</button>`;
-      if (u.status !== "blocked") actions += `<button class="btn ghost" data-act="block">Заблокировать</button>`;
+      if (u.status !== "blocked") actions += `<button class="btn ghost" data-act="block">${u.sub_active ? "Заморозить" : "Заблокировать"}</button>`;
       if (!u.is_admin) {
-        actions += `<select class="adm-tier" style="padding:7px">${tierOpts}</select>`;
         actions += `<button class="btn" data-act="week">+7 дней</button>`;
         actions += `<button class="btn ghost" data-act="month">+30 дней</button>`;
       }
@@ -2250,8 +2175,6 @@ async function loadAdminUsers() {
         ${resetBadge}
       </div>
       <div style="display:flex;flex-direction:column;gap:6px;min-width:150px">${actions}</div>`;
-    const sel = item.querySelector(".adm-tier");
-    if (sel) sel.value = u.tier;
     item.querySelectorAll("button").forEach(b => { b.onclick = () => adminAction(u, b.dataset.act, item); });
     box.appendChild(item);
   }
@@ -2272,9 +2195,8 @@ async function adminAction(u, act, item) {
     if (!ok) return toast(data.error || "Ошибка", "bad");
     toast(action === "approve" ? "Сброс одобрен ✓ — пользователь задаст новый пароль" : "Сброс отменён", "ok");
   } else if (act === "week" || act === "month") {
-    const tier = item.querySelector(".adm-tier") ? item.querySelector(".adm-tier").value : undefined;
     const add_days = act === "week" ? 7 : 30;
-    const { ok, data } = await post(`/api/admin/users/${u.id}/subscription`, { tier, add_days });
+    const { ok, data } = await post(`/api/admin/users/${u.id}/subscription`, { add_days });
     if (!ok) return toast(data.error || "Ошибка", "bad");
     toast(`Продлено на ${add_days} дн ✓`, "ok");
   }

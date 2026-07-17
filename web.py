@@ -102,13 +102,10 @@ CRYPTOBOT_TOKEN = os.environ.get("CRYPTOBOT_TOKEN", "")
 CRYPTOBOT_API = os.environ.get("CRYPTOBOT_API", "https://pay.crypt.bot/api")
 PANEL_DOMAIN = os.environ.get("PANEL_DOMAIN", "")
 
-# Тарифы доступа. Цена в рублях за период `days`. Меняй цифры как нужно.
-TIERS = {
-    "start":    {"name": "1 неделя",      "price_rub": 990,  "days": 7,  "max_accounts": 1},
-    "standard": {"name": "2 недели",      "price_rub": 1790, "days": 14, "max_accounts": 2},
-    "pro":      {"name": "1 месяц (Про)", "price_rub": 2990, "days": 30, "max_accounts": 5},
-}
-DEFAULT_TIER = "start"
+# Тарифов и лимитов НЕТ: у каждого одобренного пользователя — полный доступ ко
+# всем возможностям без ограничений по числу аккаунтов. Доступ регулируется только
+# сроком подписки (paid_until), который админ продлевает вручную (+7 / +30 дней).
+# Оплата идёт вне сайта (перевод / наличка) и на сайте не афишируется.
 
 
 def _valid_hash(value):
@@ -330,11 +327,6 @@ def _verify_token(token):
     return uid
 
 
-def _tier_key(user):
-    t = (user or {}).get("tier") or DEFAULT_TIER
-    return t if t in TIERS else DEFAULT_TIER
-
-
 def _sub_active(user):
     if (user or {}).get("is_admin"):
         return True   # админ всегда с доступом
@@ -358,7 +350,7 @@ def _days_left(user):
         return 0
 
 
-def _extend_subscription(uid, tier_key, days, clear_invoice=None):
+def _extend_subscription(uid, days):
     """Продлевает подписку: добавляет days к текущей дате (или от now, если истекла)."""
     users = load_users()
     for u in users:
@@ -372,10 +364,6 @@ def _extend_subscription(uid, tier_key, days, clear_invoice=None):
                 except Exception:
                     pass
             u["paid_until"] = (base + timedelta(days=int(days))).isoformat(timespec="seconds")
-            if tier_key:
-                u["tier"] = tier_key
-            if clear_invoice and u.get("pending_invoice") == clear_invoice:
-                u.pop("pending_invoice", None)
             break
     save_users(users)
 
@@ -387,7 +375,6 @@ def _user_public(u):
         "status": u.get("status"),
         "is_admin": bool(u.get("is_admin")),
         "created": u.get("created"),
-        "tier": _tier_key(u),
         "paid_until": u.get("paid_until"),
         "sub_active": _sub_active(u),
         "days_left": _days_left(u),
@@ -1583,152 +1570,30 @@ async def admin_reset(uid: str, body: ResetActionIn, admin=Depends(require_admin
 
 
 class SubIn(BaseModel):
-    tier: str | None = None
     add_days: int | None = None
 
 
 @app.post("/api/admin/users/{uid}/subscription")
 async def admin_subscription(uid: str, body: SubIn, admin=Depends(require_admin)):
-    """Админ: сменить тариф и/или продлить подписку вручную."""
-    users = load_users()
-    target = next((u for u in users if u["id"] == uid), None)
+    """Админ вручную продлевает доступ на N дней (+7 / +30). Оплата — вне сайта."""
+    target = get_user(uid)
     if not target:
         return JSONResponse({"error": "Пользователь не найден"}, status_code=404)
-    if body.tier:
-        if body.tier not in TIERS:
-            return JSONResponse({"error": "Неизвестный тариф"}, status_code=400)
-        target["tier"] = body.tier
     if body.add_days:
-        base = datetime.now()
-        if target.get("paid_until"):
-            try:
-                pu = datetime.fromisoformat(target["paid_until"])
-                if pu > base:
-                    base = pu
-            except Exception:
-                pass
-        target["paid_until"] = (base + timedelta(days=int(body.add_days))).isoformat(timespec="seconds")
-    save_users(users)
-    return {"ok": True, "user": _user_public(target)}
+        _extend_subscription(uid, int(body.add_days))
+    return {"ok": True, "user": _user_public(get_user(uid))}
 
 
 # ---------------------------------------------------------------------------
-# Тарифы и оплата (CryptoBot)
+# Доступ (подписка). Оплата — вне сайта; продлевает только админ вручную.
 # ---------------------------------------------------------------------------
-@app.get("/api/tiers")
-async def get_tiers(user=Depends(require_user)):
-    return {"tiers": TIERS, "default": DEFAULT_TIER}
-
-
 @app.get("/api/billing/info")
 async def billing_info(user=Depends(require_user)):
-    tkey = _tier_key(user)
     return {
-        "tier_key": tkey,
-        "tier": TIERS[tkey],
         "active": _sub_active(user),
         "paid_until": user.get("paid_until"),
         "days_left": _days_left(user),
-        "crypto_enabled": bool(CRYPTOBOT_TOKEN),
     }
-
-
-class BillIn(BaseModel):
-    tier: str | None = None
-
-
-def _tme_to_tg(url):
-    """Конвертирует https://t.me/... в tg://resolve?... — открывает приложение Telegram
-    напрямую, минуя браузер (обход блокировки t.me у провайдеров)."""
-    try:
-        u = urlparse(url or "")
-        if u.netloc not in ("t.me", "telegram.me"):
-            return None
-        parts = [p for p in u.path.split("/") if p]
-        if not parts:
-            return None
-        params = {"domain": parts[0]}
-        if len(parts) >= 2:
-            params["appname"] = parts[1]
-        for k, v in parse_qs(u.query).items():
-            params[k] = v[0]
-        return "tg://resolve?" + urlencode(params)
-    except Exception:
-        return None
-
-
-@app.post("/api/billing/invoice")
-async def billing_invoice(body: BillIn, user=Depends(require_user)):
-    if not CRYPTOBOT_TOKEN:
-        return JSONResponse({"error": "Оплата криптой не настроена (нет CRYPTOBOT_TOKEN)"}, status_code=400)
-    tkey = body.tier if (body.tier in TIERS) else _tier_key(user)
-    tier = TIERS[tkey]
-    import httpx
-
-    data = {
-        "currency_type": "fiat",
-        "fiat": "RUB",
-        "amount": str(tier["price_rub"]),
-        "description": f"Доступ «{tier['name']}» ({tier['days']} дн.)",
-        "payload": f"{user['id']}:{tkey}",
-        "expires_in": 3600,
-    }
-    if PANEL_DOMAIN:
-        data["paid_btn_name"] = "callback"
-        data["paid_btn_url"] = f"https://{PANEL_DOMAIN}"
-    try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.post(f"{CRYPTOBOT_API}/createInvoice", json=data,
-                             headers={"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN})
-            j = r.json()
-    except Exception as e:
-        return JSONResponse({"error": f"CryptoBot недоступен: {e}"}, status_code=502)
-    if not j.get("ok"):
-        return JSONResponse({"error": f"CryptoBot: {j.get('error')}"}, status_code=502)
-    inv = j["result"]
-    users = load_users()
-    for u in users:
-        if u["id"] == user["id"]:
-            u["pending_invoice"] = inv["invoice_id"]
-            u["pending_tier"] = tkey
-            break
-    save_users(users)
-    bot_url = inv.get("bot_invoice_url") or inv.get("pay_url")
-    pay_url = inv.get("mini_app_invoice_url") or bot_url
-    # tg:// — прямое открытие приложения (обход блокировки t.me в браузере)
-    deeplink = _tme_to_tg(bot_url) or _tme_to_tg(inv.get("mini_app_invoice_url"))
-    return {
-        "pay_url": pay_url,
-        "pay_deeplink": deeplink,
-        "invoice_id": inv["invoice_id"],
-        "amount": tier["price_rub"],
-    }
-
-
-@app.post("/api/billing/check")
-async def billing_check(user=Depends(require_user)):
-    u = get_user(user["id"])
-    inv_id = (u or {}).get("pending_invoice")
-    if not inv_id or not CRYPTOBOT_TOKEN:
-        return {"active": _sub_active(u), "paid": False, "days_left": _days_left(u)}
-    import httpx
-
-    try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get(f"{CRYPTOBOT_API}/getInvoices",
-                            params={"invoice_ids": str(inv_id)},
-                            headers={"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN})
-            j = r.json()
-    except Exception as e:
-        return JSONResponse({"error": f"CryptoBot недоступен: {e}"}, status_code=502)
-    items = (j.get("result") or {}).get("items") or []
-    paid = any(it.get("status") == "paid" for it in items)
-    if paid:
-        bought = u.get("pending_tier") if (u.get("pending_tier") in TIERS) else _tier_key(u)
-        _extend_subscription(user["id"], bought, TIERS[bought]["days"], clear_invoice=inv_id)
-        u2 = get_user(user["id"])
-        return {"active": True, "paid": True, "paid_until": u2.get("paid_until"), "days_left": _days_left(u2)}
-    return {"active": _sub_active(u), "paid": False, "days_left": _days_left(u)}
 
 
 # ---------------------------------------------------------------------------
@@ -1899,15 +1764,7 @@ async def create_profile(body: CreateProfileIn, user=Depends(require_active)):
     if not _valid_hash(api_hash):
         return JSONResponse({"error": "api_hash должен быть ровно 32 hex-символа"}, status_code=400)
 
-    # Лимит аккаунтов по тарифу (админа не ограничиваем)
-    if not user.get("is_admin"):
-        tier = TIERS[_tier_key(user)]
-        mine = [p for p in load_profiles() if p.get("owner") == user["id"]]
-        if len(mine) >= tier["max_accounts"]:
-            return JSONResponse(
-                {"error": f"На тарифе «{tier['name']}» лимит аккаунтов: {tier['max_accounts']}. Нужен тариф повыше."},
-                status_code=403,
-            )
+    # Лимита на число аккаунтов нет — доступ ко всем возможностям у всех одобренных.
 
     proxy = body.proxy.strip()
     if proxy and _parse_proxy(proxy) is None:
