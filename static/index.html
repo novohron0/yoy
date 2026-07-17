@@ -355,6 +355,12 @@
     <button class="btn ghost" onclick="resumeProfile()">Возобновить отправку</button>
   </div>
 
+  <!-- Баннер «аккаунт не активный» -->
+  <div id="inactive-banner" class="hidden" style="background:var(--panel-3);border-left:3px solid var(--warn, #d9a441);padding:12px 14px;border-radius:10px;margin-bottom:14px">
+    <div style="font-size:14px;margin-bottom:10px">☆ Аккаунт не активный — рассылки и расписания с него не выполняются. Настраивать можно, отправлять — только с активного.</div>
+    <button class="btn ghost" onclick="activateCurrent()">⭐ Сделать активным</button>
+  </div>
+
   <!-- Получатели -->
   <div class="section">
     <h3>Кому отправить <button class="qhelp" type="button" onclick="openHelp('recipients')" title="Как это работает?">?</button></h3>
@@ -891,6 +897,7 @@ async function loadProfiles() {
   const grid = el("profiles-grid");
   grid.innerHTML = "";
   state.profilesById = {};
+  const total = (data.profiles || []).length;
   for (const p of (data.profiles || [])) {
     state.profilesById[p.id] = p;
     const card = document.createElement("div");
@@ -899,10 +906,15 @@ async function loadProfiles() {
     const flood = (p.flagged || p.on_cooldown)
       ? `<div class="pstate off">⏸ ${p.flagged ? "помечен спамом — на паузе" : "пауза (флуд)"}</div>`
       : "";
+    // «активный» показываем только когда аккаунтов больше одного
+    const activeRow = total < 2 ? "" : (p.active
+      ? `<div class="pstate on">⭐ активный — рассылает</div>`
+      : `<div class="pstate" style="cursor:pointer;color:var(--muted)" data-activate title="Рассылки идут только с активного аккаунта">☆ сделать активным</div>`);
     card.innerHTML = `
       <div class="ava">${escapeHtml(initial)}</div>
       <div>
         <div class="pname">${escapeHtml(p.name)}</div>
+        ${activeRow}
         <div class="pstate ${p.authorized ? "on" : "off"}">${p.authorized ? "● подключён" : "○ нужен вход"}</div>
         <div class="pstate" style="color:var(--muted);cursor:pointer" data-proxy>🌐 ${p.has_proxy ? "прокси ✓" : "прокси не задан"}</div>
         <div class="pstate" style="cursor:pointer;color:${p.warmup ? "var(--accent-3)" : "var(--muted)"}" data-warmup>🔥 прогрев: ${p.warmup ? "вкл" : "выкл"}</div>
@@ -915,6 +927,8 @@ async function loadProfiles() {
       <button class="del" title="Удалить">✕</button>`;
     card.onclick = () => openProfile(p);
     card.querySelector(".del").onclick = (e) => { e.stopPropagation(); deleteProfile(p); };
+    const actEl = card.querySelector("[data-activate]");
+    if (actEl) actEl.onclick = (e) => { e.stopPropagation(); activateProfile(p); };
     card.querySelector("[data-proxy]").onclick = (e) => { e.stopPropagation(); editProxy(p); };
     card.querySelector("[data-warmup]").onclick = (e) => { e.stopPropagation(); toggleWarmup(p); };
     card.querySelector("[data-limit]").onclick = (e) => { e.stopPropagation(); editLimit(p); };
@@ -933,6 +947,13 @@ async function loadProfiles() {
   grid.appendChild(add);
   // новичку без единого профиля — подсказать про обучение
   el("welcome-banner").classList.toggle("hidden", (data.profiles || []).length > 0);
+}
+
+async function activateProfile(p) {
+  if (!confirm(`Сделать «${p.name}» активным?\n\nРассылки (и «сейчас», и по расписанию) будут идти только с него. Идущая рассылка прежнего активного остановится.`)) return;
+  const { ok, data } = await post(`/api/profiles/${p.id}/activate`, {});
+  if (!ok) { alert((data && data.error) || "Не получилось переключить"); return; }
+  loadProfiles();
 }
 
 async function deleteProfile(p) {
@@ -1191,6 +1212,7 @@ function enterCompose(pid, name) {
   el("save-btn").textContent = "Запланировать";
   el("edit-cancel").classList.add("hidden");
   renderFloodBanner();
+  renderInactiveBanner();
   loadPacks();
   loadSchedules();
 }
@@ -1273,6 +1295,23 @@ async function deletePack(pk) {
   if (!confirm(`Удалить папку «${pk.name}»? (чаты в ней не удаляются)`)) return;
   await api(`/api/profiles/${state.profileId}/packs/${pk.id}`, { method: "DELETE" });
   loadPacks();
+}
+
+function renderInactiveBanner() {
+  const p = state.profilesById[state.profileId];
+  el("inactive-banner").classList.toggle("hidden", !(p && p.active === false));
+}
+
+async function activateCurrent() {
+  const p = state.profilesById[state.profileId];
+  if (!p) return;
+  const { ok, data } = await post(`/api/profiles/${p.id}/activate`, {});
+  if (!ok) { alert((data && data.error) || "Не получилось переключить"); return; }
+  p.active = true;
+  for (const other of Object.values(state.profilesById))
+    if (other.id !== p.id) other.active = false;
+  renderInactiveBanner();
+  toast("Теперь этот аккаунт активный — рассылает он");
 }
 
 function renderFloodBanner() {
