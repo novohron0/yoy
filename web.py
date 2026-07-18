@@ -1871,6 +1871,20 @@ async def set_daily_limit(pid: str, body: LimitIn, user=Depends(require_user)):
     return {"ok": True, "daily_limit": lim}
 
 
+def _health_verdict(text):
+    """Разбор ответа @SpamBot → ok | limited | unknown.
+    Сначала «хорошие» фразы: русский добрый ответ «Ваш аккаунт свободен от
+    каких-либо ограничений» содержит подстроку «ограничен», и без этого
+    порядка здоровый аккаунт получал бы вердикт limited (и паузу 6 ч)."""
+    low = (text or "").lower()
+    if ("no limits" in low or "free as a bird" in low or "не ограничен" in low
+            or "ограничения сняты" in low or "свободен" in low or "нет ограничений" in low):
+        return "ok"
+    if "limited" in low or "ограничен" in low or "restrict" in low or "banned" in low or "заблокирован" in low:
+        return "limited"
+    return "unknown"
+
+
 @app.post("/api/profiles/{pid}/health")
 async def check_health(pid: str, user=Depends(require_user)):
     """Проверка здоровья аккаунта через @SpamBot — не в теневом ли бане."""
@@ -1885,13 +1899,7 @@ async def check_health(pid: str, user=Depends(require_user)):
             text = (resp.text or "").strip()
     except Exception as e:
         return JSONResponse({"error": f"Не удалось спросить @SpamBot: {e}"}, status_code=502)
-    low = text.lower()
-    if "no limits" in low or "free as a bird" in low or "не ограничен" in low or "ограничения сняты" in low:
-        verdict = "ok"
-    elif "limited" in low or "ограничен" in low or "restrict" in low or "banned" in low or "заблокирован" in low:
-        verdict = "limited"
-    else:
-        verdict = "unknown"
+    verdict = _health_verdict(text)
     # авто-действие: если аккаунт ограничен — сразу на паузу, чтобы не лить в бан
     auto_paused = False
     if verdict == "limited" and not _on_cooldown(get_profile(pid)):
