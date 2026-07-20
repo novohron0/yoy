@@ -12,3 +12,10 @@
         reverse_proxy host.docker.internal:8788
     }
 }
+
+# ghostline-auto
+# Ghostline (~/arb-dashboard, порт 8790) — блок обязан жить В РЕПО:
+# деплой yoy перезаписывает Caddyfile на сервере, и дописанное только там теряется.
+ghostline-arb.duckdns.org {
+    reverse_proxy host.docker.internal:8790
+}
