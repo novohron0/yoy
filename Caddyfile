@@ -4,5 +4,11 @@
 
 # Vita — календарь жизни; контейнер живёт в соседнем ~/vita (порт 8788 хоста)
 {$VITA_DOMAIN} {
-    reverse_proxy host.docker.internal:8788
+    # DNS-over-HTTPS для «Сетевой блокировки» Vita Focus → AdGuard Home (~/vita)
+    handle /dns-query* {
+        reverse_proxy host.docker.internal:8083
+    }
+    handle {
+        reverse_proxy host.docker.internal:8788
+    }
 }
