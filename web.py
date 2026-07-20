@@ -66,7 +66,7 @@ SCHEDULES_JSON = os.path.join(PROFILES_DIR, "schedules.json")
 PACKS_JSON = os.path.join(PROFILES_DIR, "packs.json")
 USERS_JSON = os.path.join(PROFILES_DIR, "users.json")
 SENDS_JSON = os.path.join(PROFILES_DIR, "sends.json")
-SENDS_KEEP = int(os.environ.get("SENDS_KEEP", "300"))  # сколько последних запусков хранить
+SENDS_KEEP = int(os.environ.get("SENDS_KEEP", "1000"))  # сколько последних запусков хранить (окно для админ-статистики)
 QUEUE_JSON = os.path.join(PROFILES_DIR, "queue.json")  # активные рассылки (докатка при рестарте)
 NOTIFS_JSON = os.path.join(PROFILES_DIR, "notifications.json")  # уведомления владельцу о ЧП
 CLONES_DIR = os.path.join(PROFILES_DIR, "clones")  # снимки настроек аккаунта для клонирования
@@ -1598,6 +1598,78 @@ async def admin_subscription(uid: str, body: SubIn, admin=Depends(require_admin)
     if body.add_days:
         _extend_subscription(uid, int(body.add_days))
     return {"ok": True, "user": _user_public(get_user(uid))}
+
+
+@app.get("/api/admin/stats")
+async def admin_stats(admin=Depends(require_admin)):
+    """Статистика активности по каждому пользователю (включая самого админа):
+    аккаунты, расписания и рассылки за 7 дней — видно, кто реально работает,
+    кто простаивает и кто «лишкует» по объёмам."""
+    now = datetime.now()
+    week_ago = now - timedelta(days=7)
+    today = now.strftime("%Y-%m-%d")
+
+    out = {}
+    for u in load_users():
+        out[u["id"]] = {
+            "id": u["id"],
+            "accounts": [],
+            "schedules_on": 0, "schedules_total": 0, "sched_max_targets": 0,
+            "runs_7d": 0, "msgs_7d": 0, "fails_7d": 0, "max_run_7d": 0,
+            "msgs_today": 0, "last_run": None, "recent": [],
+        }
+
+    for p in load_profiles():
+        s = out.get(p.get("owner"))
+        if s is None:
+            continue
+        s["accounts"].append({
+            "name": p.get("name") or p["id"],
+            "active": bool(p.get("active")),
+            "paused": bool(p.get("flagged")) or _on_cooldown(p),
+            "warmup": bool(p.get("warmup")),
+        })
+
+    for r in load_schedules():
+        s = out.get(r.get("owner"))
+        if s is None:
+            continue
+        s["schedules_total"] += 1
+        if r.get("enabled", True):
+            s["schedules_on"] += 1
+        s["sched_max_targets"] = max(s["sched_max_targets"], len(r.get("targets") or []))
+
+    for rec in load_sends():   # история newest-first
+        s = out.get(rec.get("owner"))
+        if s is None:
+            continue
+        started = rec.get("started") or ""
+        try:
+            dt = datetime.fromisoformat(started)
+        except Exception:
+            continue
+        if s["last_run"] is None:
+            s["last_run"] = started
+        if len(s["recent"]) < 3:
+            s["recent"].append({
+                "started": started,
+                "source": rec.get("source") or "",
+                "label": rec.get("label") or "",
+                "total": int(rec.get("total") or 0),
+                "ok": int(rec.get("ok") or 0),
+                "status": rec.get("status") or "",
+                "text_preview": rec.get("text_preview") or "",
+            })
+        if dt < week_ago:
+            continue
+        s["runs_7d"] += 1
+        s["msgs_7d"] += int(rec.get("ok") or 0)
+        s["fails_7d"] += len(rec.get("failed") or [])
+        s["max_run_7d"] = max(s["max_run_7d"], int(rec.get("total") or 0))
+        if started[:10] == today:
+            s["msgs_today"] += int(rec.get("ok") or 0)
+
+    return {"stats": list(out.values())}
 
 
 # ---------------------------------------------------------------------------

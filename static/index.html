@@ -2177,11 +2177,33 @@ async function openAdmin() {
 
 const USTATUS = { approved: "✅ одобрен", pending: "⏳ ждёт одобрения", blocked: "⛔ заблокирован" };
 
+function adminStatsHtml(st) {
+  if (!st) return "";
+  const accs = (st.accounts || []).map(a =>
+    `${a.active ? "⭐" : "○"} ${escapeHtml(a.name)}${a.paused ? " ⏸" : ""}${a.warmup ? " 🔥" : ""}`).join(" · ") || "нет аккаунтов";
+  const scheds = st.schedules_total
+    ? ` · расписаний вкл ${st.schedules_on}/${st.schedules_total}${st.sched_max_targets ? ` (до ${st.sched_max_targets} чатов)` : ""}`
+    : " · расписаний нет";
+  const work = st.runs_7d
+    ? `за 7 дн: <b>${st.runs_7d}</b> рассылок · <b>${st.msgs_7d}</b> отправлено (${st.fails_7d} ошиб) · макс <b>${st.max_run_7d}</b> чатов за раз · сегодня ${st.msgs_today}`
+    : (st.last_run
+      ? `за 7 дн рассылок не было · последняя ${escapeHtml(st.last_run.slice(0, 16).replace("T", " "))}`
+      : `рассылок ещё не было`);
+  const recent = (st.recent || []).map(r =>
+    `<div class="si-to" style="margin-top:3px">↳ ${escapeHtml((r.started || "").slice(5, 16).replace("T", " "))} · ${escapeHtml(r.source)}${r.label ? ` «${escapeHtml(r.label)}»` : ""} · ${r.ok}/${r.total} · ${escapeHtml(r.status)}${r.text_preview ? `<br><span style="color:var(--muted)">«${escapeHtml(r.text_preview)}»</span>` : ""}</div>`).join("");
+  return `
+    <div class="si-to" style="margin-top:5px">👤 ${accs}${scheds}</div>
+    <div class="si-to" style="margin-top:3px">📊 ${work}</div>
+    ${recent ? `<details style="margin-top:3px"><summary class="si-to" style="cursor:pointer;color:var(--muted)">последние рассылки + текст</summary>${recent}</details>` : ""}`;
+}
+
 async function loadAdminUsers() {
   const box = el("admin-list");
   box.innerHTML = `<div class="hint">Загрузка…</div>`;
-  const { ok, data } = await api("/api/admin/users");
+  const [{ ok, data }, statsRes] = await Promise.all([api("/api/admin/users"), api("/api/admin/stats")]);
   if (!ok) { box.innerHTML = `<div class="hint">${escapeHtml(data.error || "Ошибка")}</div>`; return; }
+  const statsById = {};
+  if (statsRes.ok) for (const s of (statsRes.data.stats || [])) statsById[s.id] = s;
   box.innerHTML = "";
   for (const u of (data.users || [])) {
     const me = state.me && u.id === state.me.id;
@@ -2212,6 +2234,7 @@ async function loadAdminUsers() {
         <div class="si-when">${escapeHtml(u.username)}${u.is_admin ? " · админ" : ""}${me ? " · это ты" : ""}</div>
         <div class="si-to">${USTATUS[u.status] || u.status} · ${sub}</div>
         ${resetBadge}
+        ${adminStatsHtml(statsById[u.id])}
       </div>
       <div style="display:flex;flex-direction:column;gap:6px;min-width:150px">${actions}</div>`;
     item.querySelectorAll("button").forEach(b => { b.onclick = () => adminAction(u, b.dataset.act, item); });
