@@ -39,7 +39,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from telethon import TelegramClient, utils
+from telethon import TelegramClient, utils, events
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import (
@@ -71,6 +71,8 @@ QUEUE_JSON = os.path.join(PROFILES_DIR, "queue.json")  # активные рас
 NOTIFS_JSON = os.path.join(PROFILES_DIR, "notifications.json")  # уведомления владельцу о ЧП
 CLONES_DIR = os.path.join(PROFILES_DIR, "clones")  # снимки настроек аккаунта для клонирования
 NOTIFS_KEEP = int(os.environ.get("NOTIFS_KEEP", "100"))
+RESPONSES_JSON = os.path.join(PROFILES_DIR, "responses.json")  # счётчик входящих в личку (отклик на рассылки)
+RESP_KEEP_DAYS = int(os.environ.get("RESP_KEEP_DAYS", "30"))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 os.makedirs(PROFILES_DIR, exist_ok=True)
@@ -213,6 +215,33 @@ async def _notify_saved(pid, text):
             await client.send_message("me", text)
     except Exception:
         pass  # уведомление не критично — молча пропускаем
+
+
+# --- отклик на рассылки: сколько людей написали аккаунту в личку ---
+# Считаем ТОЛЬКО количество входящих личных сообщений (без содержимого и без
+# личности отправителя) — это простой сигнал «рассылки сработали, людям
+# интересно и они пишут». Владелец панели видит цифру, не переписку.
+def _load_responses():
+    return _read_json(RESPONSES_JSON, {"counts": {}})
+
+
+def _bump_response(pid):
+    data = _load_responses()
+    counts = data.setdefault("counts", {})
+    per = counts.setdefault(pid, {})
+    day = datetime.now().strftime("%Y-%m-%d")
+    per[day] = int(per.get(day, 0)) + 1
+    cutoff = (datetime.now() - timedelta(days=RESP_KEEP_DAYS)).strftime("%Y-%m-%d")
+    for old in [d for d in per if d < cutoff]:
+        per.pop(old, None)
+    _write_json(RESPONSES_JSON, data)
+
+
+def _responses_window(pid, days):
+    """Сумма входящих в личку за последние `days` дней (включая сегодня)."""
+    per = _load_responses().get("counts", {}).get(pid, {})
+    cutoff = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    return sum(n for d, n in per.items() if d >= cutoff)
 
 
 # после скольких подряд ошибок чат считается мёртвым и убирается из получателей
@@ -573,12 +602,33 @@ def _parse_proxy(raw):
         return None
 
 
+def _register_response_listener(client, pid):
+    """Вешает слушатель входящих ЛИЧНЫХ сообщений: считает, сколько людей
+    написали аккаунту в ответ (сигнал «рассылки сработали»). Только счётчик —
+    ни содержимого, ни отправителя не храним; без единого лишнего API-запроса."""
+    if getattr(client, "_resp_listener", False):
+        return
+    client._resp_listener = True
+
+    @client.on(events.NewMessage(incoming=True))
+    async def _on_incoming(event):
+        try:
+            if not event.is_private:
+                return                      # интересуют только личные сообщения
+            if event.chat_id == 777000:
+                return                      # служебные уведомления Telegram — не отклик
+            _bump_response(pid)
+        except Exception:
+            pass                            # учёт отклика не критичен — молча пропускаем
+
+
 async def get_client(pid) -> TelegramClient | None:
     """Возвращает подключённый клиент для профиля (создаёт при необходимости)."""
     client = state.clients.get(pid)
     if client is not None:
         if not client.is_connected():
             await client.connect()
+        _register_response_listener(client, pid)
         return client
 
     profile = get_profile(pid)
@@ -592,6 +642,7 @@ async def get_client(pid) -> TelegramClient | None:
     await client.connect()
     state.clients[pid] = client
     state.entities.setdefault(pid, {})
+    _register_response_listener(client, pid)
     return client
 
 
@@ -1304,11 +1355,33 @@ async def _resume_queued_sends():
         ))
 
 
+async def _warm_response_listeners():
+    """Подключает активный аккаунт каждого владельца и вешает слушатель отклика,
+    чтобы входящие в личку считались сразу после старта, а не только после первой
+    рассылки. Подключаем по одному с паузой — не будим все аккаунты разом."""
+    owners = {p.get("owner") for p in load_profiles() if p.get("owner")}
+    for owner in owners:
+        pid = _active_pid(owner)
+        if not pid:
+            continue
+        try:
+            client = await get_client(pid)   # подключит + зарегистрирует слушатель
+            if client:
+                try:
+                    await client.catch_up()   # добрать апдейты, пропущенные в даунтайм
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[resp] прогрев слушателя {pid}: {e}")
+        await asyncio.sleep(2)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _bootstrap_admin()   # гарантируем вход админа (ADMIN_USER/ADMIN_PASS), если заданы
     state.scheduler_task = asyncio.create_task(_scheduler_loop())
     await _resume_queued_sends()
+    asyncio.create_task(_warm_response_listeners())   # фоном, не блокируя старт
     yield
     if state.scheduler_task:
         state.scheduler_task.cancel()
@@ -1600,11 +1673,34 @@ async def admin_subscription(uid: str, body: SubIn, admin=Depends(require_admin)
     return {"ok": True, "user": _user_public(get_user(uid))}
 
 
+def _activity_verdict(s):
+    """Светофор «пошло / не пошло» по данным недели.
+    good — доходит и людям пишут в ответ; mid — рассылает, но отклика мало;
+    bad — спам-флаг или почти не доходит; idle — простаивает/не подключён."""
+    attempts = s["msgs_7d"] + s["fails_7d"]
+    rate = (s["msgs_7d"] / attempts) if attempts else 0.0
+    pct = round(rate * 100)
+    resp = s["responses_7d"]
+    if s["spam_flag"]:
+        return {"level": "bad", "reason": "аккаунт под спам-флагом/паузой Telegram"}
+    if not s["accounts"]:
+        return {"level": "idle", "reason": "аккаунтов нет"}
+    if s["runs_7d"] == 0:
+        return {"level": "idle", "reason": "простаивает — рассылок за 7 дней нет"}
+    if attempts and rate < 0.5:
+        return {"level": "bad", "reason": f"рассылки почти не доходят ({pct}% дошло)"}
+    if resp > 0 and rate >= 0.7:
+        return {"level": "good", "reason": f"доходит ({pct}%), пишут в ответ: {resp} за 7 дн"}
+    if resp > 0:
+        return {"level": "mid", "reason": f"есть ответы ({resp}), но доставка средняя ({pct}%)"}
+    return {"level": "mid", "reason": f"рассылает ({pct}% доходит), но в ответ пока не пишут"}
+
+
 @app.get("/api/admin/stats")
 async def admin_stats(admin=Depends(require_admin)):
     """Статистика активности по каждому пользователю (включая самого админа):
-    аккаунты, расписания и рассылки за 7 дней — видно, кто реально работает,
-    кто простаивает и кто «лишкует» по объёмам."""
+    аккаунты, расписания, рассылки за 7 дней и отклик (входящие в личку) —
+    видно, кто реально работает, у кого «пошло», а кто простаивает или лишкует."""
     now = datetime.now()
     week_ago = now - timedelta(days=7)
     today = now.strftime("%Y-%m-%d")
@@ -1613,16 +1709,20 @@ async def admin_stats(admin=Depends(require_admin)):
     for u in load_users():
         out[u["id"]] = {
             "id": u["id"],
-            "accounts": [],
+            "accounts": [], "_pids": [], "spam_flag": False,
             "schedules_on": 0, "schedules_total": 0, "sched_max_targets": 0,
             "runs_7d": 0, "msgs_7d": 0, "fails_7d": 0, "max_run_7d": 0,
             "msgs_today": 0, "last_run": None, "recent": [],
+            "responses_7d": 0, "responses_today": 0,
         }
 
     for p in load_profiles():
         s = out.get(p.get("owner"))
         if s is None:
             continue
+        s["_pids"].append(p["id"])
+        if p.get("flagged"):
+            s["spam_flag"] = True
         s["accounts"].append({
             "name": p.get("name") or p["id"],
             "active": bool(p.get("active")),
@@ -1668,6 +1768,14 @@ async def admin_stats(admin=Depends(require_admin)):
         s["max_run_7d"] = max(s["max_run_7d"], int(rec.get("total") or 0))
         if started[:10] == today:
             s["msgs_today"] += int(rec.get("ok") or 0)
+
+    # отклик: входящие в личку на все аккаунты пользователя
+    for s in out.values():
+        for pid in s["_pids"]:
+            s["responses_7d"] += _responses_window(pid, 7)
+            s["responses_today"] += _responses_window(pid, 1)
+        s["verdict"] = _activity_verdict(s)
+        s.pop("_pids", None)
 
     return {"stats": list(out.values())}
 

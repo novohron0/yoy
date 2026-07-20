@@ -2177,6 +2177,19 @@ async function openAdmin() {
 
 const USTATUS = { approved: "✅ одобрен", pending: "⏳ ждёт одобрения", blocked: "⛔ заблокирован" };
 
+const VERDICT_UI = {
+  good: { emoji: "🟢", label: "хорошо", color: "var(--ok, #3fb950)" },
+  mid:  { emoji: "🟡", label: "средне", color: "var(--warn, #d9a441)" },
+  bad:  { emoji: "🔴", label: "проблема", color: "var(--err)" },
+  idle: { emoji: "⚪️", label: "простаивает", color: "var(--muted)" },
+};
+
+function verdictBadge(v) {
+  if (!v) return "";
+  const ui = VERDICT_UI[v.level] || VERDICT_UI.idle;
+  return `<span title="${escapeHtml(v.reason || "")}" style="color:${ui.color};font-weight:600;white-space:nowrap">${ui.emoji} ${ui.label}</span>`;
+}
+
 function adminStatsHtml(st) {
   if (!st) return "";
   const accs = (st.accounts || []).map(a =>
@@ -2189,11 +2202,15 @@ function adminStatsHtml(st) {
     : (st.last_run
       ? `за 7 дн рассылок не было · последняя ${escapeHtml(st.last_run.slice(0, 16).replace("T", " "))}`
       : `рассылок ещё не было`);
+  const resp = `💬 пишут в ответ (личка): <b>${st.responses_7d || 0}</b> за 7 дн${st.responses_today ? ` · сегодня ${st.responses_today}` : ""}`;
+  const reason = st.verdict ? `<div class="si-to" style="margin-top:3px;color:var(--muted)">${escapeHtml(st.verdict.reason || "")}</div>` : "";
   const recent = (st.recent || []).map(r =>
     `<div class="si-to" style="margin-top:3px">↳ ${escapeHtml((r.started || "").slice(5, 16).replace("T", " "))} · ${escapeHtml(r.source)}${r.label ? ` «${escapeHtml(r.label)}»` : ""} · ${r.ok}/${r.total} · ${escapeHtml(r.status)}${r.text_preview ? `<br><span style="color:var(--muted)">«${escapeHtml(r.text_preview)}»</span>` : ""}</div>`).join("");
   return `
     <div class="si-to" style="margin-top:5px">👤 ${accs}${scheds}</div>
     <div class="si-to" style="margin-top:3px">📊 ${work}</div>
+    <div class="si-to" style="margin-top:3px">${resp}</div>
+    ${reason}
     ${recent ? `<details style="margin-top:3px"><summary class="si-to" style="cursor:pointer;color:var(--muted)">последние рассылки + текст</summary>${recent}</details>` : ""}`;
 }
 
@@ -2231,7 +2248,7 @@ async function loadAdminUsers() {
         : "");
     item.innerHTML = `
       <div class="si-main">
-        <div class="si-when">${escapeHtml(u.username)}${u.is_admin ? " · админ" : ""}${me ? " · это ты" : ""}</div>
+        <div class="si-when">${escapeHtml(u.username)}${u.is_admin ? " · админ" : ""}${me ? " · это ты" : ""} ${verdictBadge((statsById[u.id] || {}).verdict)}</div>
         <div class="si-to">${USTATUS[u.status] || u.status} · ${sub}</div>
         ${resetBadge}
         ${adminStatsHtml(statsById[u.id])}
