@@ -493,6 +493,7 @@
     <h1>Пользователи</h1>
   </div>
   <div class="hint" style="margin-bottom:16px">Одобряй или блокируй тех, кто зарегистрировался. Войти и пользоваться могут только одобренные.</div>
+  <div class="section" id="admin-summary" style="display:none"></div>
   <div class="section"><div class="sched-list" id="admin-list"></div></div>
 </div>
 
@@ -2209,6 +2210,48 @@ function verdictBadge(v) {
   return `<span title="${escapeHtml(v.reason || "")}" style="color:${ui.color};font-weight:600;white-space:nowrap">${ui.emoji} ${ui.label}</span>`;
 }
 
+// Сводка сверху: сколько всего пользователей, кто с доступом, кто ждёт/просит,
+// и светофор «как работают» (сколько простаивает и т.д.) — обзор одним взглядом.
+function renderAdminSummary(users, statsById) {
+  const box = el("admin-summary");
+  if (!users || !users.length) { box.style.display = "none"; return; }
+  const c = { total: users.length, active: 0, pending: 0, expired: 0, blocked: 0, reset: 0 };
+  const v = { good: 0, mid: 0, bad: 0, idle: 0 };
+  for (const u of users) {
+    if (u.status === "pending") c.pending++;
+    if (u.status === "blocked") c.blocked++;
+    if (u.is_admin || u.sub_active) c.active++;
+    else if (u.status === "approved") c.expired++;
+    if (u.reset_status === "pending") c.reset++;
+    const st = statsById[u.id];
+    const lvl = st && st.verdict && st.verdict.level;
+    if (lvl && v[lvl] !== undefined) v[lvl]++;
+  }
+  const pill = (emoji, label, n, color, dim) =>
+    `<div style="display:flex;align-items:baseline;gap:6px;padding:8px 12px;background:var(--panel-2);border:1px solid var(--border);border-radius:10px${dim && !n ? ";opacity:.4" : ""}">
+       <span style="font-size:20px;font-weight:700;color:${color || "var(--text)"}">${n}</span>
+       <span class="si-to" style="color:var(--muted)">${emoji} ${label}</span>
+     </div>`;
+  box.style.display = "";
+  box.innerHTML = `
+    <div class="hint" style="margin-bottom:7px">Пользователи</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px">
+      ${pill("👥", "всего", c.total, "var(--text)")}
+      ${pill("✅", "доступ активен", c.active, "var(--ok)")}
+      ${pill("⏳", "ждут одобрения", c.pending, "var(--accent-3)", true)}
+      ${pill("🕐", "доступ истёк", c.expired, "var(--err)", true)}
+      ${pill("⛔", "заблокированы", c.blocked, "var(--err)", true)}
+      ${pill("🔑", "просят сброс", c.reset, "var(--err)", true)}
+    </div>
+    <div class="hint" style="margin:13px 0 7px">Как работают · за 7 дней</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px">
+      ${pill("🟢", "хорошо", v.good, VERDICT_UI.good.color)}
+      ${pill("🟡", "средне", v.mid, VERDICT_UI.mid.color, true)}
+      ${pill("🔴", "проблема", v.bad, VERDICT_UI.bad.color, true)}
+      ${pill("⚪️", "простаивают", v.idle, "var(--muted)")}
+    </div>`;
+}
+
 function adminStatsHtml(st) {
   if (!st) return "";
   const accs = (st.accounts || []).map(a =>
@@ -2240,6 +2283,7 @@ async function loadAdminUsers() {
   if (!ok) { box.innerHTML = `<div class="hint">${escapeHtml(data.error || "Ошибка")}</div>`; return; }
   const statsById = {};
   if (statsRes.ok) for (const s of (statsRes.data.stats || [])) statsById[s.id] = s;
+  renderAdminSummary(data.users || [], statsById);
   box.innerHTML = "";
   for (const u of (data.users || [])) {
     const me = state.me && u.id === state.me.id;
