@@ -893,6 +893,7 @@ function toast(msg, kind) {
 // ---------- экран профилей ----------
 async function loadProfiles() {
   loadNotifs();
+  refreshAdminBadge();
   const { data } = await api("/api/profiles");
   const grid = el("profiles-grid");
   grid.innerHTML = "";
@@ -1072,6 +1073,24 @@ async function loadNotifs() {
 async function markNotifsRead() {
   await post(`/api/notifications/read`, {});
   el("notif-banner").classList.add("hidden");
+}
+
+// Счётчик запросов на смену пароля на кнопке «Пользователи» — чтобы новые
+// запросы бросались в глаза с главного экрана, без открытия панели.
+function setAdminBadge(pending) {
+  const btn = el("btn-admin");
+  if (!btn) return;
+  btn.innerHTML = pending
+    ? `Пользователи <span style="background:var(--err);color:#fff;border-radius:10px;padding:1px 7px;font-size:12px;font-weight:700;margin-left:4px">🔑 ${pending}</span>`
+    : "Пользователи";
+  btn.title = pending ? `${pending} запрос(ов) на смену пароля — нажми, чтобы одобрить` : "";
+}
+
+async function refreshAdminBadge() {
+  if (!(state.me && state.me.is_admin)) return;
+  const { ok, data } = await api("/api/admin/users");
+  if (!ok) return;
+  setAdminBadge((data.users || []).filter(u => u.reset_status === "pending").length);
 }
 
 async function openProfile(p) {
@@ -2257,6 +2276,7 @@ async function loadAdminUsers() {
     item.querySelectorAll("button").forEach(b => { b.onclick = () => adminAction(u, b.dataset.act, item); });
     box.appendChild(item);
   }
+  setAdminBadge((data.users || []).filter(u => u.reset_status === "pending").length);
 }
 
 async function adminAction(u, act, item) {
