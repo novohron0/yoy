@@ -1817,7 +1817,7 @@ async function pollSend() {
   const { ok, data } = await api(`/api/profiles/${state.profileId}/send/status`);
   if (!ok) return;
   renderSend(data);
-  if (data.running) {
+  if (data.running || data.retry_pending) {
     setTimeout(pollSend, 3000);
   } else if (data.total) {
     loadSendHistory();   // завершилась — обновим историю
@@ -1826,12 +1826,15 @@ async function pollSend() {
 
 function renderSend(job) {
   const box = el("send-progress-box"), stopBtn = el("send-stop");
-  if (!job || !job.total || !job.running) {
+  if (!job || !job.total || (!job.running && !job.retry_pending)) {
     box.classList.add("hidden");
+    stopBtn.style.display = "none";
     return;
   }
   box.classList.remove("hidden");
-  el("send-progress").textContent = `📨 Рассылка: ${job.done}/${job.total} (доставлено ${job.ok}) — идёт…`;
+  el("send-progress").textContent = job.retry_pending
+    ? `📨 Рассылка: ${job.done}/${job.total} (доставлено ${job.ok}) — временная ошибка, повторю автоматически…`
+    : `📨 Рассылка: ${job.done}/${job.total} (доставлено ${job.ok}) — идёт…`;
   stopBtn.style.display = "";
   const fails = (job.failed || []);
   el("send-progress-fails").innerHTML = fails.length

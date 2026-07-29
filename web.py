@@ -541,6 +541,8 @@ def _set_session_cookie(resp, uid):
 class State:
     # profile_id -> TelegramClient
     clients: dict[str, TelegramClient] = {}
+    # Не даёт двум корутинам одновременно открыть одну SQLite session Telethon.
+    client_locks: dict[str, asyncio.Lock] = {}
     # profile_id -> {"phone": ..., "phone_code_hash": ...}
     login: dict[str, dict] = {}
     # profile_id -> {peer_id: entity}
@@ -549,10 +551,106 @@ class State:
     join_jobs: dict[str, dict] = {}
     # profile_id -> {"total","done","ok","failed":[],"running","cancel","status",...}
     send_jobs: dict[str, dict] = {}
+    # profile_id -> фоновая задача отправки. Запись появляется ДО первого await,
+    # чтобы ручной запуск и планировщик не могли одновременно занять один аккаунт.
+    send_tasks: dict[str, asyncio.Task] = {}
     scheduler_task = None
 
 
 state = State()
+
+
+def _send_busy(pid, *, allow_retry=False):
+    """True, если профиль занят или ждёт докатки сохранённой очереди."""
+    task = state.send_tasks.get(pid)
+    if task is not None and task.done():
+        state.send_tasks.pop(pid, None)
+        task = None
+    job = state.send_jobs.get(pid)
+    retry_pending = bool(job and job.get("retry_pending"))
+    stopping = bool(job and job.get("stopping"))
+    return (
+        task is not None
+        or bool(job and job.get("running"))
+        or stopping
+        or (retry_pending and not allow_retry)
+    )
+
+
+def _launch_tracked_send(pid, runner):
+    async def tracked():
+        try:
+            await runner()
+        finally:
+            current = asyncio.current_task()
+            if state.send_tasks.get(pid) is current:
+                state.send_tasks.pop(pid, None)
+
+    task = asyncio.create_task(tracked())
+    state.send_tasks[pid] = task
+    return task
+
+
+def _start_send_task(pid, runner, *, allow_retry=False):
+    """Резервирует профиль и запускает async runner в фоне; None если он занят."""
+    if _send_busy(pid, allow_retry=allow_retry):
+        return None
+    return _launch_tracked_send(pid, runner)
+
+
+def _reserve_current_send(pid):
+    """Резервирует профиль за текущим HTTP-запросом для одиночной отправки."""
+    if _send_busy(pid):
+        return None
+    task = asyncio.current_task()
+    if task is None:
+        return None
+    state.send_tasks[pid] = task
+    return task
+
+
+def _handoff_current_send(pid, reservation, runner):
+    """Без окна гонки передаёт резерв HTTP-запроса фоновой задаче."""
+    if state.send_tasks.get(pid) is not reservation:
+        return None
+    return _launch_tracked_send(pid, runner)
+
+
+def _release_current_send(pid, task):
+    if state.send_tasks.get(pid) is task:
+        state.send_tasks.pop(pid, None)
+
+
+async def _discard_queued_send(pid, status):
+    """Отменяет уже зарезервированную докатку и только затем удаляет её хвост."""
+    job = state.send_jobs.get(pid)
+    if job is not None:
+        # Tombstone закрывает окно между cancel task и очисткой queue.json.
+        job["stopping"] = True
+
+    task = state.send_tasks.get(pid)
+    current = asyncio.current_task()
+    if task is not None and task is not current and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    if task is not None and state.send_tasks.get(pid) is task and task.done():
+        state.send_tasks.pop(pid, None)
+
+    try:
+        _queue_clear(pid)
+    except Exception:
+        current_job = state.send_jobs.get(pid)
+        if current_job is not None:
+            current_job.pop("stopping", None)
+        raise
+
+    current_job = state.send_jobs.get(pid)
+    if current_job is not None:
+        current_job["running"] = False
+        current_job["retry_pending"] = False
+        current_job.pop("stopping", None)
+        current_job["status"] = status
+        current_job["finished"] = datetime.now().isoformat(timespec="seconds")
 
 
 def _session_path(profile):
@@ -624,26 +722,30 @@ def _register_response_listener(client, pid):
 
 async def get_client(pid) -> TelegramClient | None:
     """Возвращает подключённый клиент для профиля (создаёт при необходимости)."""
-    client = state.clients.get(pid)
-    if client is not None:
-        if not client.is_connected():
-            await client.connect()
+    lock = state.client_locks.setdefault(pid, asyncio.Lock())
+    async with lock:
+        # Повторно проверяем кэш уже под lock: другой запрос мог подключить
+        # клиента, пока мы ждали, иначе Telethon получит SQLite "database locked".
+        client = state.clients.get(pid)
+        if client is not None:
+            if not client.is_connected():
+                await client.connect()
+            _register_response_listener(client, pid)
+            return client
+
+        profile = get_profile(pid)
+        if profile is None:
+            return None
+
+        client = TelegramClient(
+            _session_path(profile), profile["api_id"], profile["api_hash"],
+            proxy=_parse_proxy(profile.get("proxy")),
+        )
+        await client.connect()
+        state.clients[pid] = client
+        state.entities.setdefault(pid, {})
         _register_response_listener(client, pid)
         return client
-
-    profile = get_profile(pid)
-    if profile is None:
-        return None
-
-    client = TelegramClient(
-        _session_path(profile), profile["api_id"], profile["api_hash"],
-        proxy=_parse_proxy(profile.get("proxy")),
-    )
-    await client.connect()
-    state.clients[pid] = client
-    state.entities.setdefault(pid, {})
-    _register_response_listener(client, pid)
-    return client
 
 
 # ---------------------------------------------------------------------------
@@ -976,8 +1078,14 @@ _BULK_STATUS = {
     "cooldown": "на паузе",
     "dead": "аккаунт заблокирован",
     "badmsg": "проблема с текстом",
+    "error": "ошибка",
     None: "готово",
 }
+
+
+class _InitialQueuePersistError(RuntimeError):
+    """Первичная запись очереди не удалась: отправку ещё можно безопасно откатить."""
+
 
 # категории, при которых рассылку надо ОСТАНОВИТЬ целиком (а не пропускать чат)
 _STOP_CATEGORIES = ("flood", "spam", "limit", "dead", "badmsg")
@@ -988,10 +1096,6 @@ async def _send_bulk(pid, targets, text, gap_lo=None, gap_hi=None, source="ру�
     """Последовательная отправка по чатам: пауза между ними, защита от флуда,
     живой прогресс (state.send_jobs), отмена, докатка при рестарте и запись в историю.
     targets — оставшиеся к отправке чаты (при докатке — недоотправленный хвост)."""
-    client = await get_client(pid)
-    if client is None or not await client.is_user_authorized():
-        _queue_clear(pid)
-        return
     remaining = list(targets)
     if fresh:
         random.shuffle(remaining)   # случайный порядок чатов — меньше похоже на бота
@@ -1015,10 +1119,24 @@ async def _send_bulk(pid, targets, text, gap_lo=None, gap_hi=None, source="ру�
             "remaining": remaining,
         })
 
-    _persist()
     interrupted = None   # None | cancel | flood | spam | limit | cooldown
     shutdown = False
+    errored = False
+    ready = False
+    persisted = False
     try:
+        # Сохраняем полный хвост ДО первого await. Если процесс остановится при
+        # подключении к Telegram, задача безопасно докатится после рестарта.
+        try:
+            _persist()
+        except Exception as e:
+            raise _InitialQueuePersistError(str(e)) from e
+        persisted = True
+        client = await get_client(pid)
+        if client is None or not await client.is_user_authorized():
+            return
+        ready = True
+
         while remaining:
             if job.get("cancel"):
                 interrupted = "cancel"
@@ -1059,12 +1177,31 @@ async def _send_bulk(pid, targets, text, gap_lo=None, gap_hi=None, source="ру�
     except asyncio.CancelledError:
         shutdown = True   # выключение сервера — оставляем хвост в очереди для докатки
         raise
+    except Exception:
+        interrupted = "error"
+        errored = True
+        raise
     finally:
         job["running"] = False
-        if shutdown:
-            _persist()   # сохраняем недоотправленное, историю не пишем — рассылка не завершена
-        else:
-            _queue_clear(pid)
+        if shutdown or errored:
+            if errored:
+                # Пока хвост лежит на диске, не даём новой ручной рассылке
+                # заменить его до следующей попытки scheduler.
+                job["retry_pending"] = persisted
+                job["status"] = (
+                    "ошибка — повторю автоматически" if persisted
+                    else "ошибка сохранения — попробуй снова"
+                )
+            if persisted:
+                try:
+                    _persist()   # хвост подхватит scheduler или следующий старт
+                except Exception as e:
+                    print(f"[send] не удалось обновить очередь {pid}: {e}")
+        elif ready:
+            try:
+                _queue_clear(pid)
+            except Exception as e:
+                print(f"[send] не удалось очистить очередь {pid}: {e}")
             job["status"] = _BULK_STATUS.get(interrupted, "готово")
             job["finished"] = datetime.now().isoformat(timespec="seconds")
             _log_send_run({
@@ -1081,6 +1218,13 @@ async def _send_bulk(pid, targets, text, gap_lo=None, gap_hi=None, source="ру�
                 "label": label,
                 "text_preview": job["text_preview"],
             })
+        elif persisted:
+            # Профиль не авторизован или подключение упало до отправки. Старое
+            # поведение — не писать пустую историю и убрать очередь.
+            try:
+                _queue_clear(pid)
+            except Exception as e:
+                print(f"[send] не удалось очистить очередь {pid}: {e}")
 
 
 async def _send_bulk_safe(pid, targets, text, gap_lo=None, gap_hi=None, source="ручная",
@@ -1246,81 +1390,235 @@ async def _fire_rule(rule):
                      source="расписание", label=label)
 
 
-async def _scheduler_loop():
-    """Каждые 20 секунд проверяет правила и отправляет наступившие."""
-    while True:
+async def _fire_rule_safe(rule):
+    try:
+        await _fire_rule(rule)
+    except asyncio.CancelledError:
+        raise
+    except _InitialQueuePersistError:
+        # Только scheduler знает, какой claim надо вернуть в due-состояние.
+        raise
+    except Exception as e:
+        print(f"[scheduler] правило {rule.get('id')}: {e}")
+
+
+def _interval_due_priority(rule, now):
+    """Ключ очередности для наступившего интервала; None если ещё рано."""
+    nf = rule.get("next_fire")
+    if not nf:
+        created = str(rule.get("created") or "").replace(" ", "T")
+        return created or now.isoformat(timespec="seconds")
+    try:
+        due_at = datetime.fromisoformat(nf)
+        if now < due_at:
+            return None
+    except Exception:
+        created = str(rule.get("created") or "").replace(" ", "T")
+        return created or now.isoformat(timespec="seconds")
+    return due_at.isoformat(timespec="seconds")
+
+
+def _schedule_allowed(rule):
+    if not rule.get("enabled", True):
+        return False
+    owner = rule.get("owner")
+    if owner is not None:
+        user = get_user(owner)
+        if user is None or user.get("status") != "approved" or not _sub_active(user):
+            return False
+    prof = get_profile(rule["profile_id"])
+    if _on_cooldown(prof):
+        return False
+    return prof is not None and _active_pid(prof.get("owner")) == prof["id"]
+
+
+def _claim_scheduled_rule(sid, pid, now):
+    """Свежим чтением атомарно помечает одно due-правило перед первым await."""
+    schedules = load_schedules()
+    rule = next((item for item in schedules
+                 if item.get("id") == sid and item.get("profile_id") == pid), None)
+    if rule is None or not _schedule_allowed(rule):
+        return None
+
+    if rule.get("interval_min"):
+        if _interval_due_priority(rule, now) is None:
+            return None
+        before_present = "next_fire" in rule
+        before = rule.get("next_fire")
+        lo = int(rule.get("interval_min") or 1)
+        hi = int(rule.get("interval_max") or lo)
+        if hi < lo:
+            hi = lo
+        delay = random.randint(lo, hi)
+        rule["next_fire"] = (now + timedelta(minutes=delay)).isoformat(timespec="seconds")
+        claim = {
+            "kind": "interval", "before": before, "before_present": before_present,
+            "after": rule["next_fire"],
+        }
+    else:
+        occ = rule.get("pending_fire")
+        if not occ:
+            if not _due(rule, now):
+                return None
+            occ = now.strftime("%Y-%m-%d") + "T" + rule["time"]
+        if rule.get("last_fired") == occ:
+            rule.pop("pending_fire", None)
+            save_schedules(schedules)
+            return None
+        before_present = "last_fired" in rule
+        before = rule.get("last_fired")
+        rule["last_fired"] = occ
+        rule.pop("pending_fire", None)
+        claim = {
+            "kind": "clock", "before": before, "before_present": before_present,
+            "after": occ,
+        }
+
+    save_schedules(schedules)
+    claimed = dict(rule)
+    claimed["_scheduler_claim"] = claim
+    return claimed
+
+
+def _rollback_scheduled_claim(claimed):
+    """Возвращает claim в due-состояние, если очередь не удалось создать."""
+    marker = claimed.get("_scheduler_claim") or {}
+    schedules = load_schedules()
+    rule = next((item for item in schedules
+                 if item.get("id") == claimed.get("id")
+                 and item.get("profile_id") == claimed.get("profile_id")), None)
+    if rule is None:
+        return
+
+    kind = marker.get("kind")
+    after = marker.get("after")
+    if kind == "interval":
+        if rule.get("next_fire") != after:
+            return
+        if marker.get("before_present"):
+            rule["next_fire"] = marker.get("before")
+        else:
+            rule.pop("next_fire", None)
+    elif kind == "clock":
+        if rule.get("last_fired") != after:
+            return
+        if marker.get("before_present"):
+            rule["last_fired"] = marker.get("before")
+        else:
+            rule.pop("last_fired", None)
+        rule["pending_fire"] = after
+    else:
+        return
+    save_schedules(schedules)
+
+
+async def _run_scheduled_rule(sid, pid, now):
+    rule = None
+    try:
+        rule = _claim_scheduled_rule(sid, pid, now)
+        if rule is not None:
+            await _fire_rule_safe(rule)
+    except _InitialQueuePersistError as e:
         try:
-            now = datetime.now()
-            today = now.strftime("%Y-%m-%d")
-            schedules = load_schedules()
-            changed = False
+            if rule is not None:
+                _rollback_scheduled_claim(rule)
+        except Exception as rollback_error:
+            print(f"[scheduler] не удалось вернуть claim правила {sid}: {rollback_error}")
+        print(f"[scheduler] очередь правила {sid} не сохранена: {e}")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"[scheduler] правило {sid}: {e}")
 
-            for rule in schedules:
-                if not rule.get("enabled", True):
-                    continue
 
-                # Не отправляем, если владелец заблокирован/удалён или подписка истекла
-                owner = rule.get("owner")
-                if owner is not None:
-                    ou = get_user(owner)
-                    if ou is None or ou.get("status") != "approved" or not _sub_active(ou):
-                        continue
+def _scheduler_tick(now=None):
+    """Один неблокирующий проход планировщика.
 
-                # Профиль на охлаждении после флуда — пропускаем (возобновится сам)
-                prof = get_profile(rule["profile_id"])
-                if _on_cooldown(prof):
-                    continue
+    Файл читается, изменяется и сохраняется без единого ``await``. Поэтому API не
+    может вклиниться между чтением и записью, а новая настройка пользователя не
+    будет затёрта старым снимком после многоминутной рассылки.
+    """
+    now = now or datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    schedules = load_schedules()
+    changed = False
+    candidates = []
 
-                # Рассылает только АКТИВНЫЙ аккаунт владельца; расписания
-                # неактивных не выключаем, а просто пропускаем — при обратном
-                # переключении всё продолжит работать
-                if prof is None or _active_pid(prof.get("owner")) != prof["id"]:
-                    continue
+    for pos, rule in enumerate(schedules):
+        try:
+            if not _schedule_allowed(rule):
+                continue
 
-                # Режим интервала: каждые N (случайно min..max) минут
-                if rule.get("interval_min"):
-                    nf = rule.get("next_fire")
-                    due = nf is None
-                    if not due:
-                        try:
-                            due = now >= datetime.fromisoformat(nf)
-                        except Exception:
-                            due = True
-                    if due:
-                        await _fire_rule(rule)
-                        lo = int(rule.get("interval_min") or 1)
-                        hi = int(rule.get("interval_max") or lo)
-                        if hi < lo:
-                            hi = lo
-                        delay = random.randint(lo, hi)
-                        rule["next_fire"] = (now + timedelta(minutes=delay)).isoformat(timespec="seconds")
-                        changed = True
-                    continue
+            # Режим интервала: каждые N (случайно min..max) минут
+            if rule.get("interval_min"):
+                priority = _interval_due_priority(rule, now)
+                if priority is not None:
+                    candidates.append((priority, pos, rule["id"], rule["profile_id"]))
+                continue
 
-                # Чистим прошедшие конкретные даты у разовых правил
-                if rule.get("dates"):
-                    fresh = [d for d in rule["dates"] if d >= today]
-                    if fresh != rule["dates"]:
-                        rule["dates"] = fresh
-                        changed = True
-                    if not fresh:
-                        rule["enabled"] = False
-                        changed = True
-                        continue
-
-                if not _due(rule, now):
-                    continue
-
-                occ = today + "T" + rule["time"]
-                if rule.get("last_fired") == occ:
-                    continue
-
-                await _fire_rule(rule)
-                rule["last_fired"] = occ
+            # Уже зафиксированное occurrence важнее очистки даты: если отправка
+            # в 23:58 ждала занятой профиль до полуночи, она не должна исчезнуть.
+            pending = rule.get("pending_fire")
+            if pending and rule.get("last_fired") != pending:
+                candidates.append((pending, pos, rule["id"], rule["profile_id"]))
+                continue
+            if pending:
+                rule.pop("pending_fire", None)
                 changed = True
 
-            if changed:
-                save_schedules(schedules)
+            # Чистим прошедшие конкретные даты у разовых правил
+            if rule.get("dates"):
+                fresh = [d for d in rule["dates"] if d >= today]
+                if fresh != rule["dates"]:
+                    rule["dates"] = fresh
+                    changed = True
+                if not fresh:
+                    rule["enabled"] = False
+                    changed = True
+                    continue
+
+            if not _due(rule, now):
+                continue
+
+            occ = today + "T" + rule["time"]
+            if rule.get("last_fired") != occ:
+                # Если профиль занят или перед ним есть другое правило, occurrence
+                # не потеряется после узкого пятиминутного окна _due().
+                rule["pending_fire"] = occ
+                changed = True
+                candidates.append((occ, pos, rule["id"], rule["profile_id"]))
+        except Exception as e:
+            print(f"[scheduler] повреждённое правило {rule.get('id')}: {e}")
+
+    # Если у одного профиля несколько просроченных правил, первым запускаем
+    # самое старое. Остальные останутся due и попадут в следующий свободный тик.
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    claimed_pids = set()
+    pending = []
+    for _, _, sid, pid in candidates:
+        if pid in claimed_pids or _send_busy(pid):
+            continue
+        claimed_pids.add(pid)
+        pending.append((sid, pid))
+
+    # Здесь сохраняются только очистка дат и pending occurrence. next_fire и
+    # last_fired ставит _claim_scheduled_rule свежим чтением внутри task — до
+    # первого await и без сохранения старого снимка после отправки.
+    if changed:
+        save_schedules(schedules)
+
+    for sid, pid in pending:
+        _start_send_task(pid, lambda sid=sid, pid=pid, now=now: _run_scheduled_rule(sid, pid, now))
+
+
+async def _scheduler_loop():
+    """Каждые 20 секунд отмечает due-правила и запускает их в фоне."""
+    while True:
+        try:
+            # Подхватывает хвост не только после рестарта, но и после временной
+            # ошибки подключения/диска в фоновой задаче.
+            await _resume_queued_sends()
+            _scheduler_tick()
         except Exception as e:
             print(f"[scheduler] ошибка цикла: {e}")
 
@@ -1329,30 +1627,40 @@ async def _scheduler_loop():
 
 async def _resume_queued_sends():
     """Докатка: после рестарта продолжает рассылки, прерванные на середине."""
-    jobs = _queue_load()
-    for j in jobs:
+    queued_pids = list(dict.fromkeys(j.get("pid") for j in _queue_load()))
+    for queued_pid in queued_pids:
+        # Предыдущий discard мог await отмену активной task. Поэтому берём
+        # запись заново и не запускаем устаревший снимок очереди.
+        j = next((item for item in _queue_load() if item.get("pid") == queued_pid), None)
+        if j is None:
+            continue
         remaining = j.get("remaining") or []
         if not remaining:
-            _queue_clear(j.get("pid"))
+            await _discard_queued_send(queued_pid, "готово")
             continue
         # владелец должен быть активен, иначе не возобновляем
         ou = get_user(j.get("owner")) if j.get("owner") else None
         if j.get("owner") and (ou is None or ou.get("status") != "approved" or not _sub_active(ou)):
-            _queue_clear(j.get("pid"))
+            await _discard_queued_send(queued_pid, "доступ закрыт")
             continue
         # докатываем только активный аккаунт — с неактивного рассылать нельзя
         prof = get_profile(j.get("pid"))
         if prof is None or _active_pid(prof.get("owner")) != prof["id"]:
-            _queue_clear(j.get("pid"))
+            await _discard_queued_send(queued_pid, "аккаунт не активный")
             continue
-        print(f"[resume] докатка рассылки {j.get('pid')}: осталось {len(remaining)} чат(ов)")
-        asyncio.create_task(_send_bulk_safe(
-            j["pid"], remaining, j.get("text", ""),
-            j.get("gap_lo"), j.get("gap_hi"),
-            j.get("source", "ручная"), j.get("label", ""),
-            j.get("started"), int(j.get("done") or 0), int(j.get("ok") or 0),
-            j.get("failed") or [], False,   # fresh=False — хвост не перемешиваем
-        ))
+        task = _start_send_task(
+            j["pid"],
+            lambda j=j, remaining=remaining: _send_bulk_safe(
+                j["pid"], remaining, j.get("text", ""),
+                j.get("gap_lo"), j.get("gap_hi"),
+                j.get("source", "ручная"), j.get("label", ""),
+                j.get("started"), int(j.get("done") or 0), int(j.get("ok") or 0),
+                j.get("failed") or [], False,   # fresh=False — хвост не перемешиваем
+            ),
+            allow_retry=True,
+        )
+        if task is not None:
+            print(f"[resume] докатка рассылки {j.get('pid')}: осталось {len(remaining)} чат(ов)")
 
 
 async def _warm_response_listeners():
@@ -1379,12 +1687,25 @@ async def _warm_response_listeners():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _bootstrap_admin()   # гарантируем вход админа (ADMIN_USER/ADMIN_PASS), если заданы
-    state.scheduler_task = asyncio.create_task(_scheduler_loop())
+    # Сначала резервируем профили под докатку, чтобы планировщик не запустил
+    # для них ещё одну рассылку в момент старта процесса.
     await _resume_queued_sends()
+    state.scheduler_task = asyncio.create_task(_scheduler_loop())
     asyncio.create_task(_warm_response_listeners())   # фоном, не блокируя старт
     yield
     if state.scheduler_task:
         state.scheduler_task.cancel()
+        try:
+            await state.scheduler_task
+        except asyncio.CancelledError:
+            pass
+    # Даём _send_bulk обработать CancelledError и сохранить недоотправленный
+    # хвост в queue.json для докатки после перезапуска.
+    send_tasks = list(state.send_tasks.values())
+    for task in send_tasks:
+        task.cancel()
+    if send_tasks:
+        await asyncio.gather(*send_tasks, return_exceptions=True)
     for client in state.clients.values():
         try:
             await client.disconnect()
@@ -2367,9 +2688,6 @@ async def send_now(pid: str, body: SendIn, user=Depends(require_active)):
             {"error": f"Аккаунт на паузе из-за флуда. {profile.get('flood_note') or ''}".strip()},
             status_code=429,
         )
-    client = await get_client(pid)
-    if client is None or not await client.is_user_authorized():
-        return JSONResponse({"error": "Не авторизован"}, status_code=401)
     if not body.text.strip():
         return JSONResponse({"error": "Пустое сообщение"}, status_code=400)
     spin_err = _spin_issue(body.text)
@@ -2378,43 +2696,61 @@ async def send_now(pid: str, body: SendIn, user=Depends(require_active)):
     if not body.targets:
         return JSONResponse({"error": "Не выбран ни один чат"}, status_code=400)
 
-    active = state.send_jobs.get(pid)
-    if active and active.get("running"):
+    # Резервируем профиль ДО get_client(): параллельные запросы и scheduler не
+    # должны одновременно открывать одну Telethon session DB.
+    reservation = _reserve_current_send(pid)
+    if reservation is None:
         return JSONResponse({"error": "Рассылка уже идёт — дождись окончания или нажми Стоп"}, status_code=409)
 
-    targets = [{"id": t.id, "name": t.name, "kind": t.kind} for t in body.targets]
-    if len(targets) == 1:
-        # один чат — шлём сразу, чтобы дать мгновенный ответ
-        status, detail = await _send_one(client, pid, targets[0], body.text)
-        # запись в историю (одиночная отправка тоже учитывается)
-        now_iso = datetime.now().isoformat(timespec="seconds")
-        reason = detail or status
-        rec = {
-            "id": secrets.token_hex(6), "profile_id": pid, "owner": profile.get("owner"),
-            "started": now_iso, "finished": now_iso, "total": 1,
-            "ok": 1 if status == "ok" else 0,
-            "failed": [] if status == "ok" else [{"name": targets[0]["name"], "reason": reason[:120]}],
-            "status": _BULK_STATUS.get(status, "ошибка") if status != "ok" else "готово",
-            "source": "ручная", "label": "", "text_preview": (body.text or "")[:80],
-        }
-        _log_send_run(rec)
-        if status == "flood":
-            return {"ok": True, "sent": [], "paused": f"Telegram просит подождать {detail}с."}
-        if status == "spam":
-            return {"ok": True, "sent": [], "paused": "Telegram пометил аккаунт как спам."}
-        if status == "limit":
-            return {"ok": True, "sent": [], "paused": "Достигнут дневной лимит отправок — попробуй позже."}
-        if status == "dead":
-            return {"ok": True, "sent": [], "paused": "Аккаунт заблокирован Telegram — отправки остановлены."}
-        if status == "badmsg":
-            return {"ok": True, "sent": [], "errors": [f"Текст не отправлен: {reason}"]}
-        if status in ("skip", "slow", "error"):
-            return {"ok": True, "sent": [], "errors": [f"{targets[0]['name']}: {reason}"]}
-        return {"ok": True, "sent": [targets[0]["name"]], "errors": []}
+    try:
+        client = await get_client(pid)
+        if client is None or not await client.is_user_authorized():
+            return JSONResponse({"error": "Не авторизован"}, status_code=401)
 
-    # несколько чатов — отправляем в фоне с паузой между ними
-    asyncio.create_task(_send_bulk_safe(pid, targets, body.text, body.gap_min, body.gap_max, source="ручная"))
-    return {"ok": True, "started": len(targets)}
+        targets = [{"id": t.id, "name": t.name, "kind": t.kind} for t in body.targets]
+        if len(targets) == 1:
+            # один чат — шлём сразу, чтобы дать мгновенный ответ
+            status, detail = await _send_one(client, pid, targets[0], body.text)
+            # запись в историю (одиночная отправка тоже учитывается)
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            reason = detail or status
+            rec = {
+                "id": secrets.token_hex(6), "profile_id": pid, "owner": profile.get("owner"),
+                "started": now_iso, "finished": now_iso, "total": 1,
+                "ok": 1 if status == "ok" else 0,
+                "failed": [] if status == "ok" else [{"name": targets[0]["name"], "reason": reason[:120]}],
+                "status": _BULK_STATUS.get(status, "ошибка") if status != "ok" else "готово",
+                "source": "ручная", "label": "", "text_preview": (body.text or "")[:80],
+            }
+            _log_send_run(rec)
+            if status == "flood":
+                return {"ok": True, "sent": [], "paused": f"Telegram просит подождать {detail}с."}
+            if status == "spam":
+                return {"ok": True, "sent": [], "paused": "Telegram пометил аккаунт как спам."}
+            if status == "limit":
+                return {"ok": True, "sent": [], "paused": "Достигнут дневной лимит отправок — попробуй позже."}
+            if status == "dead":
+                return {"ok": True, "sent": [], "paused": "Аккаунт заблокирован Telegram — отправки остановлены."}
+            if status == "badmsg":
+                return {"ok": True, "sent": [], "errors": [f"Текст не отправлен: {reason}"]}
+            if status in ("skip", "slow", "error"):
+                return {"ok": True, "sent": [], "errors": [f"{targets[0]['name']}: {reason}"]}
+            return {"ok": True, "sent": [targets[0]["name"]], "errors": []}
+
+        # Несколько чатов: без окна гонки передаём резерв фоновой задаче.
+        task = _handoff_current_send(
+            pid,
+            reservation,
+            lambda: _send_bulk_safe(
+                pid, targets, body.text, body.gap_min, body.gap_max, source="ручная"
+            ),
+        )
+        if task is None:
+            return JSONResponse({"error": "Не удалось запустить рассылку"}, status_code=409)
+        return {"ok": True, "started": len(targets)}
+    finally:
+        # После handoff в словаре уже лежит фоновая task, поэтому её не снимет.
+        _release_current_send(pid, reservation)
 
 
 class TestIn(BaseModel):
@@ -2535,6 +2871,7 @@ async def update_schedule(pid: str, sid: str, body: ScheduleIn, user=Depends(req
         return JSONResponse({"error": "Расписание не найдено"}, status_code=404)
     target.update(fields)
     target["last_fired"] = None   # сброс, чтобы новое время отработало
+    target.pop("pending_fire", None)
     save_schedules(schedules)
     return {"ok": True, "schedule": target}
 
@@ -2552,6 +2889,7 @@ async def duplicate_schedule(pid: str, sid: str, user=Depends(require_active)):
     new["enabled"] = True
     new["last_fired"] = None
     new["next_fire"] = None
+    new.pop("pending_fire", None)
     new["created"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     schedules.append(new)
     save_schedules(schedules)
@@ -2578,6 +2916,8 @@ async def toggle_schedule(pid: str, sid: str, user=Depends(require_user)):
     if target is None:
         return JSONResponse({"error": "Расписание не найдено"}, status_code=404)
     target["enabled"] = not target.get("enabled", True)
+    if not target["enabled"]:
+        target.pop("pending_fire", None)
     save_schedules(schedules)
     return {"ok": True, "enabled": target["enabled"]}
 
@@ -2681,7 +3021,13 @@ async def send_stop(pid: str, user=Depends(require_user)):
     _owned_profile(pid, user)
     job = state.send_jobs.get(pid)
     if job:
-        job["cancel"] = True
+        if job.get("retry_pending") and not job.get("running"):
+            try:
+                await _discard_queued_send(pid, "остановлено")
+            except Exception as e:
+                return JSONResponse({"error": f"Не удалось остановить рассылку: {e}"}, status_code=500)
+        else:
+            job["cancel"] = True
     return {"ok": True}
 
 
