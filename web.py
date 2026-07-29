@@ -555,6 +555,7 @@ class State:
     # чтобы ручной запуск и планировщик не могли одновременно занять один аккаунт.
     send_tasks: dict[str, asyncio.Task] = {}
     scheduler_task = None
+    warm_task = None
 
 
 state = State()
@@ -741,7 +742,16 @@ async def get_client(pid) -> TelegramClient | None:
             _session_path(profile), profile["api_id"], profile["api_hash"],
             proxy=_parse_proxy(profile.get("proxy")),
         )
-        await client.connect()
+        try:
+            await client.connect()
+        except BaseException:
+            # connect() успевает поднять внутренние Telethon task до ошибки или
+            # отмены. Явно закрываем их, иначе они остаются pending до GC.
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            raise
         state.clients[pid] = client
         state.entities.setdefault(pid, {})
         _register_response_listener(client, pid)
@@ -1691,14 +1701,17 @@ async def lifespan(app: FastAPI):
     # для них ещё одну рассылку в момент старта процесса.
     await _resume_queued_sends()
     state.scheduler_task = asyncio.create_task(_scheduler_loop())
-    asyncio.create_task(_warm_response_listeners())   # фоном, не блокируя старт
+    # Держим сильную ссылку: asyncio loop хранит фоновые task только слабо, и
+    # иначе прогрев Telethon может быть уничтожен сборщиком мусора на полпути.
+    state.warm_task = asyncio.create_task(_warm_response_listeners())
     yield
-    if state.scheduler_task:
-        state.scheduler_task.cancel()
-        try:
-            await state.scheduler_task
-        except asyncio.CancelledError:
-            pass
+    background_tasks = [task for task in (state.scheduler_task, state.warm_task) if task]
+    for task in background_tasks:
+        task.cancel()
+    if background_tasks:
+        await asyncio.gather(*background_tasks, return_exceptions=True)
+    state.scheduler_task = None
+    state.warm_task = None
     # Даём _send_bulk обработать CancelledError и сохранить недоотправленный
     # хвост в queue.json для докатки после перезапуска.
     send_tasks = list(state.send_tasks.values())

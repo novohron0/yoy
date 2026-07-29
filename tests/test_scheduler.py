@@ -66,6 +66,8 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         web.state.client_locks.clear()
         web.state.send_tasks.clear()
         web.state.send_jobs.clear()
+        web.state.scheduler_task = None
+        web.state.warm_task = None
 
     async def asyncTearDown(self):
         tasks = list(web.state.send_tasks.values())
@@ -76,6 +78,13 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         web.state.send_tasks.clear()
         web.state.send_jobs.clear()
         web.state.client_locks.clear()
+        background = [task for task in (web.state.scheduler_task, web.state.warm_task) if task]
+        for task in background:
+            task.cancel()
+        if background:
+            await asyncio.gather(*background, return_exceptions=True)
+        web.state.scheduler_task = None
+        web.state.warm_task = None
         for item in reversed(self.patches):
             item.stop()
         self.tmp.cleanup()
@@ -570,6 +579,71 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(instances), 1)
 
         web.state.clients.pop("p1", None)
+
+    async def test_get_client_disconnects_partial_client_after_connect_error(self):
+        instances = []
+
+        class Client:
+            def __init__(self, *args, **kwargs):
+                self.disconnected = False
+                instances.append(self)
+
+            async def connect(self):
+                raise ConnectionError("temporary")
+
+            async def disconnect(self):
+                self.disconnected = True
+
+        profile = {"id": "p1", "api_id": 1, "api_hash": "0" * 32}
+        with (
+            patch.object(web, "get_profile", lambda pid: profile),
+            patch.object(web, "TelegramClient", Client),
+        ):
+            with self.assertRaises(ConnectionError):
+                await web.get_client("p1")
+
+        self.assertEqual(len(instances), 1)
+        self.assertTrue(instances[0].disconnected)
+        self.assertNotIn("p1", web.state.clients)
+
+    async def test_lifespan_keeps_and_cancels_background_tasks(self):
+        scheduler_started = asyncio.Event()
+        warm_started = asyncio.Event()
+        scheduler_cancelled = asyncio.Event()
+        warm_cancelled = asyncio.Event()
+
+        async def scheduler_loop():
+            scheduler_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                scheduler_cancelled.set()
+
+        async def warm_listeners():
+            warm_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                warm_cancelled.set()
+
+        with (
+            patch.object(web, "_bootstrap_admin"),
+            patch.object(web, "_resume_queued_sends", AsyncMock()),
+            patch.object(web, "_scheduler_loop", scheduler_loop),
+            patch.object(web, "_warm_response_listeners", warm_listeners),
+        ):
+            async with web.lifespan(None):
+                await asyncio.wait_for(scheduler_started.wait(), timeout=1)
+                await asyncio.wait_for(warm_started.wait(), timeout=1)
+                self.assertIsNotNone(web.state.scheduler_task)
+                self.assertIsNotNone(web.state.warm_task)
+                self.assertFalse(web.state.scheduler_task.done())
+                self.assertFalse(web.state.warm_task.done())
+
+        self.assertTrue(scheduler_cancelled.is_set())
+        self.assertTrue(warm_cancelled.is_set())
+        self.assertIsNone(web.state.scheduler_task)
+        self.assertIsNone(web.state.warm_task)
 
 
 if __name__ == "__main__":
