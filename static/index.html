@@ -329,18 +329,6 @@
     <span id="renew-text" style="flex:1;font-size:14px"></span>
     <button class="btn ghost" onclick="el('renew-banner').classList.add('hidden')">Понятно</button>
   </div>
-  <div id="payment-audit-consent" class="hidden" style="background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--accent-3);padding:14px 16px;border-radius:12px;margin-bottom:14px;line-height:1.55">
-    <b>🔎 Проверка оплат в рабочих аккаунтах</b>
-    <div class="hint" style="margin-top:6px;font-size:13px">
-      Сервис будет автоматически проверять <b>новые</b> входящие и исходящие рабочие сообщения на признаки перевода,
-      суммы и банковские чеки. Сигнал не доказывает перевод — окончательное решение принимает администратор.
-      Замаскированные фрагменты и результаты проверки хранятся до 60 дней, недельные декларации и история их изменений — до 370 дней;
-      локальная копия изображения после изолированного распознавания удаляется. Личные аккаунты подключать нельзя.
-      Включая проверку, ты подтверждаешь право обрабатывать эти рабочие сообщения и обязуешься уведомить собеседников.
-    </div>
-    <button class="btn" style="margin-top:10px" onclick="acceptPaymentAudit()">Понимаю и согласен(на) — включить</button>
-  </div>
-  <div id="payment-audit-active" class="hidden" style="color:var(--ok);font-size:13px;margin:0 0 12px">✓ Проверка оплат в рабочих аккаунтах включена</div>
   <div id="notif-banner" class="hidden" style="background:var(--panel-3);border-left:3px solid var(--err);padding:12px 14px;border-radius:10px;margin-bottom:14px">
     <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:8px">
       <b style="font-size:14px">🔔 Уведомления</b>
@@ -923,7 +911,6 @@ function toast(msg, kind) {
 // ---------- экран профилей ----------
 async function loadProfiles() {
   loadNotifs();
-  loadPaymentAuditConsent();
   refreshAdminBadge();
   const { data } = await api("/api/profiles");
   const grid = el("profiles-grid");
@@ -1149,30 +1136,6 @@ const PAYMENT_CATEGORY = {
   negated: "есть отрицание",
 };
 
-async function loadPaymentAuditConsent() {
-  const { ok, data } = await api("/api/payment-audit");
-  if (!ok) return;
-  state.paymentAudit = data;
-  if (!data.available) {
-    el("payment-audit-consent").classList.add("hidden");
-    el("payment-audit-active").classList.remove("hidden");
-    el("payment-audit-active").style.color = "var(--err)";
-    el("payment-audit-active").textContent = "⚠ Проверка оплат временно недоступна; рассылки продолжают работать";
-    return;
-  }
-  el("payment-audit-active").style.color = "var(--ok)";
-  el("payment-audit-active").textContent = "✓ Проверка оплат в рабочих аккаунтах включена";
-  el("payment-audit-consent").classList.toggle("hidden", !!data.consented);
-  el("payment-audit-active").classList.toggle("hidden", !data.consented);
-}
-
-async function acceptPaymentAudit() {
-  const { ok, data } = await post("/api/payment-audit/consent", { accept: true });
-  if (!ok) return toast(data.error || "Не удалось включить", "bad");
-  toast("Проверка новых рабочих сообщений включена ✓", "ok");
-  loadPaymentAuditConsent();
-}
-
 function paymentAmounts(c) {
   const rows = (c.amounts || []).filter(a => Number(a.value) > 0);
   if (!rows.length) return "сумма не распознана";
@@ -1205,17 +1168,10 @@ async function loadPaymentAudit() {
     list.innerHTML = "";
     return;
   }
-  if (!data.consented) {
-    summary.innerHTML = `Проверка ещё не включена. Вернись к списку профилей и подтверди анализ рабочих диалогов.`;
-    el("payment-week-form").classList.add("hidden");
-    list.innerHTML = "";
-    return;
-  }
   const s = data.summary || {};
   summary.innerHTML = `За текущую неделю: <b>${s.pending || 0}</b> непроверенных сигналов${s.high ? ` · <span style="color:var(--err)">${s.high} высокой уверенности</span>` : ""}`
     + ` · подтверждено <b>${money(s.confirmed_total)}</b> · 15% = <b>${money(s.commission)}</b>`
-    + `${data.ocr_available ? " · OCR чеков работает" : " · ⚠️ OCR чеков временно недоступен"}`
-    + `<div style="margin-top:5px"><a href="#" onclick="revokePaymentAudit();return false" class="hint">отозвать согласие и остановить анализ новых сообщений</a></div>`;
+    + `${data.ocr_available ? " · OCR чеков работает" : " · ⚠️ OCR чеков временно недоступен"}`;
   el("payment-week-form").classList.remove("hidden");
   const report = data.week_report;
   const previousReport = (data.week_reports || []).find(r => r.week_start !== data.week_start);
@@ -1272,14 +1228,6 @@ async function savePaymentWeek() {
   if (!ok) return toast(data.error || "Не удалось сохранить", "bad");
   toast(`Заявлено ${money(amount)} · 15% = ${money(data.commission)}`, "ok");
   loadPaymentAudit();
-}
-
-async function revokePaymentAudit() {
-  if (!confirm("Остановить анализ новых сообщений? Администратор увидит, что проверка отключена.")) return;
-  const { ok, data } = await post("/api/payment-audit/consent", { accept: false });
-  if (!ok) return toast(data.error || "Не удалось отключить", "bad");
-  toast("Анализ новых сообщений остановлен", "ok");
-  loadPaymentAudit(); loadPaymentAuditConsent();
 }
 
 // Счётчик запросов на смену пароля на кнопке «Пользователи» — чтобы новые
@@ -2496,13 +2444,10 @@ function renderAdminPaymentAudit(data) {
   const summaryHtml = summaries.map(s => {
     const declared = s.week_report ? money(s.week_report.amount) : "не заявлено";
     const previous = (s.week_reports || []).find(r => r.week_start !== data.week_start);
-    const consentOff = (s.consent_history || []).filter(item => item.action === "disabled");
-    const consent = s.consented ? `<span style="color:var(--ok)">контроль включён</span>` : `<span style="color:var(--err)">контроль не подтверждён</span>`;
     const declaredFee = s.week_report ? ` (15% = ${money(Number(s.week_report.amount) * 0.15)})` : "";
-    return `<div class="si-to" style="margin:5px 0"><b>${escapeHtml(s.username)}</b> · ${consent} · заявлено ${declared}${declaredFee}`
+    return `<div class="si-to" style="margin:5px 0"><b>${escapeHtml(s.username)}</b> · заявлено ${declared}${declaredFee}`
       + `${previous ? ` · прошлая неделя ${money(previous.amount)}` : ""}`
       + `${s.week_report && (s.week_report.history || []).length > 1 ? ` · правок суммы: ${(s.week_report.history || []).length - 1}` : ""}`
-      + `${consentOff.length ? ` · <span style="color:var(--err)">отключений контроля: ${consentOff.length}</span>` : ""}`
       + ` · сигналов ${s.cases || 0}, ждут ${s.pending || 0}${s.high ? ` (${s.high} важных)` : ""}`
       + ` · подтверждено ${money(s.confirmed_total)} · 15% = <b>${money(s.commission)}</b></div>`;
   }).join("");

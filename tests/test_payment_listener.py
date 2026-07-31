@@ -34,14 +34,15 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         web.state.audit_owner_locks.clear()
         web.state.audit_ocr_semaphore = None
 
-    def consented_user(self):
-        return {
+    def work_user(self, **extra):
+        """Одобренный рабочий пользователь: проверка оплат включена для всех таких."""
+        base = {
             "id": "u1",
             "status": "approved",
             "paid_until": "2099-01-01T00:00:00",
-            "payment_audit_consent_version": web.PAYMENT_AUDIT_VERSION,
-            "payment_audit_consent_at": "2026-07-30T09:00:00+00:00",
         }
+        base.update(extra)
+        return base
 
     async def test_records_detected_private_payment_signal(self):
         store = MagicMock()
@@ -50,7 +51,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         event = FakeEvent()
         with (
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
-            patch.object(web, "get_user", return_value=self.consented_user()),
+            patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "payment_audit_store", store),
         ):
             await web._handle_payment_message(MagicMock(), "p1", event)
@@ -69,7 +70,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         event = FakeEvent("Скинул 5 000 ₽ по СБП. Секретная лишняя переписка")
         with (
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
-            patch.object(web, "get_user", return_value=self.consented_user()),
+            patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "payment_audit_store", store),
         ):
             await web._handle_payment_message(MagicMock(), "p1", event)
@@ -85,7 +86,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         store.event_key.return_value = "EVENTKEY"
         with (
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
-            patch.object(web, "get_user", return_value=self.consented_user()),
+            patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "payment_audit_store", store),
         ):
             await web._handle_payment_message(
@@ -97,10 +98,9 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("outgoing_transfer", analysis["categories"])
         self.assertLessEqual(analysis["confidence"], 0.45)
 
-    async def test_does_not_read_without_current_consent(self):
+    async def test_does_not_read_for_user_not_approved_by_admin(self):
         store = MagicMock()
-        user = self.consented_user()
-        user.pop("payment_audit_consent_version")
+        user = self.work_user(status="pending")
         with (
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
             patch.object(web, "get_user", return_value=user),
@@ -112,10 +112,9 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         detector.assert_not_called()
         store.record_event.assert_not_called()
 
-    async def test_does_not_process_messages_older_than_consent(self):
+    async def test_does_not_read_when_subscription_expired(self):
         store = MagicMock()
-        user = self.consented_user()
-        user["payment_audit_consent_at"] = "2026-07-30T11:00:00+00:00"
+        user = self.work_user(paid_until="2020-01-01T00:00:00")
         with (
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
             patch.object(web, "get_user", return_value=user),
@@ -140,7 +139,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
                 profile.assert_not_called()
         store.record_event.assert_not_called()
 
-    async def test_image_ocr_is_scheduled_only_after_consent(self):
+    async def test_image_is_scheduled_for_ocr(self):
         captured = []
         store = MagicMock()
 
@@ -150,7 +149,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
-            patch.object(web, "get_user", return_value=self.consented_user()),
+            patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "_track_audit_task", side_effect=capture),
             patch.object(web, "payment_audit_store", store),
         ):
@@ -165,7 +164,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
             store = MagicMock()
             with (
                 patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
-                patch.object(web, "get_user", return_value=self.consented_user()),
+                patch.object(web, "get_user", return_value=self.work_user()),
                 patch.object(web, "payment_audit_store", store),
                 patch.object(web, "_track_audit_task") as track,
             ):
@@ -180,7 +179,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         worker = MagicMock(return_value=marker)
         with (
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
-            patch.object(web, "get_user", return_value=self.consented_user()),
+            patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "payment_audit_store", store),
             patch.object(web, "_audit_receipt_media", new=worker),
             patch.object(web, "_track_audit_task") as track,
@@ -200,7 +199,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         store.event_key.side_effect = ("EVENT1", "EVENT2")
         with (
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
-            patch.object(web, "get_user", return_value=self.consented_user()),
+            patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "payment_audit_store", store),
         ):
             await web._handle_payment_message(
@@ -223,7 +222,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         event.message.edit_date = datetime(2026, 7, 30, 10, 5, tzinfo=timezone.utc)
         with (
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
-            patch.object(web, "get_user", return_value=self.consented_user()),
+            patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "payment_audit_store", store),
         ):
             await web._handle_payment_message(MagicMock(), "p1", event, source="edited")
@@ -242,7 +241,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         store.has_message.return_value = False
         with (
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
-            patch.object(web, "get_user", return_value=self.consented_user()),
+            patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "payment_audit_store", store),
         ):
             await web._handle_payment_message(
@@ -270,7 +269,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
-            patch.object(web, "get_user", return_value=self.consented_user()),
+            patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "payment_audit_store", store),
             patch.object(web, "analyze_payment_signal", side_effect=detect_then_delete),
         ):
@@ -296,7 +295,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         client = MagicMock()
         client.download_media = AsyncMock(return_value=b"\xff\xd8\xffimage")
         with (
-            patch.object(web, "get_user", return_value=self.consented_user()),
+            patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
             patch.object(web, "payment_audit_store", store),
             patch.object(web.receipt_ocr, "analyze_bytes_async", AsyncMock(return_value=ocr_result)),
@@ -334,7 +333,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         client = MagicMock()
         client.download_media = AsyncMock(return_value=b"\xff\xd8\xffimage")
         with (
-            patch.object(web, "get_user", return_value=self.consented_user()),
+            patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
             patch.object(web, "payment_audit_store", store),
             patch.object(web.receipt_ocr, "analyze_bytes_async", AsyncMock(return_value=ocr_result)),
@@ -363,7 +362,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         client.download_media = never_finishes
         worker = AsyncMock()
         with (
-            patch.object(web, "get_user", return_value=self.consented_user()),
+            patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "PAYMENT_AUDIT_DOWNLOAD_TIMEOUT", 0.01),
             patch.object(web.receipt_ocr, "analyze_bytes_async", worker),
         ):
@@ -449,7 +448,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
-            patch.object(web, "get_user", return_value=self.consented_user()),
+            patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "payment_audit_store", store),
         ):
             delay, _ = await asyncio.gather(
@@ -467,7 +466,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         event.message.edit_date = datetime(2026, 7, 30, 10, 5, tzinfo=timezone.utc)
         with (
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
-            patch.object(web, "get_user", return_value=self.consented_user()),
+            patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "payment_audit_store", store),
             patch.object(web, "_audit_receipt_media", new=worker),
             patch.object(web, "_track_audit_task") as track,
@@ -476,29 +475,6 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(worker.call_args.kwargs["message_source"], "edited")
         track.assert_called_once()
-
-    async def test_consent_gaps_keep_an_immutable_admin_visible_history(self):
-        user = self.consented_user()
-        user.pop("payment_audit_consent_version")
-        user.pop("payment_audit_consent_at")
-        store = MagicMock()
-
-        def close_task(awaitable, **_kwargs):
-            awaitable.close()
-
-        with (
-            patch.object(web, "load_users", return_value=[user]),
-            patch.object(web, "save_users"),
-            patch.object(web, "payment_audit_store", store),
-            patch.object(web, "_track_audit_task", side_effect=close_task),
-        ):
-            await web.payment_audit_consent(web.PaymentAuditConsentIn(accept=True), user=user)
-            await web.payment_audit_consent(web.PaymentAuditConsentIn(accept=True), user=user)
-            await web.payment_audit_consent(web.PaymentAuditConsentIn(accept=False), user=user)
-            await web.payment_audit_consent(web.PaymentAuditConsentIn(accept=True), user=user)
-
-        actions = [item["action"] for item in user["payment_audit_consent_history"]]
-        self.assertEqual(actions, ["enabled", "disabled", "enabled"])
 
     async def test_user_summary_uses_current_calendar_week(self):
         store = MagicMock()
@@ -510,7 +486,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(web, "_current_week_bounds", return_value=("2026-07-27", "2026-08-03")),
             patch.object(web, "_payment_ocr_available", new=AsyncMock(return_value=True)),
         ):
-            result = await web.payment_audit_info(user=self.consented_user())
+            result = await web.payment_audit_info(user=self.work_user())
 
         store.weekly_summary.assert_called_once_with(
             "u1", "2026-07-27", "2026-08-03",

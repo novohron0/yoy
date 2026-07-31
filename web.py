@@ -490,9 +490,6 @@ def _user_public(u):
         "reset_status": u.get("reset_status"),        # None | "pending" | "approved"
         "reset_requested": u.get("reset_requested"),
         "must_setup": bool(u.get("must_setup")),      # вошёл по дефолтному admin/admin — заставить сменить
-        "payment_audit_consented": _payment_audit_consented(u),
-        "payment_audit_consent_at": u.get("payment_audit_consent_at"),
-        "payment_audit_consent_history": list(u.get("payment_audit_consent_history") or [])[-50:],
     }
 
 
@@ -645,9 +642,8 @@ class State:
     audit_ocr_dropped: dict[str, int] = {"queue": 0, "quota": 0, "invalid": 0}
     audit_deleted_owners: set[str] = set()
     audit_deleted_profiles: set[str] = set()
-    # Serializes audit writes with consent revocation and destructive account
-    # operations, preventing an in-flight Telegram callback from recreating
-    # evidence after it was deleted or recording after consent was withdrawn.
+    # Serializes audit writes with destructive account operations, preventing an
+    # in-flight Telegram callback from recreating evidence after it was deleted.
     audit_owner_locks: dict[str, asyncio.Lock] = {}
     audit_ocr_semaphore = None
     audit_cleanup_at = 0.0
@@ -798,13 +794,14 @@ def _parse_proxy(raw):
         return None
 
 
-def _payment_audit_consented(user):
-    return bool(
-        user
-        and user.get("status") == "approved"
-        and user.get("payment_audit_consent_version") == PAYMENT_AUDIT_VERSION
-        and user.get("payment_audit_consent_at")
-    )
+def _payment_audit_applies(user):
+    """Проверка оплат включена для всех одобренных рабочих аккаунтов.
+
+    Согласие на неё пользователи дают вне панели — подписанным соглашением на
+    пользование сервисом, поэтому отдельного экрана-подтверждения в сервисе нет
+    и отключить проверку изнутри нельзя.
+    """
+    return bool(user and user.get("status") == "approved")
 
 
 def _payment_media_type(event):
@@ -981,7 +978,7 @@ def _payment_audit_scope_active(owner, pid):
     user = get_user(owner)
     profile = get_profile(pid)
     return bool(
-        _payment_audit_consented(user)
+        _payment_audit_applies(user)
         and _sub_active(user)
         and profile
         and profile.get("owner") == owner
@@ -1075,7 +1072,7 @@ async def _audit_receipt_media(client, event, *, owner, pid, chat_id, direction,
     if _payment_audit_scope_blocked(owner, pid):
         return
     user = get_user(owner)
-    if not _payment_audit_consented(user) or not _sub_active(user):
+    if not _payment_audit_applies(user) or not _sub_active(user):
         return
     if not _payment_ocr_media_allowed(event, media_type):
         return
@@ -1090,11 +1087,11 @@ async def _audit_receipt_media(client, event, *, owner, pid, chat_id, direction,
         meta = state.audit_ocr_tasks.get(asyncio.current_task())
         if meta is not None:
             meta["running"] = True
-        # A queued item may start after consent was revoked or access expired.
+        # A queued item may start after access expired or the account was deleted.
         user = get_user(owner)
         if (
             _payment_audit_scope_blocked(owner, pid)
-            or not _payment_audit_consented(user)
+            or not _payment_audit_applies(user)
             or not _sub_active(user)
             or not _audit_ocr_allowed(pid, priority=priority)
         ):
@@ -1114,7 +1111,7 @@ async def _audit_receipt_media(client, event, *, owner, pid, chat_id, direction,
         user = get_user(owner)
         if (
             _payment_audit_scope_blocked(owner, pid)
-            or not _payment_audit_consented(user)
+            or not _payment_audit_applies(user)
             or not _sub_active(user)
         ):
             data = None
@@ -1167,7 +1164,7 @@ async def _audit_receipt_media(client, event, *, owner, pid, chat_id, direction,
     user = get_user(owner)
     if (
         _payment_audit_scope_blocked(owner, pid)
-        or not _payment_audit_consented(user)
+        or not _payment_audit_applies(user)
         or not _sub_active(user)
     ):
         return
@@ -1211,28 +1208,11 @@ async def _handle_payment_message(client, pid, event, *, source="message"):
         if _payment_audit_scope_blocked(owner, pid):
             return
         user = get_user(owner) if owner else None
-        if not _payment_audit_consented(user) or not _sub_active(user):
+        if not _payment_audit_applies(user) or not _sub_active(user):
             return
         store = await _get_payment_audit_store_async()
         if store is None:
             return
-        consent_at = user.get("payment_audit_consent_at")
-        event_date = getattr(event, "date", None)
-        try:
-            if consent_at and event_date:
-                consent_dt = datetime.fromisoformat(str(consent_at).replace("Z", "+00:00"))
-                if consent_dt.tzinfo is None:
-                    consent_dt = consent_dt.replace(tzinfo=timezone.utc)
-                event_dt = event_date
-                if not isinstance(event_dt, datetime):
-                    event_dt = datetime.fromisoformat(str(event_dt).replace("Z", "+00:00"))
-                if event_dt.tzinfo is None:
-                    event_dt = event_dt.replace(tzinfo=timezone.utc)
-                if event_dt.astimezone(timezone.utc) < consent_dt.astimezone(timezone.utc):
-                    return
-        except (TypeError, ValueError):
-            return
-
         direction = "outgoing" if bool(getattr(event, "out", False)) else "incoming"
         media_type = _payment_media_type(event)
         text = getattr(event, "raw_text", "") or ""
@@ -2316,7 +2296,7 @@ async def _warm_response_listeners():
         if pid:
             pids.append(pid)
         user = get_user(owner)
-        if _payment_audit_consented(user) and _sub_active(user):
+        if _payment_audit_applies(user) and _sub_active(user):
             pids.extend(p["id"] for p in profiles if p.get("owner") == owner)
 
     for pid in dict.fromkeys(pids):
@@ -2687,7 +2667,7 @@ async def admin_subscription(uid: str, body: SubIn, admin=Depends(require_admin)
     if body.add_days:
         _extend_subscription(uid, int(body.add_days))
     current = get_user(uid)
-    if _payment_audit_consented(current) and _sub_active(current):
+    if _payment_audit_applies(current) and _sub_active(current):
         _track_audit_task(_warm_payment_owner_profiles(uid))
     return {"ok": True, "user": _user_public(current)}
 
@@ -2884,10 +2864,6 @@ class FolderIn(BaseModel):
     name: str = "Каналы"
 
 
-class PaymentAuditConsentIn(BaseModel):
-    accept: bool
-
-
 class PaymentCaseResponseIn(BaseModel):
     status: str
     note: str = ""
@@ -2953,8 +2929,6 @@ async def payment_audit_info(user=Depends(require_user)):
         return {
             "version": PAYMENT_AUDIT_VERSION,
             "available": False,
-            "consented": _payment_audit_consented(user),
-            "consent_at": user.get("payment_audit_consent_at"),
             "retention_days": PAYMENT_AUDIT_RETENTION_DAYS,
             "commission_rate": PAYMENT_COMMISSION_RATE,
             "ocr_available": False,
@@ -2974,8 +2948,6 @@ async def payment_audit_info(user=Depends(require_user)):
     return {
         "version": PAYMENT_AUDIT_VERSION,
         "available": True,
-        "consented": _payment_audit_consented(user),
-        "consent_at": user.get("payment_audit_consent_at"),
         "retention_days": PAYMENT_AUDIT_RETENTION_DAYS,
         "commission_rate": PAYMENT_COMMISSION_RATE,
         "ocr_available": ocr_available,
@@ -2986,45 +2958,8 @@ async def payment_audit_info(user=Depends(require_user)):
     }
 
 
-@app.post("/api/payment-audit/consent")
-async def payment_audit_consent(body: PaymentAuditConsentIn, user=Depends(require_user)):
-    if body.accept and await _get_payment_audit_store_async() is None:
-        return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
-    async with _audit_owner_lock(user["id"]):
-        users = load_users()
-        target = next((u for u in users if u.get("id") == user["id"]), None)
-        if target is None:
-            return JSONResponse({"error": "Пользователь не найден"}, status_code=404)
-        was_consented = _payment_audit_consented(target)
-        changed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        if body.accept and not was_consented:
-            target["payment_audit_consent_version"] = PAYMENT_AUDIT_VERSION
-            target["payment_audit_consent_at"] = changed_at
-        elif not body.accept and was_consented:
-            target.pop("payment_audit_consent_version", None)
-            target.pop("payment_audit_consent_at", None)
-        if bool(body.accept) != was_consented:
-            history = list(target.get("payment_audit_consent_history") or [])
-            history.append({
-                "at": changed_at,
-                "action": "enabled" if body.accept else "disabled",
-                "version": PAYMENT_AUDIT_VERSION,
-            })
-            target["payment_audit_consent_history"] = history[-100:]
-        save_users(users)
-    if body.accept:
-        _track_audit_task(_warm_payment_owner_profiles(user["id"]))
-    return {
-        "ok": True,
-        "consented": bool(body.accept),
-        "consent_at": target.get("payment_audit_consent_at"),
-    }
-
-
 @app.get("/api/payment-audit/cases")
 async def payment_audit_cases(days: int = 7, limit: int = 100, user=Depends(require_user)):
-    if not _payment_audit_consented(user):
-        return JSONResponse({"error": "Сначала подтверди проверку рабочих диалогов"}, status_code=409)
     profiles = load_profiles()
     store = await _get_payment_audit_store_async()
     if store is None:
@@ -3055,8 +2990,6 @@ async def payment_audit_respond(case_id: str, body: PaymentCaseResponseIn,
 
 @app.post("/api/payment-audit/week")
 async def payment_audit_week(body: PaymentWeekIn, user=Depends(require_user)):
-    if not _payment_audit_consented(user):
-        return JSONResponse({"error": "Сначала подтверди проверку рабочих диалогов"}, status_code=409)
     store = await _get_payment_audit_store_async()
     if store is None:
         return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
@@ -3092,8 +3025,6 @@ async def admin_payment_audit(days: int = 7, admin=Depends(require_admin)):
         summary.update({
             "owner": owner["id"],
             "username": owner.get("username") or owner["id"],
-            "consented": _payment_audit_consented(owner),
-            "consent_history": list(owner.get("payment_audit_consent_history") or [])[-20:],
             "week_report": week_report,
             "week_reports": week_reports,
         })
