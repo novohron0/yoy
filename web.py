@@ -3181,6 +3181,52 @@ async def admin_payment_audit_review(case_id: str, body: PaymentCaseReviewIn,
     return {"ok": True, "case": _audit_case_view(case, users=load_users())}
 
 
+def _peek_image_mime(raw: bytes) -> str:
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
+async def _peek_collect_messages(client, entity, *, pid, chat_ref, target_refs, limit=80):
+    """Fetch a quiet history window and prefer the case trigger message."""
+    collected = []
+    offset_id = 0
+    matched = None
+    for _ in range(4):
+        batch = await client.get_messages(entity, limit=min(40, limit), offset_id=offset_id)
+        batch = list(batch or [])
+        if not batch:
+            break
+        collected.extend(batch)
+        for msg in batch:
+            mid = int(getattr(msg, "id", 0) or 0)
+            if mid and PaymentAuditStore.message_ref(pid, chat_ref, mid) in target_refs:
+                matched = msg
+        if matched or len(collected) >= limit:
+            break
+        offset_id = int(getattr(batch[-1], "id", 0) or 0)
+        if offset_id <= 0:
+            break
+    # Keep chronological uniqueness.
+    by_id = {}
+    for msg in collected:
+        mid = int(getattr(msg, "id", 0) or 0)
+        if mid:
+            by_id[mid] = msg
+    ordered = [by_id[k] for k in sorted(by_id)]
+    if matched is not None:
+        mid = int(matched.id)
+        # Window around the trigger: older + newer neighbors already fetched.
+        idx = next((i for i, m in enumerate(ordered) if int(m.id) == mid), None)
+        if idx is not None:
+            ordered = ordered[max(0, idx - 20): idx + 21]
+    else:
+        ordered = ordered[-40:]
+    return ordered, matched
+
+
 @app.get("/api/admin/payment-audit/cases/{case_id}/peek")
 async def admin_payment_audit_peek(case_id: str, admin=Depends(require_admin)):
     """Тихий просмотр диалога глазами рабочего аккаунта.
@@ -3212,56 +3258,142 @@ async def admin_payment_audit_peek(case_id: str, admin=Depends(require_admin)):
         return JSONResponse({"error": "Не удалось открыть диалог на аккаунте сотрудника"}, status_code=404)
 
     peer = _brief(entity)
+    target_refs = {
+        str(item.get("message_ref") or "")
+        for item in (case.get("evidence") or [])
+        if isinstance(item, dict) and item.get("message_ref")
+    }
+    # message_ref intentionally stripped from API evidence — recover from events table.
+    try:
+        with store._connection() as db:
+            for row in db.execute(
+                "SELECT message_ref FROM payment_events WHERE case_id=?", (case_id,)
+            ):
+                if row["message_ref"]:
+                    target_refs.add(str(row["message_ref"]))
+    except Exception:
+        pass
+    target_refs.discard("")
+
     try:
         # get_messages сам по себе не шлёт read-ack — клиент/сотрудник ничего не видит.
-        messages = await client.get_messages(entity, limit=12)
+        messages, matched = await _peek_collect_messages(
+            client, entity, pid=pid, chat_ref=chat_ref, target_refs=target_refs, limit=80,
+        )
     except Exception as exc:
         return JSONResponse(
             {"error": f"Не удалось прочитать историю: {type(exc).__name__}"},
             status_code=502,
         )
 
+    evidence_bits = []
+    for item in case.get("evidence") or []:
+        if not isinstance(item, dict):
+            continue
+        snip = str(item.get("snippet") or "").strip()
+        src = str(item.get("source") or "message")
+        if snip:
+            evidence_bits.append(f"{src}: «{snip}»")
+    origin = {
+        "summary": (
+            f"Сумма {_payment_amounts_label(case)} взята не из последних реплик чата, "
+            f"а из распознанного чека/сигнала."
+            if any(a.get("value") for a in (case.get("amounts") or []))
+            else "Сумма в кейсе не распознана — смотри скрины и фразы ниже."
+        ),
+        "detector": evidence_bits[-6:],
+        "trigger_found": matched is not None,
+        "trigger_message_id": int(matched.id) if matched is not None else None,
+    }
+
     rows = []
-    photos = []
-    for msg in reversed(list(messages or [])):
+    image_msgs = []
+    for msg in messages:
+        mid = int(getattr(msg, "id", 0) or 0)
         text = (getattr(msg, "raw_text", None) or getattr(msg, "message", None) or "").strip()
         has_media = getattr(msg, "media", None) is not None
+        is_image = bool(
+            getattr(msg, "photo", None) is not None
+            or str(getattr(getattr(msg, "file", None), "mime_type", "") or "").startswith("image/")
+        )
         if not text and has_media:
-            text = "[фото/файл]"
+            text = "[фото/файл]" if is_image else "[файл]"
         if not text:
             continue
         at = getattr(msg, "date", None)
+        is_trigger = bool(
+            mid
+            and PaymentAuditStore.message_ref(pid, chat_ref, mid) in target_refs
+        )
         rows.append({
-            "id": int(getattr(msg, "id", 0) or 0),
+            "id": mid,
             "direction": "outgoing" if bool(getattr(msg, "out", False)) else "incoming",
             "text": mask_sensitive_text(text, 400),
             "at": at.astimezone(timezone.utc).isoformat(timespec="seconds") if at else "",
             "has_media": bool(has_media),
+            "is_trigger": is_trigger,
         })
-        if (
-            len(photos) < 2
-            and has_media
-            and (
-                getattr(msg, "photo", None) is not None
-                or str(getattr(getattr(msg, "file", None), "mime_type", "") or "").startswith("image/")
-            )
-        ):
+        if is_image and has_media:
+            image_msgs.append((msg, mid, is_trigger))
+
+    # Сначала исходный чек-сигнал, потом остальные скрины рядом.
+    image_msgs.sort(key=lambda item: (not item[2], -item[1]))
+    case_values = {
+        round(float(a.get("value") or 0), 2)
+        for a in (case.get("amounts") or [])
+        if float(a.get("value") or 0) > 0
+    }
+    ocr_ready = await _payment_ocr_available()
+    photos = []
+    for msg, mid, is_trigger in image_msgs[:8]:
+        try:
+            raw = await client.download_media(msg, file=bytes)
+        except Exception:
+            raw = None
+        if not (isinstance(raw, (bytes, bytearray)) and 32 < len(raw) <= 2_500_000):
+            continue
+        mime = _peek_image_mime(bytes(raw))
+        ocr_text = ""
+        ocr_amounts = []
+        if ocr_ready and len([p for p in photos if p.get("ocr_text")]) < 5:
             try:
-                raw = await client.download_media(msg, file=bytes)
+                async with asyncio.timeout(20):
+                    result = await receipt_ocr.analyze_bytes_async(bytes(raw))
+                signals = getattr(result, "signals", None)
+                term_bits = list(getattr(signals, "terms", ()) or [])[:4]
+                amount_bits = [
+                    str(getattr(a, "raw", "") or getattr(a, "value", ""))
+                    for a in (getattr(signals, "amounts", ()) or [])[:4]
+                ]
+                raw_preview = mask_sensitive_text(str(getattr(result, "text", "") or ""), 180)
+                joined = " · ".join(x for x in (term_bits + amount_bits) if x)
+                ocr_text = raw_preview or mask_sensitive_text(joined, 240)
+                for a in (getattr(signals, "amounts", ()) or [])[:6]:
+                    try:
+                        value = float(str(getattr(a, "value", "") or "0").replace(",", "."))
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        ocr_amounts.append({
+                            "value": value,
+                            "currency": getattr(a, "currency", None) or "RUB",
+                            "raw": str(getattr(a, "raw", "") or value),
+                        })
             except Exception:
-                raw = None
-            if isinstance(raw, (bytes, bytearray)) and 32 < len(raw) <= 2_500_000:
-                mime = "image/jpeg"
-                if raw[:8] == b"\x89PNG\r\n\x1a\n":
-                    mime = "image/png"
-                elif raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
-                    mime = "image/webp"
-                photos.append({
-                    "message_id": int(getattr(msg, "id", 0) or 0),
-                    "direction": "outgoing" if bool(getattr(msg, "out", False)) else "incoming",
-                    "mime": mime,
-                    "data_url": f"data:{mime};base64,{base64.b64encode(bytes(raw)).decode('ascii')}",
-                })
+                pass
+        photo_values = {round(float(a["value"]), 2) for a in ocr_amounts}
+        photos.append({
+            "message_id": mid,
+            "direction": "outgoing" if bool(getattr(msg, "out", False)) else "incoming",
+            "mime": mime,
+            "is_trigger": is_trigger,
+            "matches_case_amount": bool(case_values and case_values & photo_values),
+            "ocr_text": ocr_text,
+            "ocr_amounts": ocr_amounts,
+            "data_url": f"data:{mime};base64,{base64.b64encode(bytes(raw)).decode('ascii')}",
+        })
+
+    photos.sort(key=lambda p: (not p.get("is_trigger"), not p.get("matches_case_amount"), -p["message_id"]))
 
     view = _audit_case_view(case, users=load_users())
     return {
@@ -3269,7 +3401,8 @@ async def admin_payment_audit_peek(case_id: str, admin=Depends(require_admin)):
         "quiet": True,
         "case": view,
         "peer": peer,
-        "messages": rows[-12:],
+        "origin": origin,
+        "messages": rows,
         "photos": photos,
         "hint": "Просмотр только для тебя. Сообщения не отмечены прочитанными, ничего не отправлено.",
     }

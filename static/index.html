@@ -2552,18 +2552,39 @@ async function peekPaymentCase(id) {
   }
   const peer = data.peer || {};
   const peerName = peer.username ? `${peer.name || ""} (@${peer.username})` : (peer.name || "клиент");
+  const amountsLabel = _paymentAmountsLabel(data.case);
   if (sub) {
-    sub.textContent = `${peerName} · ${_paymentAmountsLabel(data.case)} · ${data.hint || "тихо, только чтение"}`;
+    sub.textContent = `${peerName} · ${amountsLabel} · ${data.hint || "тихо, только чтение"}`;
   }
-  const photos = (data.photos || []).map(p =>
-    `<div style="margin:8px 0"><img src="${p.data_url}" alt="вложение" style="max-width:100%;border-radius:10px;border:1px solid var(--border)" /></div>`
+  const origin = data.origin || {};
+  const detector = (origin.detector || []).map(x =>
+    `<div class="si-to" style="margin-top:2px">• ${escapeHtml(x)}</div>`
   ).join("");
+  const originHtml = `<div style="background:var(--panel-2);border-radius:10px;padding:10px 12px;margin-bottom:10px">
+      <div class="si-text" style="font-weight:600">Откуда сумма ${escapeHtml(amountsLabel)}</div>
+      <div class="si-to" style="margin-top:4px">${escapeHtml(origin.summary || "")}</div>
+      ${detector}
+      <div class="si-to" style="margin-top:4px;color:${origin.trigger_found ? "var(--ok)" : "var(--accent-3)"}">${origin.trigger_found ? "✓ нашли исходное сообщение с чеком в истории" : "исходное сообщение ищем среди скринов ниже"}</div>
+    </div>`;
+  const photos = (data.photos || []).map(p => {
+    const badge = p.matches_case_amount
+      ? `<span style="color:var(--ok);font-weight:700">← это похоже на чек с суммой кейса</span>`
+      : (p.is_trigger ? `<span style="color:var(--accent-3);font-weight:700">← сообщение-сигнал</span>` : "");
+    const ocr = p.ocr_text ? `<div class="si-to" style="margin-top:3px">OCR: «${escapeHtml(p.ocr_text)}»</div>` : "";
+    const who = p.direction === "outgoing" ? "аккаунт" : "клиент";
+    return `<div style="margin:10px 0;padding-bottom:8px;border-bottom:1px solid var(--border)">
+      <div class="si-to">${who} · фото #${p.message_id} ${badge}</div>
+      <img src="${p.data_url}" alt="вложение" style="max-width:100%;border-radius:10px;border:1px solid var(--border);margin-top:6px" />
+      ${ocr}
+    </div>`;
+  }).join("") || `<div class="hint">Скринов в этом окне нет</div>`;
   const msgs = (data.messages || []).map(m => {
     const who = m.direction === "outgoing" ? "аккаунт" : "клиент";
     const when = (m.at || "").slice(11, 16);
-    return `<div class="si-to" style="margin-top:4px"><b>${who}</b>${when ? ` · ${when}` : ""}${m.has_media ? " · вложение" : ""}: ${escapeHtml(m.text || "")}</div>`;
+    const mark = m.is_trigger ? ` <span style="color:var(--ok)">← сигнал</span>` : "";
+    return `<div class="si-to" style="margin-top:4px${m.is_trigger ? ";color:var(--text);font-weight:600" : ""}"><b>${who}</b>${when ? ` · ${when}` : ""}${m.has_media ? " · вложение" : ""}${mark}: ${escapeHtml(m.text || "")}</div>`;
   }).join("") || `<div class="hint">Сообщений не видно</div>`;
-  body.innerHTML = `${photos}<div style="margin-top:8px">${msgs}</div>`;
+  body.innerHTML = `${originHtml}<div class="si-text" style="font-weight:600;margin:8px 0 4px">Все скрины рядом</div>${photos}<div class="si-text" style="font-weight:600;margin:12px 0 4px">Переписка / слова вроде «перевёл»</div>${msgs}`;
 }
 
 function _paymentAmountsLabel(c) {
