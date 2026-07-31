@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import random
 import re
@@ -853,6 +854,41 @@ def _audit_signal_snippet(analysis):
     return mask_sensitive_text(" · ".join(fragments[:8]), 240)
 
 
+def _trusted_ocr_amounts(rich, signals) -> list[dict]:
+    """Keep only amounts that have an explicit currency mark (₽/руб/…)."""
+    trusted: list[dict] = []
+    seen: set[tuple[float, str]] = set()
+
+    def add(value, currency, raw="", explicit=True):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(number) or number <= 0:
+            return
+        currency = str(currency or "RUB")
+        key = (number, currency)
+        if key in seen:
+            return
+        seen.add(key)
+        trusted.append({
+            "value": number,
+            "currency": currency,
+            "raw": str(raw or value),
+            "currency_explicit": bool(explicit),
+        })
+
+    for item in rich.get("amounts") or []:
+        if item.get("currency_explicit"):
+            add(item.get("value"), item.get("currency") or "RUB", item.get("raw") or "")
+    for item in getattr(signals, "amounts", ()) or []:
+        currency = getattr(item, "currency", None)
+        if not currency:
+            continue
+        add(getattr(item, "value", None), currency, getattr(item, "raw", "") or "")
+    return trusted
+
+
 async def _payment_chat_context(client, chat_id, *, limit=5):
     """Grab a short nearby window so admin can verify without opening Telegram."""
     try:
@@ -1191,33 +1227,57 @@ async def _audit_receipt_media(client, event, *, owner, pid, chat_id, direction,
             # Явно отпускаем единственную ссылку на банковский скриншот.
             data = None
 
+    # OCR часто «рисует» голые цифры (телефон, id, мусор). Без ₽/руб им нельзя
+    # верить — иначе получаются фантомные 30108 ₽ вместо реальных 400 ₽.
     rich = analyze_payment_signal(
         result.text,
         direction=direction,
         media_type=media_type,
         is_forwarded=is_forwarded,
+        allow_bare_amounts=False,
     )
     if not rich.get("detected") and not result.signals.is_likely_payment:
         return
 
     categories = set(rich.get("categories") or [])
     categories.update({"receipt", "receipt_ocr"})
-    amounts = list(rich.get("amounts") or [])
-    if not amounts:
-        amounts = [
-            {"value": item.value, "currency": item.currency or "RUB"}
-            for item in result.signals.amounts
-        ]
+    amounts = _trusted_ocr_amounts(rich, result.signals)
+    caption = (getattr(event, "raw_text", None) or "").strip()
+    if caption:
+        caption_rich = analyze_payment_signal(
+            caption,
+            direction=direction,
+            media_type=media_type,
+            is_forwarded=is_forwarded,
+            allow_bare_amounts=False,
+        )
+        for item in caption_rich.get("amounts") or []:
+            if item.get("currency_explicit") or float(item.get("value") or 0) > 0:
+                key = (float(item.get("value") or 0), item.get("currency") or "RUB")
+                if key not in {(float(a.get("value") or 0), a.get("currency") or "RUB") for a in amounts}:
+                    if item.get("currency_explicit"):
+                        amounts.append(item)
     ocr_confidence = {"high": 0.86, "medium": 0.62, "low": 0.35}.get(
         result.signals.confidence, 0.3
     )
+    confidence = max(float(rich.get("confidence") or 0), ocr_confidence)
+    success_claim = bool(rich.get("success_claim"))
+    event_status = rich.get("event_status") if rich.get("event_status") != "none" else "receipt"
+    if not amounts:
+        # Чек/слова про перевод есть, но надёжной суммы нет — не выдумываем.
+        categories.discard("amount")
+        confidence = min(confidence, 0.45)
+        success_claim = False
+        if event_status == "completed":
+            event_status = "receipt"
     analysis = {
         **rich,
         "detected": True,
         "categories": sorted(categories),
         "amounts": amounts,
-        "confidence": max(float(rich.get("confidence") or 0), ocr_confidence),
-        "event_status": rich.get("event_status") if rich.get("event_status") != "none" else "receipt",
+        "confidence": confidence,
+        "success_claim": success_claim,
+        "event_status": event_status,
         "dedup_hashes": [
             key for key in (result.exact_dedup_key, result.text_dedup_key) if key
         ],

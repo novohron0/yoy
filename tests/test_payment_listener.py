@@ -312,6 +312,88 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
 
         store.record_event.assert_not_called()
 
+    async def test_ocr_rejects_bare_digit_junk_as_amount(self):
+        store = MagicMock()
+        store.chat_key.return_value = "CHATKEY"
+        store.event_key.return_value = "EVENTKEY"
+        store.message_ref.return_value = "a" * 64
+        # Типичный мусор OCR: слова про перевод + голые цифры без ₽.
+        ocr_result = SimpleNamespace(
+            text="перевод выполнен · чек перевод · 30108 · 62",
+            signals=SimpleNamespace(
+                is_likely_payment=False,
+                confidence="low",
+                amounts=(),
+            ),
+            exact_dedup_key="sha256:junk",
+            text_dedup_key="ocr-sha256:junk",
+            media_sha256="junk",
+        )
+        client = MagicMock()
+        client.download_media = AsyncMock(return_value=b"\xff\xd8\xffimage")
+        client.get_messages = AsyncMock(return_value=[])
+        with (
+            patch.object(web, "get_user", return_value=self.work_user()),
+            patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
+            patch.object(web, "payment_audit_store", store),
+            patch.object(web.receipt_ocr, "analyze_bytes_async", AsyncMock(return_value=ocr_result)),
+        ):
+            await web._audit_receipt_media(
+                client,
+                FakeEvent("", media_type="image/jpeg"),
+                owner="u1",
+                pid="p1",
+                chat_id=12345,
+                direction="incoming",
+                media_type="image/jpeg",
+            )
+
+        self.assertTrue(store.record_event.called)
+        analysis = store.record_event.call_args.kwargs["analysis"]
+        self.assertEqual(analysis["amounts"], [])
+        self.assertFalse(analysis["income_claim"])
+        self.assertNotIn(30108, [a.get("value") for a in analysis.get("amounts") or []])
+        self.assertLessEqual(analysis["confidence"], 0.45)
+
+    async def test_ocr_keeps_explicit_currency_amount(self):
+        store = MagicMock()
+        store.chat_key.return_value = "CHATKEY"
+        store.event_key.return_value = "EVENTKEY"
+        store.message_ref.return_value = "a" * 64
+        ocr_result = SimpleNamespace(
+            text="Перевод выполнен успешно. Сумма 400 ₽",
+            signals=SimpleNamespace(
+                is_likely_payment=True,
+                confidence="high",
+                amounts=[SimpleNamespace(value="400", currency="RUB", raw="400 ₽")],
+            ),
+            exact_dedup_key="sha256:ok",
+            text_dedup_key="ocr-sha256:ok",
+            media_sha256="ok",
+        )
+        client = MagicMock()
+        client.download_media = AsyncMock(return_value=b"\xff\xd8\xffimage")
+        client.get_messages = AsyncMock(return_value=[])
+        with (
+            patch.object(web, "get_user", return_value=self.work_user()),
+            patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
+            patch.object(web, "payment_audit_store", store),
+            patch.object(web.receipt_ocr, "analyze_bytes_async", AsyncMock(return_value=ocr_result)),
+        ):
+            await web._audit_receipt_media(
+                client,
+                FakeEvent("", media_type="image/jpeg"),
+                owner="u1",
+                pid="p1",
+                chat_id=12345,
+                direction="incoming",
+                media_type="image/jpeg",
+            )
+
+        analysis = store.record_event.call_args.kwargs["analysis"]
+        self.assertEqual([a["value"] for a in analysis["amounts"]], [400.0])
+        self.assertTrue(analysis["income_claim"])
+
     async def test_negated_ocr_never_becomes_high_confidence_income(self):
         store = MagicMock()
         store.chat_key.return_value = "CHATKEY"

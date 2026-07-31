@@ -569,6 +569,7 @@ def analyze_payment_signal(
     is_forwarded: bool = False,
     is_quote: bool = False,
     media_metadata: Mapping[str, Any] | None = None,
+    allow_bare_amounts: bool | None = None,
 ) -> dict[str, Any]:
     """Return a conservative review signal for a Russian payment message.
 
@@ -577,6 +578,8 @@ def analyze_payment_signal(
     make ``success_claim`` false even if the quoted words describe a transfer.
     ``media_metadata`` is optional and may contain ``type``/``mime_type`` and
     the two attribution flags; explicit keyword arguments take precedence.
+    ``allow_bare_amounts``: when False, ignore numbers without ₽/руб/тыс —
+    important for noisy OCR that invents digit junk like ``30108``.
     """
 
     metadata_media = _metadata_value(media_metadata, "type", "kind", "mime_type")
@@ -675,7 +678,11 @@ def analyze_payment_signal(
         or negation_matches
         or reversal_matches
     )
-    amounts = _extract_amounts(body, allow_bare=has_transaction_language)
+    if allow_bare_amounts is None:
+        allow_bare = has_transaction_language
+    else:
+        allow_bare = bool(allow_bare_amounts)
+    amounts = _extract_amounts(body, allow_bare=allow_bare)
     strong_bare_amount = any(
         item["currency_explicit"] or abs(float(item["value"])) >= 100
         for item in amounts
