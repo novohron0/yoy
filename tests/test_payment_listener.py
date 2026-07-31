@@ -529,3 +529,52 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WeakMoneyTraceTests(unittest.IsolatedAsyncioTestCase):
+    """Слабый денежный след сохраняется сразу — чат могут удалить в любой момент."""
+
+    def work_user(self):
+        return {"id": "u1", "status": "approved", "paid_until": "2099-01-01T00:00:00"}
+
+    async def handle(self, text):
+        store = MagicMock()
+        store.chat_key.return_value = "CHATKEY"
+        store.event_key.return_value = "EVENTKEY"
+        store.message_ref.return_value = "b" * 64
+        with (
+            patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
+            patch.object(web, "get_user", return_value=self.work_user()),
+            patch.object(web, "payment_audit_store", store),
+        ):
+            await web._handle_payment_message(MagicMock(), "p1", FakeEvent(text))
+        return store
+
+    async def test_saves_money_talk_that_is_not_a_full_signal(self):
+        store = await self.handle("скинул, проверяй")
+        store.record_event.assert_called_once()
+        analysis = store.record_event.call_args.kwargs["analysis"]
+        self.assertIn("money_mentioned", analysis["categories"])
+        self.assertFalse(analysis["income_claim"])
+        self.assertLessEqual(analysis["confidence"], 0.25)
+        self.assertTrue(store.record_event.call_args.kwargs["snippet"],
+                        "в слабой карточке должна остаться улика")
+
+    async def test_weak_trace_is_never_counted_as_income(self):
+        store = await self.handle("жду оплату")
+        analysis = store.record_event.call_args.kwargs["analysis"]
+        self.assertFalse(analysis["success_claim"])
+        self.assertFalse(analysis["income_claim"])
+        self.assertEqual(analysis["event_status"], "possible")
+
+    async def test_ordinary_chatter_is_still_not_saved(self):
+        for text in ("привет, как дела", "скинул фотки с объекта", "проверь почту"):
+            with self.subTest(text=text):
+                store = await self.handle(text)
+                store.record_event.assert_not_called()
+
+    async def test_full_signal_still_wins_over_weak_trace(self):
+        store = await self.handle("скинул 5000 на карту")
+        analysis = store.record_event.call_args.kwargs["analysis"]
+        self.assertNotIn("money_mentioned", analysis["categories"])
+        self.assertTrue(analysis["income_claim"])

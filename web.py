@@ -1246,6 +1246,36 @@ async def _handle_payment_message(client, pid, event, *, source="message"):
                 snippet=_audit_signal_snippet(analysis),
                 source=source,
             )
+        elif analysis.get("money_mentioned") and source != "edited":
+            # Про деньги в этом сообщении говорили, но на полноценный сигнал не
+            # набралось. Всё равно сохраняем: рабочие чаты часто удаляют сразу
+            # после заказа, и переспросить будет уже негде.
+            weak = dict(analysis)
+            weak.update({
+                "detected": True,
+                "categories": sorted(set(analysis.get("categories") or []) | {"money_mentioned"}),
+                "amounts": analysis.get("money_amounts") or [],
+                "evidence": analysis.get("money_evidence") or [],
+                "confidence": min(float(analysis.get("confidence") or 0), 0.25),
+                "event_status": "possible",
+                "success_claim": False,
+                "income_claim": False,
+                "level": "low",
+            })
+            await _record_payment_event(
+                store,
+                owner=owner,
+                pid=pid,
+                event_key=store.event_key(pid, event.chat_id, event.id, event_version),
+                chat_key=chat_key,
+                message_ref=message_ref,
+                chat_ref=event.chat_id,
+                observed_at=_payment_observed_at(event, source),
+                direction=direction,
+                analysis=weak,
+                snippet=_audit_signal_snippet(weak),
+                source=source,
+            )
         elif source == "edited":
             # An edited message that used to be a payment signal is material:
             # keep the historical evidence but remove its live amount/status.

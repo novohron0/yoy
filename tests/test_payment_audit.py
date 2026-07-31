@@ -383,3 +383,60 @@ class PaymentAuditTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MoneyTraceCaptureTests(unittest.TestCase):
+    """Рабочие чаты часто удаляют после заказа — денежный след теряться не должен."""
+
+    def trace(self, text, direction="incoming"):
+        result = analyze_payment_signal(text, direction=direction)
+        return bool(result["detected"] or result["money_mentioned"])
+
+    def test_keeps_words_the_owner_named(self):
+        for text in (
+            "скинул 5000 на карту",
+            "перевел 3000",
+            "закинул на карту",
+            "отправил, проверяй",
+            "скинул, проверь",
+            "деньги есть",
+            "оплата есть",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(self.trace(text))
+
+    def test_keeps_money_talk_that_is_not_a_proof(self):
+        for text in (
+            "перевод не прошёл",
+            "не смогла перевести, попробую позже",
+            "верну 5000 завтра",
+            "куда кидать",
+            "какая карта?",
+            "жду оплату",
+            "по 2500 за штуку, итого 10000",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(self.trace(text))
+
+    def test_still_ignores_messages_that_are_not_about_money(self):
+        for text in (
+            "скинул фотки с объекта",
+            "5000 просмотров за сутки",
+            "проверь почту",
+            "отправил документы на почту",
+            "привет, как дела",
+            "завтра встречаемся в 10",
+            "отправь на 2202 2020 1234 5678",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(self.trace(text))
+
+    def test_weak_trace_carries_its_own_evidence(self):
+        result = analyze_payment_signal("скинул, проверяй", direction="incoming")
+        self.assertFalse(result["detected"])
+        self.assertTrue(result["money_mentioned"])
+        self.assertTrue(result["money_evidence"], "у слабого следа должна быть улика")
+
+    def test_verify_word_alone_is_not_money(self):
+        result = analyze_payment_signal("проверь почту пожалуйста", direction="incoming")
+        self.assertFalse(result["money_mentioned"])

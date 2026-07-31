@@ -106,8 +106,13 @@ _REQUEST_PATTERNS = (
     ),
     _rx(
         r"\bкуда\s+(?:тебе|вам|можно\s+)?"
-        r"(?:скинуть|перевести|отправить|оплатить|закинуть)\b"
+        r"(?:скинуть|скидывать|перевести|переводить|отправить|отправлять|"
+        r"оплатить|оплачивать|закинуть|закидывать|кидать|кинуть)\b"
     ),
+    # «какая карта?», «карта какая», «на какую карту» — спрашивают реквизиты
+    _rx(r"\b(?:как(?:ая|ой|ую)\s+(?:у\s+тебя\s+|у\s+вас\s+)?(?:карта|карту|банк|сбер|тинькоф+)|"
+        r"карта\s+как(?:ая|ой)|на\s+как(?:ую|ой)\s+(?:карту|номер|банк))\b"),
+    _rx(r"\bномер\s+карты\s*\?"),
     _rx(r"\b(?:жду|нужны)\s+(?:твои|ваши|банковские\s+)?реквизиты\b"),
     _rx(r"\b(?:выставь|выставите|пришли|пришлите)\s+(?:мне\s+)?счет\b"),
 )
@@ -149,8 +154,32 @@ _CONFIRMATION_PATTERNS = (
         r"\b(?:получен[аоы]?|поступил[аи]?|пришл[аи]|пришел|"
         r"зачислен[аоы]?)\s+(?:оплата|перевод|платеж|деньги)\b"
     ),
-    _rx(r"\bесть\s+(?:оплата|перевод|поступление)\b"),
+    _rx(r"\bесть\s+(?:оплата|перевод|поступление|деньги)\b"),
+    _rx(r"\b(?:оплата|перевод|платеж|деньги)\s+есть\b"),
     _rx(r"\b(?:пришло|поступило|зачислено)\s+\d"),
+    # «всё получила», «всё пришло», «деньги упали» — подтверждение получения
+    _rx(r"\bвс[её]\s+(?:получил(?:а|и)?|пришло|дошло|на\s+месте)\b"),
+    _rx(r"\b(?:деньги|оплата|перевод|платеж)\s+(?:упал[аои]?|прилетел[аои]?)\b"),
+)
+
+# «скинул, проверяй» — просьба посмотреть поступление. Само по себе слово ничего
+# не значит («проверь почту»), поэтому засчитывается только рядом с деньгами.
+_VERIFY_PATTERNS = (
+    _rx(
+        r"\b(?:проверь(?:те)?|проверяй(?:те)?|глянь(?:те)?|посмотри(?:те)?|"
+        r"чекни(?:те)?)\s+(?:пожалуйста\s+)?(?:там\s+)?"
+        r"(?:карт[уы]|сч[ёе]т|баланс|оплату|перевод|платеж|деньги|поступление)\b"
+    ),
+    _rx(r"\b(?:проверь(?:те)?|проверяй(?:те)?|глянь(?:те)?|чекни(?:те)?)\b"),
+)
+
+# Слова, которые сами по себе не доказывают перевод, но означают, что о деньгах
+# в этом чате говорили. Влияют ТОЛЬКО на «сохранить слабый след» — в оценку
+# уверенности и в признак отрицания не входят, чтобы не портить основной разбор.
+_MONEY_TALK_PATTERNS = (
+    _rx(r"\b(?:верн(?:у|[ёе]м|ут)|возвращ(?:у|ает)|возврат[а-я]*)\b"),
+    _rx(r"\b(?:итого|цена|ценник|стоимость|прайс|стоит)\b"),
+    _rx(r"\b(?:жду|ждем|жд[ёе]м)\s+(?:оплат[а-я]*|перевод[а-я]*|деньги)\b"),
 )
 
 _UNCERTAINTY_PATTERNS = (
@@ -633,6 +662,8 @@ def analyze_payment_signal(
     if receipt_with_media and not receipt_matches:
         receipt_matches = weak_receipt_matches
 
+    verify_matches = _matches(_VERIFY_PATTERNS, body)
+    money_talk_matches = _matches(_MONEY_TALK_PATTERNS, body)
     has_transaction_language = bool(
         completed_matches
         or intent_matches
@@ -700,6 +731,20 @@ def analyze_payment_signal(
         add("payment_uncertain", uncertainty_matches)
     if amounts:
         categories.append("amount")
+    # «проверяй» засчитываем только рядом с деньгами — иначе это «проверь почту».
+    verify_contextual = bool(
+        verify_matches
+        and (
+            amounts
+            or money_context_matches
+            or method_matches
+            or receipt_matches
+            or completed_matches
+            or confirmation_matches
+        )
+    )
+    if verify_contextual:
+        add("payment_verify_request", verify_matches)
 
     token_count = len(_TOKEN_RE.findall(body))
     category_count = len({
@@ -915,8 +960,34 @@ def analyze_payment_signal(
         and (completed_matches or confirmation_matches)
     )
 
+    # Страховочная сеть. Рабочие чаты часто удаляют сразу после заказа, поэтому
+    # лучше сохранить слабый денежный след, чем не сохранить ничего: сам разговор
+    # о деньгах уже был, даже если он не тянет на полноценный сигнал.
+    money_mentioned = bool(
+        inherent_completed_matches
+        or inherent_intent_matches
+        or method_matches
+        or receipt_matches
+        or confirmation_matches
+        or negation_matches
+        or reversal_matches
+        or request_matches
+        or money_context_matches
+        or verify_contextual
+        or (amounts and not non_payment_object_matches)
+        or (money_talk_matches and not non_payment_object_matches)
+    )
+
     return {
         "detected": detected,
+        "money_mentioned": money_mentioned,
+        # Улики и суммы для слабого следа: заполнены даже тогда, когда сигнал не
+        # набрал на полноценный, — иначе в карточке было бы пусто.
+        "money_evidence": evidence + _evidence("money_talk", money_talk_matches),
+        "money_amounts": [
+            {key: value for key, value in item.items() if not key.startswith("_")}
+            for item in amounts
+        ],
         "categories": categories if contextual else [],
         "amounts": [
             {key: value for key, value in item.items() if not key.startswith("_")}

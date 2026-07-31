@@ -751,6 +751,12 @@ class PaymentAuditStore:
                 else:
                     directions = old_directions | {direction}
                     media_hashes = old_media | new_hashes
+                    if event_status == "retracted":
+                        # Признаки оплаты убрали правкой сообщения. Сумму и
+                        # категории НЕ стираем: для сверки это красный флаг, а
+                        # не пустая карточка.
+                        categories |= old_categories
+                        amounts = old_amounts
                 if (
                     evidence["snippet"]
                     or evidence["categories"]
@@ -802,6 +808,10 @@ class PaymentAuditStore:
                     current_base, categories, amounts, directions, media_hashes,
                     current_status, current_income,
                 )
+                if current_status == "retracted":
+                    # Правка сообщения не должна прятать случай из списка —
+                    # заметность остаётся не ниже прежней.
+                    score = max(score, int(row["score"] or 0))
                 first_at = min(str(row["first_at"]), at)
                 last_at = max(str(row["last_at"]), at)
                 db.execute(

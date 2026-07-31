@@ -219,11 +219,15 @@ class PaymentAuditStoreTests(unittest.TestCase):
         self.assertEqual(edited["categories"], ["payment_request"])
         self.assertEqual(delayed_ocr["amounts"], [{"value": 7000.0, "currency": "RUB"}])
         self.assertEqual(delayed_ocr["event_status"], "requested")
+        # Признаки оплаты убрали правкой — но карточка не должна опустеть и не
+        # должна провалиться ниже порога показа, иначе правкой можно спрятать
+        # случай от сверки.
         self.assertEqual(retracted["id"], original["id"])
         self.assertEqual(retracted["event_status"], "retracted")
-        self.assertEqual(retracted["amounts"], [])
-        self.assertEqual(retracted["categories"], [])
-        self.assertEqual(retracted["score"], 0)
+        self.assertEqual(retracted["amounts"], [{"value": 7000.0, "currency": "RUB"}])
+        self.assertIn("payment_request", retracted["categories"])
+        self.assertGreaterEqual(retracted["score"], edited["score"])
+        self.assertGreaterEqual(retracted["score"], 20)
         self.assertEqual(restored["event_status"], "completed")
         self.assertEqual(restored["amounts"], [{"value": 9000.0, "currency": "RUB"}])
         self.assertNotIn(5000.0, [item["value"] for item in restored["amounts"]])
