@@ -741,6 +741,18 @@ https://t.me/+AbCdEf..."></textarea>
   </div>
 </div>
 
+<!-- ============ Модалка: тихий просмотр оплаты ============ -->
+<div id="modal-payment-peek" class="overlay hidden" onclick="if(event.target===this)closePaymentPeek()">
+  <div class="modal" style="width:520px">
+    <h2>👁 Проверка диалога</h2>
+    <p class="sub" id="payment-peek-sub">Тихий просмотр через аккаунт сотрудника — без «прочитано» и без сообщений.</p>
+    <div id="payment-peek-body"><div class="hint">Загрузка…</div></div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closePaymentPeek()">Закрыть</button>
+    </div>
+  </div>
+</div>
+
 <!-- ============ Модалка: забыли пароль ============ -->
 <div id="modal-reset" class="overlay hidden">
   <div class="modal">
@@ -2486,13 +2498,14 @@ function renderAdminPaymentAudit(data) {
       <div class="si-to">Решение: ${escapeHtml(adminLine)}${c.admin_note ? ` — ${escapeHtml(c.admin_note)}` : ""}</div>
       <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
         <button class="btn" onclick="adminReviewPaymentCase('${c.id}','confirmed','${suggested}')">✓ Подтвердить доход</button>
+        <button class="btn ghost" onclick="peekPaymentCase('${c.id}')">👁 Посмотреть тихо</button>
         <button class="btn ghost" onclick="adminReviewPaymentCase('${c.id}','needs_info',null)">Запросить пояснение</button>
         <button class="btn ghost" onclick="adminReviewPaymentCase('${c.id}','dismissed',null)">Не доход</button>
       </div>
     </div>`;
   }).join("") : `<div class="hint">За выбранный период сигналов нет.</div>`;
   box.innerHTML = `<h3>🔎 Оплаты и недельная сверка</h3>
-    <div class="hint">Сигнал из чата не является доказательством: сумму подтверждает администратор после ответа пользователя.</div>
+    <div class="hint">Сигнал из чата не является доказательством: сумму подтверждает администратор после ответа пользователя. «Посмотреть тихо» читает диалог глазами аккаунта сотрудника — без отметки прочитано.</div>
     <div class="hint">OCR: в работе ${Number(ocrQueue.active || 0)}${ocrDropped ? ` · пропущено защитными лимитами ${ocrDropped}` : ""}</div>
     <div style="margin:10px 0 14px">${summaryHtml || `<div class="hint">Пользователей пока нет.</div>`}</div>
     <div class="sched-list">${caseHtml}</div>`;
@@ -2515,6 +2528,49 @@ async function adminReviewPaymentCase(id, status, suggested) {
   if (!ok) return toast(data.error || "Не удалось сохранить решение", "bad");
   toast("Решение сохранено ✓", "ok");
   loadAdminUsers();
+}
+
+function closePaymentPeek() {
+  const box = el("modal-payment-peek");
+  if (box) box.classList.add("hidden");
+  const body = el("payment-peek-body");
+  if (body) body.innerHTML = "";
+}
+
+async function peekPaymentCase(id) {
+  const modal = el("modal-payment-peek");
+  const body = el("payment-peek-body");
+  const sub = el("payment-peek-sub");
+  if (!modal || !body) return;
+  body.innerHTML = `<div class="hint">Загрузка диалога…</div>`;
+  if (sub) sub.textContent = "Тихий просмотр через аккаунт сотрудника — без «прочитано» и без сообщений.";
+  modal.classList.remove("hidden");
+  const { ok, data } = await api(`/api/admin/payment-audit/cases/${id}/peek`);
+  if (!ok) {
+    body.innerHTML = `<div class="hint" style="color:var(--err)">${escapeHtml(data.error || "Не удалось открыть")}</div>`;
+    return;
+  }
+  const peer = data.peer || {};
+  const peerName = peer.username ? `${peer.name || ""} (@${peer.username})` : (peer.name || "клиент");
+  if (sub) {
+    sub.textContent = `${peerName} · ${_paymentAmountsLabel(data.case)} · ${data.hint || "тихо, только чтение"}`;
+  }
+  const photos = (data.photos || []).map(p =>
+    `<div style="margin:8px 0"><img src="${p.data_url}" alt="вложение" style="max-width:100%;border-radius:10px;border:1px solid var(--border)" /></div>`
+  ).join("");
+  const msgs = (data.messages || []).map(m => {
+    const who = m.direction === "outgoing" ? "аккаунт" : "клиент";
+    const when = (m.at || "").slice(11, 16);
+    return `<div class="si-to" style="margin-top:4px"><b>${who}</b>${when ? ` · ${when}` : ""}${m.has_media ? " · вложение" : ""}: ${escapeHtml(m.text || "")}</div>`;
+  }).join("") || `<div class="hint">Сообщений не видно</div>`;
+  body.innerHTML = `${photos}<div style="margin-top:8px">${msgs}</div>`;
+}
+
+function _paymentAmountsLabel(c) {
+  if (!c) return "";
+  const rows = (c.amounts || []).filter(a => Number(a.value) > 0);
+  if (!rows.length) return "сумма не распознана";
+  return rows.map(a => `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 }).format(Number(a.value))} ${a.currency === "RUB" ? "₽" : String(a.currency || "")}`).join(" · ");
 }
 
 async function loadAdminUsers() {

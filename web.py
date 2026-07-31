@@ -21,6 +21,7 @@ Telegram планировщик постов — веб-панель.
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import io
@@ -3178,6 +3179,100 @@ async def admin_payment_audit_review(case_id: str, body: PaymentCaseReviewIn,
             f"❓ Админ просит пояснение по оплате ({_payment_amounts_label(case)}): {note}"[:500],
         )
     return {"ok": True, "case": _audit_case_view(case, users=load_users())}
+
+
+@app.get("/api/admin/payment-audit/cases/{case_id}/peek")
+async def admin_payment_audit_peek(case_id: str, admin=Depends(require_admin)):
+    """Тихий просмотр диалога глазами рабочего аккаунта.
+
+    Только чтение: ничего не отправляем и не помечаем сообщения прочитанными.
+    Ссылка «открыть в Telegram» с телефона админа не подходит — диалог живёт
+    на чужой сессии сотрудника.
+    """
+    store = await _get_payment_audit_store_async()
+    if store is None:
+        return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
+    case = await asyncio.to_thread(store.get_case, case_id)
+    if not case:
+        return JSONResponse({"error": "Событие не найдено"}, status_code=404)
+    pid = case.get("profile_id")
+    chat_ref = case.get("chat_ref")
+    if not pid or not isinstance(chat_ref, int) or chat_ref <= 0:
+        return JSONResponse({"error": "Нет привязки к диалогу"}, status_code=404)
+    if not case.get("profile_active", True):
+        return JSONResponse({"error": "Профиль сотрудника уже отключён"}, status_code=404)
+
+    client = await get_client(pid)
+    if client is None or not await client.is_user_authorized():
+        return JSONResponse({"error": "Аккаунт сотрудника сейчас офлайн"}, status_code=503)
+
+    try:
+        entity = await client.get_entity(chat_ref)
+    except Exception:
+        return JSONResponse({"error": "Не удалось открыть диалог на аккаунте сотрудника"}, status_code=404)
+
+    peer = _brief(entity)
+    try:
+        # get_messages сам по себе не шлёт read-ack — клиент/сотрудник ничего не видит.
+        messages = await client.get_messages(entity, limit=12)
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"Не удалось прочитать историю: {type(exc).__name__}"},
+            status_code=502,
+        )
+
+    rows = []
+    photos = []
+    for msg in reversed(list(messages or [])):
+        text = (getattr(msg, "raw_text", None) or getattr(msg, "message", None) or "").strip()
+        has_media = getattr(msg, "media", None) is not None
+        if not text and has_media:
+            text = "[фото/файл]"
+        if not text:
+            continue
+        at = getattr(msg, "date", None)
+        rows.append({
+            "id": int(getattr(msg, "id", 0) or 0),
+            "direction": "outgoing" if bool(getattr(msg, "out", False)) else "incoming",
+            "text": mask_sensitive_text(text, 400),
+            "at": at.astimezone(timezone.utc).isoformat(timespec="seconds") if at else "",
+            "has_media": bool(has_media),
+        })
+        if (
+            len(photos) < 2
+            and has_media
+            and (
+                getattr(msg, "photo", None) is not None
+                or str(getattr(getattr(msg, "file", None), "mime_type", "") or "").startswith("image/")
+            )
+        ):
+            try:
+                raw = await client.download_media(msg, file=bytes)
+            except Exception:
+                raw = None
+            if isinstance(raw, (bytes, bytearray)) and 32 < len(raw) <= 2_500_000:
+                mime = "image/jpeg"
+                if raw[:8] == b"\x89PNG\r\n\x1a\n":
+                    mime = "image/png"
+                elif raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+                    mime = "image/webp"
+                photos.append({
+                    "message_id": int(getattr(msg, "id", 0) or 0),
+                    "direction": "outgoing" if bool(getattr(msg, "out", False)) else "incoming",
+                    "mime": mime,
+                    "data_url": f"data:{mime};base64,{base64.b64encode(bytes(raw)).decode('ascii')}",
+                })
+
+    view = _audit_case_view(case, users=load_users())
+    return {
+        "ok": True,
+        "quiet": True,
+        "case": view,
+        "peer": peer,
+        "messages": rows[-12:],
+        "photos": photos,
+        "hint": "Просмотр только для тебя. Сообщения не отмечены прочитанными, ничего не отправлено.",
+    }
 
 
 # ---------------------------------------------------------------------------
