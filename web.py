@@ -37,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs, urlencode
 
 from payment_audit import analyze_payment_signal
-from payment_audit_store import PaymentAuditStore, mask_sensitive_text
+from payment_audit_store import PaymentAuditStore, mask_sensitive_text, normalize_chat_context
 from receipt_ocr import (
     OcrLimits,
     RemoteReceiptOcr,
@@ -852,6 +852,71 @@ def _audit_signal_snippet(analysis):
     return mask_sensitive_text(" · ".join(fragments[:8]), 240)
 
 
+async def _payment_chat_context(client, chat_id, *, limit=5):
+    """Grab a short nearby window so admin can verify without opening Telegram."""
+    try:
+        messages = await client.get_messages(chat_id, limit=max(1, min(8, int(limit))))
+    except Exception:
+        return []
+    rows = []
+    for msg in reversed(list(messages or [])):
+        text = (getattr(msg, "raw_text", None) or getattr(msg, "message", None) or "").strip()
+        if not text:
+            if getattr(msg, "media", None) is not None:
+                text = "[фото/файл]"
+            else:
+                continue
+        rows.append({
+            "direction": "outgoing" if bool(getattr(msg, "out", False)) else "incoming",
+            "snippet": text,
+        })
+    return normalize_chat_context(rows, limit=5, snippet_limit=120)
+
+
+def _payment_amounts_label(case):
+    amounts = [
+        a for a in (case.get("amounts") or [])
+        if isinstance(a, dict) and float(a.get("value") or 0) > 0
+    ]
+    if not amounts:
+        return "сумма не распознана"
+    parts = []
+    for a in amounts[:3]:
+        value = float(a.get("value") or 0)
+        currency = a.get("currency") or "RUB"
+        suffix = "₽" if currency == "RUB" else str(currency)
+        parts.append(f"{value:g} {suffix}")
+    return " · ".join(parts)
+
+
+def _notify_admins_payment_case(case, *, owner_name=""):
+    """Surface a fresh medium/high case in the admin panel notifications."""
+    if (case or {}).get("level") not in {"high", "medium"}:
+        return
+    if case.get("created_at") != case.get("updated_at"):
+        return
+    context = case.get("context") or []
+    if context:
+        preview = " | ".join(
+            ("аккаунт" if row.get("direction") == "outgoing" else "клиент")
+            + f": «{row.get('snippet')}»"
+            for row in context[-3:]
+        )
+    else:
+        evidence = case.get("evidence") or []
+        snippets = [str(e.get("snippet") or "") for e in evidence if e.get("snippet")]
+        preview = " · ".join(snippets[-2:]) or "сигнал без текста"
+    who = owner_name or case.get("owner") or "?"
+    level = "высокая" if case.get("level") == "high" else "средняя"
+    text = (
+        f"💳 Оплата ({level}): {who} · {_payment_amounts_label(case)} · "
+        f"{case.get('chat_label') or 'диалог'}. {preview}"
+    )
+    for user in load_users():
+        if user.get("is_admin") and user.get("status") == "approved":
+            _add_notification(user["id"], case.get("profile_id") or "", "warn", text[:500])
+
+
 def _contextualize_payment_analysis(analysis, *, direction, is_forwarded=False):
     """Interpret a phrase from the work account's point of view.
 
@@ -1178,7 +1243,8 @@ async def _audit_receipt_media(client, event, *, owner, pid, chat_id, direction,
     ocr_version = "ocr:" + _payment_event_version(
         event, message_source, getattr(event, "raw_text", "") or ""
     )
-    await _record_payment_event(
+    context = await _payment_chat_context(client, chat_id)
+    case = await _record_payment_event(
         store,
         owner=owner,
         pid=pid,
@@ -1194,7 +1260,11 @@ async def _audit_receipt_media(client, event, *, owner, pid, chat_id, direction,
         # amount/categories for this exact Telegram message are replaced.
         source="edited" if message_source == "edited" else "ocr",
         media_hash=result.media_sha256,
+        context=context,
     )
+    if case:
+        owner_user = get_user(owner) or {}
+        _notify_admins_payment_case(case, owner_name=owner_user.get("username") or "")
 
 
 async def _handle_payment_message(client, pid, event, *, source="message"):
@@ -1231,8 +1301,14 @@ async def _handle_payment_message(client, pid, event, *, source="message"):
         event_version = _payment_event_version(event, source, text)
         message_ref = store.message_ref(pid, event.chat_id, event.id)
         chat_key = store.chat_key(pid, event.chat_id)
+        context = None
+        if analysis.get("detected") or (
+            analysis.get("money_mentioned") and source != "edited"
+        ):
+            context = await _payment_chat_context(client, event.chat_id)
+        case = None
         if analysis.get("detected"):
-            await _record_payment_event(
+            case = await _record_payment_event(
                 store,
                 owner=owner,
                 pid=pid,
@@ -1245,6 +1321,7 @@ async def _handle_payment_message(client, pid, event, *, source="message"):
                 analysis=analysis,
                 snippet=_audit_signal_snippet(analysis),
                 source=source,
+                context=context,
             )
         elif analysis.get("money_mentioned") and source != "edited":
             # Про деньги в этом сообщении говорили, но на полноценный сигнал не
@@ -1262,7 +1339,7 @@ async def _handle_payment_message(client, pid, event, *, source="message"):
                 "income_claim": False,
                 "level": "low",
             })
-            await _record_payment_event(
+            case = await _record_payment_event(
                 store,
                 owner=owner,
                 pid=pid,
@@ -1275,7 +1352,10 @@ async def _handle_payment_message(client, pid, event, *, source="message"):
                 analysis=weak,
                 snippet=_audit_signal_snippet(weak),
                 source=source,
+                context=context,
             )
+        if case:
+            _notify_admins_payment_case(case, owner_name=(user or {}).get("username") or "")
         elif source == "edited":
             # An edited message that used to be a payment signal is material:
             # keep the historical evidence but remove its live amount/status.
@@ -3089,6 +3169,14 @@ async def admin_payment_audit_review(case_id: str, body: PaymentCaseReviewIn,
         return JSONResponse({"error": "Неверное решение или сумма"}, status_code=400)
     except KeyError:
         return JSONResponse({"error": "Событие не найдено"}, status_code=404)
+    if body.status == "needs_info":
+        note = (body.note or "").strip() or "нужно пояснение по этому сигналу"
+        _add_notification(
+            case.get("owner"),
+            case.get("profile_id") or "",
+            "warn",
+            f"❓ Админ просит пояснение по оплате ({_payment_amounts_label(case)}): {note}"[:500],
+        )
     return {"ok": True, "case": _audit_case_view(case, users=load_users())}
 
 

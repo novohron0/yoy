@@ -80,6 +80,41 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("5 000 ₽", snippet)
         self.assertNotIn("Секретная", snippet)
 
+    async def test_passes_nearby_chat_context_for_quick_review(self):
+        store = MagicMock()
+        store.chat_key.return_value = "CHATKEY"
+        store.event_key.return_value = "EVENTKEY"
+        store.record_event.return_value = {
+            "level": "high",
+            "created_at": "t1",
+            "updated_at": "t2",
+            "amounts": [],
+            "evidence": [],
+            "context": [],
+            "owner": "u1",
+            "profile_id": "p1",
+            "chat_label": "Диалог #ABC",
+        }
+        client = AsyncMock()
+        # Telethon отдаёт историю newest-first — как в реальном get_messages.
+        client.get_messages.return_value = [
+            SimpleNamespace(raw_text="Скинул 5 000 ₽ по СБП", out=False, media=None, message="Скинул 5 000 ₽ по СБП"),
+            SimpleNamespace(raw_text="5000", out=True, media=None, message="5000"),
+            SimpleNamespace(raw_text="Сколько?", out=False, media=None, message="Сколько?"),
+        ]
+        with (
+            patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
+            patch.object(web, "get_user", return_value=self.work_user()),
+            patch.object(web, "payment_audit_store", store),
+        ):
+            await web._handle_payment_message(client, "p1", FakeEvent())
+
+        context = store.record_event.call_args.kwargs["context"]
+        self.assertGreaterEqual(len(context), 2)
+        self.assertEqual(context[0]["direction"], "incoming")
+        self.assertIn("Сколько", context[0]["snippet"])
+        self.assertEqual(context[1]["direction"], "outgoing")
+
     async def test_outgoing_sent_money_is_not_income(self):
         store = MagicMock()
         store.chat_key.return_value = "CHATKEY"

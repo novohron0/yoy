@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from payment_audit_store import PaymentAuditStore, mask_sensitive_text
+from payment_audit_store import PaymentAuditStore, mask_sensitive_text, normalize_chat_context
 
 
 class PaymentAuditStoreTests(unittest.TestCase):
@@ -43,6 +43,7 @@ class PaymentAuditStoreTests(unittest.TestCase):
         message_ref=None,
         event_version=None,
         snippet=None,
+        context=None,
     ):
         at = at or datetime(2026, 7, 30, 10, minute, tzinfo=timezone.utc)
         message_id = suffix if message_id is None else message_id
@@ -75,6 +76,26 @@ class PaymentAuditStoreTests(unittest.TestCase):
             media_hash=media_hash,
             chat_ref=chat_ref,
             message_ref=message_ref,
+            context=context,
+        )
+
+    def test_chat_context_is_masked_and_exposed_on_case(self):
+        case = self.record(
+            "ctx",
+            context=[
+                {"direction": "incoming", "snippet": "Сколько стоит?"},
+                {"direction": "outgoing", "snippet": "5000, карта 40817810099910004312"},
+                {"direction": "incoming", "snippet": "Ок, скинул"},
+            ],
+        )
+        self.assertEqual(len(case["context"]), 3)
+        self.assertEqual(case["context"][0]["snippet"], "Сколько стоит?")
+        self.assertIn("••••", case["context"][1]["snippet"])
+        self.assertNotIn("40817810099910004312", case["context"][1]["snippet"])
+        self.assertEqual(case["evidence"][0]["context"][-1]["snippet"], "Ок, скинул")
+        self.assertEqual(
+            normalize_chat_context([{"direction": "incoming", "snippet": "  a  "}])[0]["snippet"],
+            "a",
         )
 
     def test_masks_financial_and_contact_identifiers_but_keeps_amount(self):

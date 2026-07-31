@@ -95,6 +95,25 @@ def mask_sensitive_text(text: str, limit: int = 240) -> str:
     return clean[: max(0, int(limit))]
 
 
+def normalize_chat_context(context, *, limit: int = 5, snippet_limit: int = 120) -> list[dict]:
+    """Keep a short masked window of surrounding chat lines for quick review."""
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for item in context or []:
+        if not isinstance(item, dict):
+            continue
+        snippet = mask_sensitive_text(str(item.get("snippet") or ""), snippet_limit)
+        if not snippet:
+            continue
+        direction = "outgoing" if item.get("direction") == "outgoing" else "incoming"
+        key = f"{direction}:{snippet.casefold()}"
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"direction": direction, "snippet": snippet})
+    return rows[-max(1, int(limit)):]
+
+
 class PaymentAuditStore:
     """Small transactional store; a fresh SQLite connection is used per call."""
 
@@ -576,6 +595,7 @@ class PaymentAuditStore:
         media_hash: str = "",
         message_ref: str | None = None,
         chat_ref: int | str | None = None,
+        context: list | None = None,
     ) -> dict:
         """Insert one event and conservatively correlate it with an open case.
 
@@ -712,6 +732,7 @@ class PaymentAuditStore:
             if duplicate_media:
                 categories.add("duplicate_receipt")
 
+            context_rows = normalize_chat_context(context)
             evidence = {
                 "at": at,
                 "direction": direction,
@@ -723,6 +744,8 @@ class PaymentAuditStore:
                 "income_claim": income_claim,
                 "attribution": attribution,
             }
+            if context_rows:
+                evidence["context"] = context_rows
 
             if row:
                 case_id = row["id"]
@@ -918,6 +941,24 @@ class PaymentAuditStore:
         if not out["profile_active"]:
             out["profile_id"] = None
         out["chat_label"] = f"Диалог #{out.get('chat_key', '')[-6:]}"
+        context_rows: list[dict] = []
+        seen_context: set[str] = set()
+        for item in out.get("evidence") or []:
+            if not isinstance(item, dict):
+                continue
+            for row in item.get("context") or []:
+                if not isinstance(row, dict):
+                    continue
+                snippet = str(row.get("snippet") or "").strip()
+                if not snippet:
+                    continue
+                direction = "outgoing" if row.get("direction") == "outgoing" else "incoming"
+                key = f"{direction}:{snippet.casefold()}"
+                if key in seen_context:
+                    continue
+                seen_context.add(key)
+                context_rows.append({"direction": direction, "snippet": snippet})
+        out["context"] = context_rows[-5:]
         return out
 
     def get_case(self, case_id: str) -> dict:

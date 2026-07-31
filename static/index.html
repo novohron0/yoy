@@ -1152,6 +1152,18 @@ function paymentEvidence(c, maxRows) {
   }).join("");
 }
 
+function paymentChatContext(c, maxRows) {
+  const rows = (c.context && c.context.length)
+    ? c.context
+    : (c.evidence || []).flatMap(e => e.context || []);
+  if (!rows.length) return "";
+  const body = rows.slice(-(maxRows || 5)).map(e => {
+    const arrow = e.direction === "outgoing" ? "аккаунт →" : "клиент →";
+    return `<div class="si-to" style="margin-top:2px">${arrow} «${escapeHtml(e.snippet || "")}»</div>`;
+  }).join("");
+  return `<div class="si-to" style="margin-top:6px;color:var(--accent-3)">переписка рядом:</div>${body}`;
+}
+
 function paymentLevel(c) {
   if (c.level === "high") return { text: "высокая уверенность", color: "var(--err)" };
   if (c.level === "medium") return { text: "средняя уверенность", color: "var(--accent-3)" };
@@ -1197,7 +1209,8 @@ async function loadPaymentAudit() {
       <div class="si-text" style="font-weight:600">${paymentAmounts(c)}</div>
       <div class="si-to">${escapeHtml(c.profile_name || "")} · ${escapeHtml(cats || "возможная оплата")}</div>
       ${paymentEvidence(c, 3)}
-      <div class="si-to" style="margin-top:5px">${escapeHtml(PAYMENT_USER_STATUS[c.user_status] || c.user_status)} · ${escapeHtml(PAYMENT_ADMIN_STATUS[c.admin_status] || c.admin_status)}</div>
+      ${paymentChatContext(c, 5)}
+      <div class="si-to" style="margin-top:5px">${escapeHtml(PAYMENT_USER_STATUS[c.user_status] || c.user_status)} · ${escapeHtml(PAYMENT_ADMIN_STATUS[c.admin_status] || c.admin_status)}${c.admin_note ? ` — ${escapeHtml(c.admin_note)}` : ""}</div>
       <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
         <button class="btn ghost" onclick="respondPaymentCase('${c.id}','income')">✓ Это доход</button>
         <button class="btn ghost" onclick="respondPaymentCase('${c.id}','not_received')">Не поступило</button>
@@ -2468,8 +2481,9 @@ function renderAdminPaymentAudit(data) {
       <div class="si-to">${escapeHtml(c.profile_name || "")} · ${escapeHtml((c.last_at || "").slice(0,16).replace("T"," "))}</div>
       <div class="si-to" style="${duplicate ? "color:var(--err);font-weight:700" : ""}">${escapeHtml(cats || "возможная оплата")}</div>
       ${paymentEvidence(c, 4)}
+      ${paymentChatContext(c, 5)}
       <div class="si-to" style="margin-top:5px">Ответ: ${escapeHtml(userLine)}</div>
-      <div class="si-to">Решение: ${escapeHtml(adminLine)}</div>
+      <div class="si-to">Решение: ${escapeHtml(adminLine)}${c.admin_note ? ` — ${escapeHtml(c.admin_note)}` : ""}</div>
       <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
         <button class="btn" onclick="adminReviewPaymentCase('${c.id}','confirmed','${suggested}')">✓ Подтвердить доход</button>
         <button class="btn ghost" onclick="adminReviewPaymentCase('${c.id}','needs_info',null)">Запросить пояснение</button>
