@@ -329,6 +329,18 @@
     <span id="renew-text" style="flex:1;font-size:14px"></span>
     <button class="btn ghost" onclick="el('renew-banner').classList.add('hidden')">Понятно</button>
   </div>
+  <div id="payment-audit-consent" class="hidden" style="background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--accent-3);padding:14px 16px;border-radius:12px;margin-bottom:14px;line-height:1.55">
+    <b>🔎 Проверка оплат в рабочих аккаунтах</b>
+    <div class="hint" style="margin-top:6px;font-size:13px">
+      Сервис будет автоматически проверять <b>новые</b> входящие и исходящие рабочие сообщения на признаки перевода,
+      суммы и банковские чеки. Сигнал не доказывает перевод — окончательное решение принимает администратор.
+      Замаскированные фрагменты и результаты проверки хранятся до 60 дней, недельные декларации и история их изменений — до 370 дней;
+      локальная копия изображения после изолированного распознавания удаляется. Личные аккаунты подключать нельзя.
+      Включая проверку, ты подтверждаешь право обрабатывать эти рабочие сообщения и обязуешься уведомить собеседников.
+    </div>
+    <button class="btn" style="margin-top:10px" onclick="acceptPaymentAudit()">Понимаю и согласен(на) — включить</button>
+  </div>
+  <div id="payment-audit-active" class="hidden" style="color:var(--ok);font-size:13px;margin:0 0 12px">✓ Проверка оплат в рабочих аккаунтах включена</div>
   <div id="notif-banner" class="hidden" style="background:var(--panel-3);border-left:3px solid var(--err);padding:12px 14px;border-radius:10px;margin-bottom:14px">
     <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:8px">
       <b style="font-size:14px">🔔 Уведомления</b>
@@ -473,6 +485,21 @@
     <div id="send-progress-fails" style="margin-top:6px"></div>
   </div>
 
+  <!-- Проверка оплат в рабочих личных диалогах -->
+  <div class="section" id="payment-audit-section" style="margin-top:24px">
+    <h3>🔎 Проверка оплат</h3>
+    <div id="payment-audit-summary" class="hint">Загрузка…</div>
+    <div id="payment-week-form" class="hidden" style="margin-top:12px">
+      <label>Заработок за текущую неделю, ₽</label>
+      <div class="row" style="align-items:center;gap:8px">
+        <div><input id="payment-week-amount" type="number" min="0" step="1" placeholder="Например, 25000"></div>
+        <button class="btn ghost" style="flex:0 0 auto" onclick="savePaymentWeek()">Сохранить</button>
+      </div>
+      <div id="payment-week-note" class="hint" style="margin-top:5px"></div>
+    </div>
+    <div class="sched-list" id="payment-audit-cases" style="margin-top:12px"></div>
+  </div>
+
   <!-- Активные расписания -->
   <div class="section" id="sched-section" style="margin-top:24px">
     <h3>Запланированные отправки</h3>
@@ -494,6 +521,7 @@
   </div>
   <div class="hint" style="margin-bottom:16px">Одобряй или блокируй тех, кто зарегистрировался. Войти и пользоваться могут только одобренные.</div>
   <div class="section" id="admin-summary" style="display:none"></div>
+  <div class="section" id="admin-payment-audit"><div class="hint">Проверка оплат загружается…</div></div>
   <div class="section"><div class="sched-list" id="admin-list"></div></div>
 </div>
 
@@ -857,6 +885,7 @@ let state = {
   schedMode: "daily",   // "daily" | "interval"
   profilesById: {},
   billing: null,
+  paymentAudit: null,
   editingSid: null,
   lastSearch: [],
   helpReturn: null,   // куда вернуться из обучения
@@ -894,6 +923,7 @@ function toast(msg, kind) {
 // ---------- экран профилей ----------
 async function loadProfiles() {
   loadNotifs();
+  loadPaymentAuditConsent();
   refreshAdminBadge();
   const { data } = await api("/api/profiles");
   const grid = el("profiles-grid");
@@ -1076,6 +1106,182 @@ async function markNotifsRead() {
   el("notif-banner").classList.add("hidden");
 }
 
+// ---------- прозрачная проверка оплат в рабочих аккаунтах ----------
+function money(v) {
+  const n = Number(v || 0);
+  return new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 }).format(n) + " ₽";
+}
+
+const PAYMENT_USER_STATUS = {
+  pending: "ждёт ответа",
+  income: "пользователь: это доход",
+  not_received: "пользователь: деньги не поступили",
+  personal: "пользователь: личный перевод",
+  refund: "пользователь: возврат",
+  duplicate: "пользователь: дубликат",
+  disputed: "пользователь оспаривает",
+};
+const PAYMENT_ADMIN_STATUS = {
+  pending: "не проверено администратором",
+  confirmed: "подтверждено",
+  dismissed: "не является доходом",
+  needs_info: "нужно пояснение",
+};
+const PAYMENT_CATEGORY = {
+  transfer_completed: "сообщили о переводе",
+  payment_confirmation: "подтвердили получение",
+  payment_intent: "собираются оплатить",
+  purchase_intent: "покупают/берут",
+  payment_request: "запросили реквизиты",
+  payment_method: "карта/СБП",
+  receipt: "чек",
+  receipt_ocr: "чек распознан",
+  payment_negation: "перевод не состоялся",
+  refund_or_reversal: "возврат/отмена",
+  duplicate_receipt: "чек уже встречался",
+  outgoing_transfer: "аккаунт сам отправлял деньги",
+  counterparty_received: "клиент сообщил, что получил деньги",
+  forwarded_receipt: "пересланный чек",
+  forwarded_evidence: "пересланное сообщение",
+  uncertain_claim: "вопрос или неуверенное утверждение",
+  message_retracted: "сообщение изменено — признаки оплаты удалены",
+  amount: "найдена сумма",
+  negated: "есть отрицание",
+};
+
+async function loadPaymentAuditConsent() {
+  const { ok, data } = await api("/api/payment-audit");
+  if (!ok) return;
+  state.paymentAudit = data;
+  if (!data.available) {
+    el("payment-audit-consent").classList.add("hidden");
+    el("payment-audit-active").classList.remove("hidden");
+    el("payment-audit-active").style.color = "var(--err)";
+    el("payment-audit-active").textContent = "⚠ Проверка оплат временно недоступна; рассылки продолжают работать";
+    return;
+  }
+  el("payment-audit-active").style.color = "var(--ok)";
+  el("payment-audit-active").textContent = "✓ Проверка оплат в рабочих аккаунтах включена";
+  el("payment-audit-consent").classList.toggle("hidden", !!data.consented);
+  el("payment-audit-active").classList.toggle("hidden", !data.consented);
+}
+
+async function acceptPaymentAudit() {
+  const { ok, data } = await post("/api/payment-audit/consent", { accept: true });
+  if (!ok) return toast(data.error || "Не удалось включить", "bad");
+  toast("Проверка новых рабочих сообщений включена ✓", "ok");
+  loadPaymentAuditConsent();
+}
+
+function paymentAmounts(c) {
+  const rows = (c.amounts || []).filter(a => Number(a.value) > 0);
+  if (!rows.length) return "сумма не распознана";
+  return rows.map(a => `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 }).format(Number(a.value))} ${a.currency === "RUB" ? "₽" : escapeHtml(String(a.currency || ""))}`).join(" · ");
+}
+
+function paymentEvidence(c, maxRows) {
+  return (c.evidence || []).slice(-(maxRows || 3)).map(e => {
+    const arrow = e.direction === "outgoing" ? "аккаунт →" : "клиент →";
+    const text = e.snippet ? `«${escapeHtml(e.snippet)}»` : (e.source === "ocr" ? "чек распознан" : "сигнал");
+    return `<div class="si-to" style="margin-top:3px">${arrow} · ${text}</div>`;
+  }).join("");
+}
+
+function paymentLevel(c) {
+  if (c.level === "high") return { text: "высокая уверенность", color: "var(--err)" };
+  if (c.level === "medium") return { text: "средняя уверенность", color: "var(--accent-3)" };
+  return { text: "слабый сигнал", color: "var(--muted)" };
+}
+
+async function loadPaymentAudit() {
+  const summary = el("payment-audit-summary"), list = el("payment-audit-cases");
+  if (!summary || !list) return;
+  const { ok, data } = await api("/api/payment-audit");
+  if (!ok) { summary.textContent = "Не удалось загрузить проверку оплат"; return; }
+  state.paymentAudit = data;
+  if (!data.available) {
+    summary.innerHTML = `<span style="color:var(--err)">Проверка оплат временно недоступна.</span> Рассылки при этом продолжают работать.`;
+    el("payment-week-form").classList.add("hidden");
+    list.innerHTML = "";
+    return;
+  }
+  if (!data.consented) {
+    summary.innerHTML = `Проверка ещё не включена. Вернись к списку профилей и подтверди анализ рабочих диалогов.`;
+    el("payment-week-form").classList.add("hidden");
+    list.innerHTML = "";
+    return;
+  }
+  const s = data.summary || {};
+  summary.innerHTML = `За текущую неделю: <b>${s.pending || 0}</b> непроверенных сигналов${s.high ? ` · <span style="color:var(--err)">${s.high} высокой уверенности</span>` : ""}`
+    + ` · подтверждено <b>${money(s.confirmed_total)}</b> · 15% = <b>${money(s.commission)}</b>`
+    + `${data.ocr_available ? " · OCR чеков работает" : " · ⚠️ OCR чеков временно недоступен"}`
+    + `<div style="margin-top:5px"><a href="#" onclick="revokePaymentAudit();return false" class="hint">отозвать согласие и остановить анализ новых сообщений</a></div>`;
+  el("payment-week-form").classList.remove("hidden");
+  const report = data.week_report;
+  const previousReport = (data.week_reports || []).find(r => r.week_start !== data.week_start);
+  el("payment-week-amount").value = report ? report.amount : "";
+  el("payment-week-note").textContent = report
+    ? `Заявлено: ${money(report.amount)} · 15% = ${money(Number(report.amount) * 0.15)}`
+      + `${previousReport ? ` · прошлая неделя: ${money(previousReport.amount)}` : ""}`
+    : `Неделя с ${data.week_start}: сумма пока не заявлена.`
+      + `${previousReport ? ` Прошлая неделя: ${money(previousReport.amount)}.` : ""}`;
+
+  const casesRes = await api("/api/payment-audit/cases?days=7&limit=100");
+  if (!casesRes.ok) { list.innerHTML = `<div class="hint">${escapeHtml(casesRes.data.error || "Ошибка")}</div>`; return; }
+  const cases = casesRes.data.cases || [];
+  if (!cases.length) { list.innerHTML = `<div class="hint">Платёжных сигналов пока нет.</div>`; return; }
+  list.innerHTML = cases.map(c => {
+    const level = paymentLevel(c);
+    const cats = (c.categories || []).filter(x => PAYMENT_CATEGORY[x]).map(x => PAYMENT_CATEGORY[x]).slice(0, 5).join(" · ");
+    const answered = c.user_status !== "pending";
+    return `<div class="sched-item" style="display:block">
+      <div class="si-when" style="color:${level.color}">${level.text} · ${escapeHtml(c.chat_label)} · ${escapeHtml((c.last_at || "").slice(0, 16).replace("T", " "))}${c.chat_link ? ` · <a href="${escapeHtml(c.chat_link)}">открыть в Telegram</a>` : ""}</div>
+      <div class="si-text" style="font-weight:600">${paymentAmounts(c)}</div>
+      <div class="si-to">${escapeHtml(c.profile_name || "")} · ${escapeHtml(cats || "возможная оплата")}</div>
+      ${paymentEvidence(c, 3)}
+      <div class="si-to" style="margin-top:5px">${escapeHtml(PAYMENT_USER_STATUS[c.user_status] || c.user_status)} · ${escapeHtml(PAYMENT_ADMIN_STATUS[c.admin_status] || c.admin_status)}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+        <button class="btn ghost" onclick="respondPaymentCase('${c.id}','income')">✓ Это доход</button>
+        <button class="btn ghost" onclick="respondPaymentCase('${c.id}','not_received')">Не поступило</button>
+        <button class="btn ghost" onclick="respondPaymentCase('${c.id}','personal')">Личный перевод</button>
+        <button class="btn ghost" onclick="respondPaymentCase('${c.id}','refund')">Возврат</button>
+        <button class="btn ghost" onclick="respondPaymentCase('${c.id}','duplicate')">Дубликат</button>
+        ${answered ? `<button class="btn ghost" onclick="respondPaymentCase('${c.id}','disputed')">Оспорить</button>` : ""}
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function respondPaymentCase(id, status) {
+  let note = "";
+  if (status !== "income") {
+    const entered = prompt("Короткое пояснение (необязательно):", "");
+    if (entered === null) return;
+    note = entered;
+  }
+  const { ok, data } = await post(`/api/payment-audit/cases/${id}/respond`, { status, note });
+  if (!ok) return toast(data.error || "Не удалось сохранить", "bad");
+  toast("Ответ сохранён ✓", "ok");
+  loadPaymentAudit();
+}
+
+async function savePaymentWeek() {
+  const amount = Number(el("payment-week-amount").value);
+  if (!Number.isFinite(amount) || amount < 0) return toast("Укажи сумму за неделю", "bad");
+  const { ok, data } = await post("/api/payment-audit/week", { amount });
+  if (!ok) return toast(data.error || "Не удалось сохранить", "bad");
+  toast(`Заявлено ${money(amount)} · 15% = ${money(data.commission)}`, "ok");
+  loadPaymentAudit();
+}
+
+async function revokePaymentAudit() {
+  if (!confirm("Остановить анализ новых сообщений? Администратор увидит, что проверка отключена.")) return;
+  const { ok, data } = await post("/api/payment-audit/consent", { accept: false });
+  if (!ok) return toast(data.error || "Не удалось отключить", "bad");
+  toast("Анализ новых сообщений остановлен", "ok");
+  loadPaymentAudit(); loadPaymentAuditConsent();
+}
+
 // Счётчик запросов на смену пароля на кнопке «Пользователи» — чтобы новые
 // запросы бросались в глаза с главного экрана, без открытия панели.
 function setAdminBadge(pending) {
@@ -1235,6 +1441,7 @@ function enterCompose(pid, name) {
   renderInactiveBanner();
   loadPacks();
   loadSchedules();
+  loadPaymentAudit();
 }
 
 function editSchedule(s) {
@@ -2279,14 +2486,87 @@ function adminStatsHtml(st) {
     ${recent ? `<details style="margin-top:3px"><summary class="si-to" style="cursor:pointer;color:var(--muted)">последние рассылки + текст</summary>${recent}</details>` : ""}`;
 }
 
+function renderAdminPaymentAudit(data) {
+  const box = el("admin-payment-audit");
+  if (!box) return;
+  if (!data) { box.innerHTML = `<div class="hint">Проверка оплат недоступна.</div>`; return; }
+  const summaries = (data.summaries || []).filter(s => !String(s.username || "").startsWith("admin") || s.cases || s.week_report);
+  const ocrQueue = data.ocr_queue || { active: 0, dropped: {} };
+  const ocrDropped = Object.values(ocrQueue.dropped || {}).reduce((sum, value) => sum + Number(value || 0), 0);
+  const summaryHtml = summaries.map(s => {
+    const declared = s.week_report ? money(s.week_report.amount) : "не заявлено";
+    const previous = (s.week_reports || []).find(r => r.week_start !== data.week_start);
+    const consentOff = (s.consent_history || []).filter(item => item.action === "disabled");
+    const consent = s.consented ? `<span style="color:var(--ok)">контроль включён</span>` : `<span style="color:var(--err)">контроль не подтверждён</span>`;
+    const declaredFee = s.week_report ? ` (15% = ${money(Number(s.week_report.amount) * 0.15)})` : "";
+    return `<div class="si-to" style="margin:5px 0"><b>${escapeHtml(s.username)}</b> · ${consent} · заявлено ${declared}${declaredFee}`
+      + `${previous ? ` · прошлая неделя ${money(previous.amount)}` : ""}`
+      + `${s.week_report && (s.week_report.history || []).length > 1 ? ` · правок суммы: ${(s.week_report.history || []).length - 1}` : ""}`
+      + `${consentOff.length ? ` · <span style="color:var(--err)">отключений контроля: ${consentOff.length}</span>` : ""}`
+      + ` · сигналов ${s.cases || 0}, ждут ${s.pending || 0}${s.high ? ` (${s.high} важных)` : ""}`
+      + ` · подтверждено ${money(s.confirmed_total)} · 15% = <b>${money(s.commission)}</b></div>`;
+  }).join("");
+  const cases = data.cases || [];
+  const caseHtml = cases.length ? cases.map(c => {
+    const level = paymentLevel(c);
+    const rubAmounts = [...new Set((c.amounts || []).filter(a => a.currency === "RUB").map(a => Number(a.value) || 0).filter(v => v > 0))];
+    const suggested = rubAmounts.length === 1 ? rubAmounts[0] : "";
+    const cats = (c.categories || []).filter(x => PAYMENT_CATEGORY[x]).map(x => PAYMENT_CATEGORY[x]).slice(0, 7).join(" · ");
+    const duplicate = (c.categories || []).includes("duplicate_receipt");
+    const userLine = `${PAYMENT_USER_STATUS[c.user_status] || c.user_status}${c.user_note ? ` — ${c.user_note}` : ""}`;
+    const adminLine = `${PAYMENT_ADMIN_STATUS[c.admin_status] || c.admin_status}${c.admin_amount != null ? ` · ${money(c.admin_amount)}` : ""}`;
+    return `<div class="sched-item" style="display:block">
+      <div class="si-when" style="color:${level.color}">${escapeHtml(c.username || "")} · ${level.text} · ${escapeHtml(c.chat_label || "")}${c.chat_link ? ` · <a href="${escapeHtml(c.chat_link)}">открыть в Telegram</a>` : ""}</div>
+      <div class="si-text" style="font-weight:600">${paymentAmounts(c)}</div>
+      <div class="si-to">${escapeHtml(c.profile_name || "")} · ${escapeHtml((c.last_at || "").slice(0,16).replace("T"," "))}</div>
+      <div class="si-to" style="${duplicate ? "color:var(--err);font-weight:700" : ""}">${escapeHtml(cats || "возможная оплата")}</div>
+      ${paymentEvidence(c, 4)}
+      <div class="si-to" style="margin-top:5px">Ответ: ${escapeHtml(userLine)}</div>
+      <div class="si-to">Решение: ${escapeHtml(adminLine)}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+        <button class="btn" onclick="adminReviewPaymentCase('${c.id}','confirmed','${suggested}')">✓ Подтвердить доход</button>
+        <button class="btn ghost" onclick="adminReviewPaymentCase('${c.id}','needs_info',null)">Запросить пояснение</button>
+        <button class="btn ghost" onclick="adminReviewPaymentCase('${c.id}','dismissed',null)">Не доход</button>
+      </div>
+    </div>`;
+  }).join("") : `<div class="hint">За выбранный период сигналов нет.</div>`;
+  box.innerHTML = `<h3>🔎 Оплаты и недельная сверка</h3>
+    <div class="hint">Сигнал из чата не является доказательством: сумму подтверждает администратор после ответа пользователя.</div>
+    <div class="hint">OCR: в работе ${Number(ocrQueue.active || 0)}${ocrDropped ? ` · пропущено защитными лимитами ${ocrDropped}` : ""}</div>
+    <div style="margin:10px 0 14px">${summaryHtml || `<div class="hint">Пользователей пока нет.</div>`}</div>
+    <div class="sched-list">${caseHtml}</div>`;
+}
+
+async function adminReviewPaymentCase(id, status, suggested) {
+  let amount = null, note = "";
+  if (status === "confirmed") {
+    const entered = prompt("Подтверждённая сумма дохода, ₽:", suggested || "");
+    if (entered === null) return;
+    amount = Number(String(entered).replace(",", "."));
+    if (!Number.isFinite(amount) || amount < 0) return toast("Неверная сумма", "bad");
+    note = prompt("Комментарий к проверке (необязательно):", "") || "";
+  } else {
+    const entered = prompt(status === "needs_info" ? "Какое пояснение запросить?" : "Почему это не доход?", "");
+    if (entered === null) return;
+    note = entered;
+  }
+  const { ok, data } = await post(`/api/admin/payment-audit/cases/${id}/review`, { status, amount, note });
+  if (!ok) return toast(data.error || "Не удалось сохранить решение", "bad");
+  toast("Решение сохранено ✓", "ok");
+  loadAdminUsers();
+}
+
 async function loadAdminUsers() {
   const box = el("admin-list");
   box.innerHTML = `<div class="hint">Загрузка…</div>`;
-  const [{ ok, data }, statsRes] = await Promise.all([api("/api/admin/users"), api("/api/admin/stats")]);
+  const [{ ok, data }, statsRes, paymentRes] = await Promise.all([
+    api("/api/admin/users"), api("/api/admin/stats"), api("/api/admin/payment-audit?days=7")
+  ]);
   if (!ok) { box.innerHTML = `<div class="hint">${escapeHtml(data.error || "Ошибка")}</div>`; return; }
   const statsById = {};
   if (statsRes.ok) for (const s of (statsRes.data.stats || [])) statsById[s.id] = s;
   renderAdminSummary(data.users || [], statsById);
+  renderAdminPaymentAudit(paymentRes.ok ? paymentRes.data : null);
   box.innerHTML = "";
   for (const u of (data.users || [])) {
     const me = state.me && u.id === state.me.id;

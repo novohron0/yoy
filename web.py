@@ -29,10 +29,20 @@ import os
 import random
 import re
 import secrets
+import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs, urlencode
+
+from payment_audit import analyze_payment_signal
+from payment_audit_store import PaymentAuditStore, mask_sensitive_text
+from receipt_ocr import (
+    OcrLimits,
+    RemoteReceiptOcr,
+    ReceiptOcrError,
+)
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
@@ -73,6 +83,7 @@ CLONES_DIR = os.path.join(PROFILES_DIR, "clones")  # снимки настрое
 NOTIFS_KEEP = int(os.environ.get("NOTIFS_KEEP", "100"))
 RESPONSES_JSON = os.path.join(PROFILES_DIR, "responses.json")  # счётчик входящих в личку (отклик на рассылки)
 RESP_KEEP_DAYS = int(os.environ.get("RESP_KEEP_DAYS", "30"))
+PAYMENT_AUDIT_DB = os.path.join(PROFILES_DIR, "payment_audit.sqlite3")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 os.makedirs(PROFILES_DIR, exist_ok=True)
@@ -97,6 +108,75 @@ if not SECRET_KEY:
 # secure-флаг для cookie. По умолчанию включён (мы за HTTPS через Caddy).
 # Для локального запуска по http можно выставить COOKIE_SECURE=0.
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"
+
+# --- Прозрачная проверка оплат в рабочих Telegram-аккаунтах ---
+PAYMENT_AUDIT_VERSION = "2026-07-30-v1"
+PAYMENT_AUDIT_RETENTION_DAYS = int(os.environ.get("PAYMENT_AUDIT_RETENTION_DAYS", "60"))
+PAYMENT_AUDIT_OCR_MAX_BYTES = int(os.environ.get("PAYMENT_AUDIT_OCR_MAX_BYTES", str(10 * 1024 * 1024)))
+PAYMENT_AUDIT_OCR_PER_HOUR = int(os.environ.get("PAYMENT_AUDIT_OCR_PER_HOUR", "30"))
+PAYMENT_AUDIT_OCR_QUEUE_MAX = int(os.environ.get("PAYMENT_AUDIT_OCR_QUEUE_MAX", "20"))
+PAYMENT_AUDIT_DOWNLOAD_TIMEOUT = float(os.environ.get("PAYMENT_AUDIT_DOWNLOAD_TIMEOUT", "20"))
+PAYMENT_AUDIT_OCR_HEALTH_TIMEOUT = float(os.environ.get("PAYMENT_AUDIT_OCR_HEALTH_TIMEOUT", "2"))
+PAYMENT_COMMISSION_RATE = 0.15
+payment_audit_store = None
+_payment_audit_store_retry_at = 0.0
+_payment_audit_store_lock = threading.Lock()
+_payment_ocr_health_cache = (0.0, False)
+receipt_ocr = RemoteReceiptOcr(
+    base_url=os.environ.get("PAYMENT_AUDIT_OCR_URL", "http://ocr:8080"),
+    limits=OcrLimits(
+        max_media_bytes=PAYMENT_AUDIT_OCR_MAX_BYTES,
+        # PDF parsing is intentionally disabled at the Telegram boundary.  A
+        # single raster receipt is enough for the first safe production mode.
+        max_pdf_pages=1,
+    )
+)
+
+
+def _get_payment_audit_store():
+    """Initialize the optional audit store without risking the scheduler."""
+    global payment_audit_store, _payment_audit_store_retry_at
+    with _payment_audit_store_lock:
+        if payment_audit_store is not None:
+            return payment_audit_store
+        if time.monotonic() < _payment_audit_store_retry_at:
+            return None
+        try:
+            payment_audit_store = PaymentAuditStore(
+                PAYMENT_AUDIT_DB,
+                SECRET_KEY,
+                retention_days=PAYMENT_AUDIT_RETENTION_DAYS,
+                correlation_minutes=60,
+            )
+        except Exception as exc:
+            # Payment audit is auxiliary. A damaged/full audit DB must not stop
+            # scheduled Telegram sends or the main web panel.
+            print(f"[payment-audit] store unavailable {type(exc).__name__}")
+            _payment_audit_store_retry_at = time.monotonic() + 300
+            return None
+        _payment_audit_store_retry_at = 0.0
+        return payment_audit_store
+
+
+async def _get_payment_audit_store_async():
+    return await asyncio.to_thread(_get_payment_audit_store)
+
+
+async def _payment_ocr_available():
+    """Return sidecar readiness without delaying the panel when OCR is down."""
+    global _payment_ocr_health_cache
+    now = time.monotonic()
+    refresh_at, available = _payment_ocr_health_cache
+    if now < refresh_at:
+        return available
+    try:
+        async with asyncio.timeout(max(0.25, PAYMENT_AUDIT_OCR_HEALTH_TIMEOUT)):
+            health = await receipt_ocr.health()
+        available = bool(health.ready and health.languages_available)
+    except (TimeoutError, ReceiptOcrError):
+        available = False
+    _payment_ocr_health_cache = (now + (30 if available else 10), available)
+    return available
 
 # --- Тарифы и оплата ---
 # Токен CryptoBot (Crypto Pay API). Получить: @CryptoBot → Crypto Pay → Create App.
@@ -410,6 +490,9 @@ def _user_public(u):
         "reset_status": u.get("reset_status"),        # None | "pending" | "approved"
         "reset_requested": u.get("reset_requested"),
         "must_setup": bool(u.get("must_setup")),      # вошёл по дефолтному admin/admin — заставить сменить
+        "payment_audit_consented": _payment_audit_consented(u),
+        "payment_audit_consent_at": u.get("payment_audit_consent_at"),
+        "payment_audit_consent_history": list(u.get("payment_audit_consent_history") or [])[-50:],
     }
 
 
@@ -554,6 +637,20 @@ class State:
     # profile_id -> фоновая задача отправки. Запись появляется ДО первого await,
     # чтобы ручной запуск и планировщик не могли одновременно занять один аккаунт.
     send_tasks: dict[str, asyncio.Task] = {}
+    # OCR запускается отдельно от обработчика Telegram, но task держим сильной
+    # ссылкой и корректно отменяем при остановке контейнера.
+    audit_tasks: set[asyncio.Task] = set()
+    audit_ocr_tasks: dict[asyncio.Task, dict] = {}
+    audit_ocr_recent: dict[str, list[tuple[float, bool]]] = {}
+    audit_ocr_dropped: dict[str, int] = {"queue": 0, "quota": 0, "invalid": 0}
+    audit_deleted_owners: set[str] = set()
+    audit_deleted_profiles: set[str] = set()
+    # Serializes audit writes with consent revocation and destructive account
+    # operations, preventing an in-flight Telegram callback from recreating
+    # evidence after it was deleted or recording after consent was withdrawn.
+    audit_owner_locks: dict[str, asyncio.Lock] = {}
+    audit_ocr_semaphore = None
+    audit_cleanup_at = 0.0
     scheduler_task = None
     warm_task = None
 
@@ -701,10 +798,528 @@ def _parse_proxy(raw):
         return None
 
 
+def _payment_audit_consented(user):
+    return bool(
+        user
+        and user.get("status") == "approved"
+        and user.get("payment_audit_consent_version") == PAYMENT_AUDIT_VERSION
+        and user.get("payment_audit_consent_at")
+    )
+
+
+def _payment_media_type(event):
+    if getattr(event, "photo", None) is not None:
+        return "image/jpeg"
+    file_obj = getattr(event, "file", None)
+    mime = getattr(file_obj, "mime_type", None)
+    return str(mime or "") or None
+
+
+def _payment_ocr_media_allowed(event, media_type):
+    """Allow only bounded JPEG/PNG receipts; skip stickers and PDFs."""
+    if media_type not in {"image/jpeg", "image/png"}:
+        return False
+    file_obj = getattr(event, "file", None)
+    size = int(getattr(file_obj, "size", 0) or 0)
+    # Telegram photos may not expose ``file.size`` on every Telethon version;
+    # documents must always advertise a size before we allocate their bytes.
+    if size <= 0 and getattr(event, "photo", None) is None:
+        return False
+    return size <= 0 or size <= PAYMENT_AUDIT_OCR_MAX_BYTES
+
+
+def _payment_raster_magic_allowed(data):
+    return bool(
+        isinstance(data, bytes)
+        and (
+            data.startswith(b"\xff\xd8\xff")
+            or data.startswith(b"\x89PNG\r\n\x1a\n")
+        )
+    )
+
+
+def _audit_signal_snippet(analysis):
+    """Persist only matched payment phrases, never the whole chat/OCR text."""
+    fragments = []
+    seen = set()
+    for item in analysis.get("evidence") or []:
+        value = str((item or {}).get("match") or "").strip()
+        if value and value.casefold() not in seen:
+            fragments.append(value[:80])
+            seen.add(value.casefold())
+    for amount in analysis.get("amounts") or []:
+        value = str((amount or {}).get("raw") or "").strip()
+        if value and value.casefold() not in seen:
+            fragments.append(value[:48])
+            seen.add(value.casefold())
+    return mask_sensitive_text(" · ".join(fragments[:8]), 240)
+
+
+def _contextualize_payment_analysis(analysis, *, direction, is_forwarded=False):
+    """Interpret a phrase from the work account's point of view.
+
+    A client saying «скинул» is a possible incoming payment; the worker saying
+    the same thing is an outgoing transfer. Requests, plans, reversals and
+    forwarded evidence stay review signals but can never become proof.
+    """
+    result = dict(analysis or {})
+    categories = set(result.get("categories") or [])
+    confidence = float(result.get("confidence") or 0)
+    negated = bool(result.get("negated") or categories & {
+        "payment_negation", "refund_or_reversal", "negated",
+    })
+    completed = "transfer_completed" in categories
+    confirmed = "payment_confirmation" in categories
+    receipt = bool(categories & {"receipt", "receipt_ocr"})
+    uncertain = bool(result.get("uncertain") or result.get("question"))
+
+    income_claim = bool(
+        result.get("detected")
+        and result.get("success_claim")
+        and not negated
+        and not uncertain
+        and not is_forwarded
+        and (
+            (direction == "incoming" and completed)
+            or (direction == "outgoing" and confirmed)
+        )
+    )
+
+    if direction == "outgoing" and completed and not confirmed:
+        categories.add("outgoing_transfer")
+        confidence = min(confidence, 0.45)
+    if direction == "incoming" and confirmed and not completed:
+        categories.add("counterparty_received")
+        confidence = min(confidence, 0.45)
+    if result.get("event_status") in {"requested", "intent"}:
+        confidence = min(confidence, 0.58)
+    if negated:
+        confidence = min(confidence, 0.42)
+        income_claim = False
+    if uncertain:
+        categories.add("uncertain_claim")
+        confidence = min(confidence, 0.45)
+        income_claim = False
+    if is_forwarded:
+        categories.add("forwarded_receipt" if receipt else "forwarded_evidence")
+        confidence = min(confidence, 0.42)
+        income_claim = False
+
+    result["categories"] = sorted(categories)
+    result["confidence"] = round(max(0.0, min(confidence, 1.0)), 2)
+    result["level"] = (
+        "high" if confidence >= 0.75 else
+        "medium" if confidence >= 0.48 else
+        "low" if result.get("detected") else "none"
+    )
+    result["income_claim"] = income_claim
+    result["direction"] = direction
+    return result
+
+
+def _payment_event_version(event, source, text):
+    if source != "edited":
+        return source
+    message = getattr(event, "message", None)
+    edited_at = getattr(message, "edit_date", None)
+    digest = hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:12]
+    return f"edited:{edited_at or ''}:{digest}"
+
+
+def _payment_observed_at(event, source):
+    if source == "edited":
+        edited_at = getattr(getattr(event, "message", None), "edit_date", None)
+        if edited_at is not None:
+            return edited_at
+    return getattr(event, "date", None)
+
+
+def _track_audit_task(awaitable, *, ocr_pid=None, priority=False):
+    task = asyncio.create_task(awaitable)
+    state.audit_tasks.add(task)
+    if ocr_pid is not None:
+        state.audit_ocr_tasks[task] = {
+            "pid": str(ocr_pid),
+            "priority": bool(priority),
+            "running": False,
+        }
+
+    def done(finished):
+        state.audit_tasks.discard(finished)
+        state.audit_ocr_tasks.pop(finished, None)
+        try:
+            finished.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            # Не печатаем текст/медиа/имя диалога — только класс технической ошибки.
+            print(f"[payment-audit] background {type(exc).__name__}")
+
+    task.add_done_callback(done)
+    return task
+
+
+def _payment_audit_scope_blocked(owner, pid):
+    return bool(
+        str(owner) in state.audit_deleted_owners
+        or str(pid) in state.audit_deleted_profiles
+    )
+
+
+def _audit_owner_lock(owner):
+    key = str(owner)
+    lock = state.audit_owner_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        state.audit_owner_locks[key] = lock
+    return lock
+
+
+def _payment_audit_scope_active(owner, pid):
+    if _payment_audit_scope_blocked(owner, pid):
+        return False
+    user = get_user(owner)
+    profile = get_profile(pid)
+    return bool(
+        _payment_audit_consented(user)
+        and _sub_active(user)
+        and profile
+        and profile.get("owner") == owner
+    )
+
+
+async def _record_payment_event(store, *, owner, pid, **kwargs):
+    """Commit one audit event atomically against revoke/delete operations."""
+    async with _audit_owner_lock(owner):
+        if not _payment_audit_scope_active(owner, pid):
+            return None
+        return await asyncio.to_thread(
+            store.record_event,
+            owner=owner,
+            profile_id=pid,
+            **kwargs,
+        )
+
+
+async def _record_payment_retraction(store, *, owner, pid, chat_key,
+                                     message_ref, record_kwargs):
+    """Check-and-retract the same message under one audit/delete lock."""
+    async with _audit_owner_lock(owner):
+        if not _payment_audit_scope_active(owner, pid):
+            return None
+        exists = await asyncio.to_thread(
+            store.has_message, owner, pid, chat_key, message_ref
+        )
+        if not exists:
+            return None
+        return await asyncio.to_thread(
+            store.record_event,
+            owner=owner,
+            profile_id=pid,
+            **record_kwargs,
+        )
+
+
+def _active_ocr_meta():
+    return [
+        meta for task, meta in state.audit_ocr_tasks.items()
+        if not task.done() and not task.cancelling()
+    ]
+
+
+def _cancel_audit_ocr_for_profiles(profile_ids):
+    targets = {str(pid) for pid in profile_ids}
+    for task, meta in list(state.audit_ocr_tasks.items()):
+        if str(meta.get("pid")) in targets and not task.done():
+            task.cancel()
+
+
+def _audit_ocr_queue_has_capacity(pid, *, priority=False):
+    if priority:
+        # A likely receipt must not sit behind a burst of ordinary photos.
+        for task, meta in list(state.audit_ocr_tasks.items()):
+            if not meta.get("priority") and not meta.get("running") and not task.done():
+                task.cancel()
+                state.audit_ocr_dropped["queue"] += 1
+    active = _active_ocr_meta()
+    total_limit = max(1, PAYMENT_AUDIT_OCR_QUEUE_MAX)
+    pid_count = sum(1 for meta in active if meta.get("pid") == str(pid))
+    if priority:
+        return len(active) < total_limit and pid_count < 4
+    ordinary_limit = min(4, max(1, total_limit - max(2, total_limit // 5)))
+    return len(active) < ordinary_limit and pid_count < 2
+
+
+def _audit_ocr_allowed(pid, *, priority=False):
+    now = time.monotonic()
+    recent = [
+        (ts, was_priority) for ts, was_priority in state.audit_ocr_recent.get(pid, [])
+        if now - ts < 3600
+    ]
+    limit = max(1, PAYMENT_AUDIT_OCR_PER_HOUR)
+    ordinary_limit = max(1, limit - max(3, limit // 4))
+    if len(recent) >= limit or (
+        not priority and sum(1 for _ts, was_priority in recent if not was_priority) >= ordinary_limit
+    ):
+        state.audit_ocr_recent[pid] = recent
+        state.audit_ocr_dropped["quota"] += 1
+        return False
+    recent.append((now, bool(priority)))
+    state.audit_ocr_recent[pid] = recent
+    return True
+
+
+async def _audit_receipt_media(client, event, *, owner, pid, chat_id, direction,
+                               media_type, is_forwarded=False, priority=False,
+                               message_source="message"):
+    if _payment_audit_scope_blocked(owner, pid):
+        return
+    user = get_user(owner)
+    if not _payment_audit_consented(user) or not _sub_active(user):
+        return
+    if not _payment_ocr_media_allowed(event, media_type):
+        return
+    file_obj = getattr(event, "file", None)
+    size = int(getattr(file_obj, "size", 0) or 0)
+    if size > PAYMENT_AUDIT_OCR_MAX_BYTES:
+        return
+    if state.audit_ocr_semaphore is None:
+        state.audit_ocr_semaphore = asyncio.Semaphore(1)
+
+    async with state.audit_ocr_semaphore:
+        meta = state.audit_ocr_tasks.get(asyncio.current_task())
+        if meta is not None:
+            meta["running"] = True
+        # A queued item may start after consent was revoked or access expired.
+        user = get_user(owner)
+        if (
+            _payment_audit_scope_blocked(owner, pid)
+            or not _payment_audit_consented(user)
+            or not _sub_active(user)
+            or not _audit_ocr_allowed(pid, priority=priority)
+        ):
+            return
+        try:
+            async with asyncio.timeout(max(1.0, PAYMENT_AUDIT_DOWNLOAD_TIMEOUT)):
+                data = await client.download_media(event.message, file=bytes)
+        except TimeoutError:
+            print("[payment-audit] media download TimeoutError")
+            return
+        if (
+            not _payment_raster_magic_allowed(data)
+            or len(data) > PAYMENT_AUDIT_OCR_MAX_BYTES
+        ):
+            state.audit_ocr_dropped["invalid"] += 1
+            return
+        user = get_user(owner)
+        if (
+            _payment_audit_scope_blocked(owner, pid)
+            or not _payment_audit_consented(user)
+            or not _sub_active(user)
+        ):
+            data = None
+            return
+        try:
+            result = await receipt_ocr.analyze_bytes_async(data)
+        except ReceiptOcrError as exc:
+            print(f"[payment-audit] OCR {type(exc).__name__}")
+            return
+        finally:
+            # Явно отпускаем единственную ссылку на банковский скриншот.
+            data = None
+
+    rich = analyze_payment_signal(
+        result.text,
+        direction=direction,
+        media_type=media_type,
+        is_forwarded=is_forwarded,
+    )
+    if not rich.get("detected") and not result.signals.is_likely_payment:
+        return
+
+    categories = set(rich.get("categories") or [])
+    categories.update({"receipt", "receipt_ocr"})
+    amounts = list(rich.get("amounts") or [])
+    if not amounts:
+        amounts = [
+            {"value": item.value, "currency": item.currency or "RUB"}
+            for item in result.signals.amounts
+        ]
+    ocr_confidence = {"high": 0.86, "medium": 0.62, "low": 0.35}.get(
+        result.signals.confidence, 0.3
+    )
+    analysis = {
+        **rich,
+        "detected": True,
+        "categories": sorted(categories),
+        "amounts": amounts,
+        "confidence": max(float(rich.get("confidence") or 0), ocr_confidence),
+        "event_status": rich.get("event_status") if rich.get("event_status") != "none" else "receipt",
+        "dedup_hashes": [
+            key for key in (result.exact_dedup_key, result.text_dedup_key) if key
+        ],
+    }
+    analysis = _contextualize_payment_analysis(
+        analysis,
+        direction=direction,
+        is_forwarded=is_forwarded,
+    )
+    user = get_user(owner)
+    if (
+        _payment_audit_scope_blocked(owner, pid)
+        or not _payment_audit_consented(user)
+        or not _sub_active(user)
+    ):
+        return
+    profile = get_profile(pid)
+    if not profile or profile.get("owner") != owner:
+        return
+    store = await _get_payment_audit_store_async()
+    if store is None:
+        return
+    message_id = getattr(event, "id", 0)
+    ocr_version = "ocr:" + _payment_event_version(
+        event, message_source, getattr(event, "raw_text", "") or ""
+    )
+    await _record_payment_event(
+        store,
+        owner=owner,
+        pid=pid,
+        event_key=store.event_key(pid, chat_id, message_id, ocr_version),
+        chat_key=store.chat_key(pid, chat_id),
+        message_ref=store.message_ref(pid, chat_id, message_id),
+        chat_ref=chat_id,
+        observed_at=_payment_observed_at(event, message_source),
+        direction=direction,
+        analysis=analysis,
+        snippet=_audit_signal_snippet(analysis),
+        # Store revisions must use the canonical source so the previous live
+        # amount/categories for this exact Telegram message are replaced.
+        source="edited" if message_source == "edited" else "ocr",
+        media_hash=result.media_sha256,
+    )
+
+
+async def _handle_payment_message(client, pid, event, *, source="message"):
+    try:
+        if not event.is_private or event.chat_id in (None, 777000):
+            return
+        if str(pid) in state.audit_deleted_profiles:
+            return
+        profile = get_profile(pid)
+        owner = (profile or {}).get("owner")
+        if _payment_audit_scope_blocked(owner, pid):
+            return
+        user = get_user(owner) if owner else None
+        if not _payment_audit_consented(user) or not _sub_active(user):
+            return
+        store = await _get_payment_audit_store_async()
+        if store is None:
+            return
+        consent_at = user.get("payment_audit_consent_at")
+        event_date = getattr(event, "date", None)
+        try:
+            if consent_at and event_date:
+                consent_dt = datetime.fromisoformat(str(consent_at).replace("Z", "+00:00"))
+                if consent_dt.tzinfo is None:
+                    consent_dt = consent_dt.replace(tzinfo=timezone.utc)
+                event_dt = event_date
+                if not isinstance(event_dt, datetime):
+                    event_dt = datetime.fromisoformat(str(event_dt).replace("Z", "+00:00"))
+                if event_dt.tzinfo is None:
+                    event_dt = event_dt.replace(tzinfo=timezone.utc)
+                if event_dt.astimezone(timezone.utc) < consent_dt.astimezone(timezone.utc):
+                    return
+        except (TypeError, ValueError):
+            return
+
+        direction = "outgoing" if bool(getattr(event, "out", False)) else "incoming"
+        media_type = _payment_media_type(event)
+        text = getattr(event, "raw_text", "") or ""
+        forwarded = bool(getattr(getattr(event, "message", None), "fwd_from", None))
+        analysis = analyze_payment_signal(
+            text,
+            direction=direction,
+            media_type=media_type,
+            is_forwarded=forwarded,
+        )
+        analysis = _contextualize_payment_analysis(
+            analysis,
+            direction=direction,
+            is_forwarded=forwarded,
+        )
+        event_version = _payment_event_version(event, source, text)
+        message_ref = store.message_ref(pid, event.chat_id, event.id)
+        chat_key = store.chat_key(pid, event.chat_id)
+        if analysis.get("detected"):
+            await _record_payment_event(
+                store,
+                owner=owner,
+                pid=pid,
+                event_key=store.event_key(pid, event.chat_id, event.id, event_version),
+                chat_key=chat_key,
+                message_ref=message_ref,
+                chat_ref=event.chat_id,
+                observed_at=_payment_observed_at(event, source),
+                direction=direction,
+                analysis=analysis,
+                snippet=_audit_signal_snippet(analysis),
+                source=source,
+            )
+        elif source == "edited":
+            # An edited message that used to be a payment signal is material:
+            # keep the historical evidence but remove its live amount/status.
+            await _record_payment_retraction(
+                store,
+                owner=owner,
+                pid=pid,
+                chat_key=chat_key,
+                message_ref=message_ref,
+                record_kwargs={
+                    "event_key": store.event_key(pid, event.chat_id, event.id, event_version),
+                    "chat_key": chat_key,
+                    "message_ref": message_ref,
+                    "chat_ref": event.chat_id,
+                    "observed_at": _payment_observed_at(event, source),
+                    "direction": direction,
+                    "analysis": {
+                        "detected": True,
+                        "categories": ["message_retracted"],
+                        "amounts": [],
+                        "confidence": 0,
+                        "event_status": "retracted",
+                        "success_claim": False,
+                        "income_claim": False,
+                        "attribution": "forwarded" if forwarded else "direct",
+                    },
+                    "snippet": "",
+                    "source": "edited",
+                },
+            )
+
+        ocr_priority = bool(analysis.get("detected"))
+        if _payment_ocr_media_allowed(event, media_type):
+            if not _audit_ocr_queue_has_capacity(pid, priority=ocr_priority):
+                state.audit_ocr_dropped["queue"] += 1
+                return
+            _track_audit_task(_audit_receipt_media(
+                client,
+                event,
+                owner=owner,
+                pid=pid,
+                chat_id=event.chat_id,
+                direction=direction,
+                media_type=media_type,
+                is_forwarded=forwarded,
+                priority=ocr_priority,
+                message_source=source,
+            ), ocr_pid=pid, priority=ocr_priority)
+    except Exception as exc:
+        print(f"[payment-audit] message {type(exc).__name__}")
+
+
 def _register_response_listener(client, pid):
-    """Вешает слушатель входящих ЛИЧНЫХ сообщений: считает, сколько людей
-    написали аккаунту в ответ (сигнал «рассылки сработали»). Только счётчик —
-    ни содержимого, ни отправителя не храним; без единого лишнего API-запроса."""
+    """Вешает счётчик откликов и, после согласия, проверку оплат рабочих ЛС."""
     if getattr(client, "_resp_listener", False):
         return
     client._resp_listener = True
@@ -719,6 +1334,14 @@ def _register_response_listener(client, pid):
             _bump_response(pid)
         except Exception:
             pass                            # учёт отклика не критичен — молча пропускаем
+
+    @client.on(events.NewMessage())
+    async def _on_payment_message(event):
+        await _handle_payment_message(client, pid, event)
+
+    @client.on(events.MessageEdited())
+    async def _on_payment_edit(event):
+        await _handle_payment_message(client, pid, event, source="edited")
 
 
 async def get_client(pid) -> TelegramClient | None:
@@ -1629,6 +2252,11 @@ async def _scheduler_loop():
             # ошибки подключения/диска в фоновой задаче.
             await _resume_queued_sends()
             _scheduler_tick()
+            if time.monotonic() >= state.audit_cleanup_at:
+                state.audit_cleanup_at = time.monotonic() + 24 * 60 * 60
+                store = await _get_payment_audit_store_async()
+                if store is not None:
+                    await asyncio.to_thread(store.cleanup)
         except Exception as e:
             print(f"[scheduler] ошибка цикла: {e}")
 
@@ -1674,14 +2302,24 @@ async def _resume_queued_sends():
 
 
 async def _warm_response_listeners():
-    """Подключает активный аккаунт каждого владельца и вешает слушатель отклика,
-    чтобы входящие в личку считались сразу после старта, а не только после первой
-    рассылки. Подключаем по одному с паузой — не будим все аккаунты разом."""
-    owners = {p.get("owner") for p in load_profiles() if p.get("owner")}
+    """Подключает Telegram listeners последовательно, не создавая залп сессий.
+
+    Для обычного счётчика достаточно активного профиля. После явного согласия
+    на проверку рабочих оплат слушаем все рабочие профили владельца, чтобы смена
+    активного аккаунта не создавала слепое окно.
+    """
+    profiles = load_profiles()
+    owners = {p.get("owner") for p in profiles if p.get("owner")}
+    pids = []
     for owner in owners:
         pid = _active_pid(owner)
-        if not pid:
-            continue
+        if pid:
+            pids.append(pid)
+        user = get_user(owner)
+        if _payment_audit_consented(user) and _sub_active(user):
+            pids.extend(p["id"] for p in profiles if p.get("owner") == owner)
+
+    for pid in dict.fromkeys(pids):
         try:
             client = await get_client(pid)   # подключит + зарегистрирует слушатель
             if client:
@@ -1697,6 +2335,13 @@ async def _warm_response_listeners():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _bootstrap_admin()   # гарантируем вход админа (ADMIN_USER/ADMIN_PASS), если заданы
+    try:
+        store = _get_payment_audit_store()
+        if store is not None:
+            store.cleanup()
+            state.audit_cleanup_at = time.monotonic() + 24 * 60 * 60
+    except Exception as exc:
+        print(f"[payment-audit] cleanup {type(exc).__name__}")
     # Сначала резервируем профили под докатку, чтобы планировщик не запустил
     # для них ещё одну рассылку в момент старта процесса.
     await _resume_queued_sends()
@@ -1719,6 +2364,24 @@ async def lifespan(app: FastAPI):
         task.cancel()
     if send_tasks:
         await asyncio.gather(*send_tasks, return_exceptions=True)
+    audit_tasks = list(state.audit_tasks)
+    for task in audit_tasks:
+        task.cancel()
+    if audit_tasks:
+        await asyncio.gather(*audit_tasks, return_exceptions=True)
+    try:
+        await receipt_ocr.aclose()
+    except Exception:
+        pass
+    state.audit_tasks.clear()
+    state.audit_ocr_tasks.clear()
+    state.audit_ocr_recent.clear()
+    state.audit_ocr_dropped = {"queue": 0, "quota": 0, "invalid": 0}
+    state.audit_deleted_owners.clear()
+    state.audit_deleted_profiles.clear()
+    state.audit_owner_locks.clear()
+    state.audit_ocr_semaphore = None
+    state.audit_cleanup_at = 0.0
     for client in state.clients.values():
         try:
             await client.disconnect()
@@ -1944,12 +2607,13 @@ async def admin_set_status(uid: str, body: UserStatusIn, admin=Depends(require_a
         return JSONResponse({"error": "Неверный статус"}, status_code=400)
     if uid == admin["id"]:
         return JSONResponse({"error": "Нельзя менять статус самому себе"}, status_code=400)
-    users = load_users()
-    target = next((u for u in users if u["id"] == uid), None)
-    if not target:
-        return JSONResponse({"error": "Пользователь не найден"}, status_code=404)
-    target["status"] = body.status
-    save_users(users)
+    async with _audit_owner_lock(uid):
+        users = load_users()
+        target = next((u for u in users if u["id"] == uid), None)
+        if not target:
+            return JSONResponse({"error": "Пользователь не найден"}, status_code=404)
+        target["status"] = body.status
+        save_users(users)
     return {"ok": True, "user": _user_public(target)}
 
 
@@ -1961,9 +2625,27 @@ async def admin_delete_user(uid: str, admin=Depends(require_admin)):
     if not any(u["id"] == uid for u in users):
         return JSONResponse({"error": "Пользователь не найден"}, status_code=404)
 
+    owner_profiles = [p for p in load_profiles() if p.get("owner") == uid]
+    store = await _get_payment_audit_store_async()
+    if store is None and os.path.exists(PAYMENT_AUDIT_DB):
+        return JSONResponse({"error": "Не удалось безопасно удалить данные проверки оплат"}, status_code=503)
+    state.audit_deleted_owners.add(str(uid))
+    state.audit_deleted_profiles.update(str(p["id"]) for p in owner_profiles)
+    _cancel_audit_ocr_for_profiles(p["id"] for p in owner_profiles)
+    try:
+        async with _audit_owner_lock(uid):
+            if store is not None:
+                await asyncio.to_thread(store.delete_owner, uid)
+    except Exception as exc:
+        state.audit_deleted_owners.discard(str(uid))
+        state.audit_deleted_profiles.difference_update(str(p["id"]) for p in owner_profiles)
+        print(f"[payment-audit] delete owner {type(exc).__name__}")
+        return JSONResponse({"error": "Не удалось безопасно удалить данные проверки оплат"}, status_code=503)
+
     # Удаляем профили пользователя (вместе с сессиями Telegram) и его расписания.
-    for p in [p for p in load_profiles() if p.get("owner") == uid]:
+    for p in owner_profiles:
         await _destroy_profile(p)
+    save_profiles([p for p in load_profiles() if p.get("owner") != uid])
     save_schedules([s for s in load_schedules() if s.get("owner") != uid])
     save_packs([p for p in load_packs() if p.get("owner") != uid])
     save_users([u for u in users if u["id"] != uid])
@@ -2004,7 +2686,10 @@ async def admin_subscription(uid: str, body: SubIn, admin=Depends(require_admin)
         return JSONResponse({"error": "Пользователь не найден"}, status_code=404)
     if body.add_days:
         _extend_subscription(uid, int(body.add_days))
-    return {"ok": True, "user": _user_public(get_user(uid))}
+    current = get_user(uid)
+    if _payment_audit_consented(current) and _sub_active(current):
+        _track_audit_task(_warm_payment_owner_profiles(uid))
+    return {"ok": True, "user": _user_public(current)}
 
 
 def _activity_verdict(s):
@@ -2197,6 +2882,253 @@ class JoinIn(BaseModel):
 
 class FolderIn(BaseModel):
     name: str = "Каналы"
+
+
+class PaymentAuditConsentIn(BaseModel):
+    accept: bool
+
+
+class PaymentCaseResponseIn(BaseModel):
+    status: str
+    note: str = ""
+
+
+class PaymentCaseReviewIn(BaseModel):
+    status: str
+    amount: float | None = None
+    note: str = ""
+
+
+class PaymentWeekIn(BaseModel):
+    amount: float
+    note: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Проверка оплат в рабочих Telegram-диалогах
+# ---------------------------------------------------------------------------
+def _current_week_start():
+    today = datetime.now().date()
+    return (today - timedelta(days=today.weekday())).isoformat()
+
+
+def _current_week_bounds():
+    start = datetime.fromisoformat(_current_week_start()).date()
+    return start.isoformat(), (start + timedelta(days=7)).isoformat()
+
+
+def _audit_case_view(case, *, profiles=None, users=None):
+    row = dict(case)
+    profiles = profiles if profiles is not None else load_profiles()
+    profile = next((p for p in profiles if p.get("id") == row.get("profile_id")), None)
+    row["profile_name"] = (profile or {}).get("name") or row.get("profile_id")
+    chat_ref = row.get("chat_ref")
+    row["chat_link"] = f"tg://user?id={chat_ref}" if isinstance(chat_ref, int) and chat_ref > 0 else ""
+    if users is not None:
+        owner = next((u for u in users if u.get("id") == row.get("owner")), None)
+        row["username"] = (owner or {}).get("username") or row.get("owner")
+    return row
+
+
+async def _warm_payment_owner_profiles(owner):
+    if str(owner) in state.audit_deleted_owners:
+        return
+    for profile in [p for p in load_profiles() if p.get("owner") == owner]:
+        if _payment_audit_scope_blocked(owner, profile["id"]):
+            continue
+        try:
+            client = await get_client(profile["id"])
+            if client:
+                await client.catch_up()
+        except Exception as exc:
+            print(f"[payment-audit] warm {profile['id']} {type(exc).__name__}")
+        await asyncio.sleep(1)
+
+
+@app.get("/api/payment-audit")
+async def payment_audit_info(user=Depends(require_user)):
+    week, next_week = _current_week_bounds()
+    store = await _get_payment_audit_store_async()
+    if store is None:
+        return {
+            "version": PAYMENT_AUDIT_VERSION,
+            "available": False,
+            "consented": _payment_audit_consented(user),
+            "consent_at": user.get("payment_audit_consent_at"),
+            "retention_days": PAYMENT_AUDIT_RETENTION_DAYS,
+            "commission_rate": PAYMENT_COMMISSION_RATE,
+            "ocr_available": False,
+            "week_start": week,
+            "week_report": None,
+            "week_reports": [],
+            "summary": {},
+        }
+    report = await asyncio.to_thread(store.weekly_report, user["id"], week)
+    week_reports = await asyncio.to_thread(store.recent_weekly_reports, user["id"], 4)
+    summary = await asyncio.to_thread(
+        store.weekly_summary,
+        user["id"], week, next_week,
+        commission_rate=PAYMENT_COMMISSION_RATE,
+    )
+    ocr_available = await _payment_ocr_available()
+    return {
+        "version": PAYMENT_AUDIT_VERSION,
+        "available": True,
+        "consented": _payment_audit_consented(user),
+        "consent_at": user.get("payment_audit_consent_at"),
+        "retention_days": PAYMENT_AUDIT_RETENTION_DAYS,
+        "commission_rate": PAYMENT_COMMISSION_RATE,
+        "ocr_available": ocr_available,
+        "week_start": week,
+        "week_report": report,
+        "week_reports": week_reports,
+        "summary": summary,
+    }
+
+
+@app.post("/api/payment-audit/consent")
+async def payment_audit_consent(body: PaymentAuditConsentIn, user=Depends(require_user)):
+    if body.accept and await _get_payment_audit_store_async() is None:
+        return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
+    async with _audit_owner_lock(user["id"]):
+        users = load_users()
+        target = next((u for u in users if u.get("id") == user["id"]), None)
+        if target is None:
+            return JSONResponse({"error": "Пользователь не найден"}, status_code=404)
+        was_consented = _payment_audit_consented(target)
+        changed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if body.accept and not was_consented:
+            target["payment_audit_consent_version"] = PAYMENT_AUDIT_VERSION
+            target["payment_audit_consent_at"] = changed_at
+        elif not body.accept and was_consented:
+            target.pop("payment_audit_consent_version", None)
+            target.pop("payment_audit_consent_at", None)
+        if bool(body.accept) != was_consented:
+            history = list(target.get("payment_audit_consent_history") or [])
+            history.append({
+                "at": changed_at,
+                "action": "enabled" if body.accept else "disabled",
+                "version": PAYMENT_AUDIT_VERSION,
+            })
+            target["payment_audit_consent_history"] = history[-100:]
+        save_users(users)
+    if body.accept:
+        _track_audit_task(_warm_payment_owner_profiles(user["id"]))
+    return {
+        "ok": True,
+        "consented": bool(body.accept),
+        "consent_at": target.get("payment_audit_consent_at"),
+    }
+
+
+@app.get("/api/payment-audit/cases")
+async def payment_audit_cases(days: int = 7, limit: int = 100, user=Depends(require_user)):
+    if not _payment_audit_consented(user):
+        return JSONResponse({"error": "Сначала подтверди проверку рабочих диалогов"}, status_code=409)
+    profiles = load_profiles()
+    store = await _get_payment_audit_store_async()
+    if store is None:
+        return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
+    cases = await asyncio.to_thread(
+        store.list_cases,
+        owner=user["id"], days=max(1, min(int(days), 90)), limit=max(1, min(int(limit), 200))
+    )
+    return {"cases": [_audit_case_view(c, profiles=profiles) for c in cases]}
+
+
+@app.post("/api/payment-audit/cases/{case_id}/respond")
+async def payment_audit_respond(case_id: str, body: PaymentCaseResponseIn,
+                                user=Depends(require_user)):
+    store = await _get_payment_audit_store_async()
+    if store is None:
+        return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
+    try:
+        case = await asyncio.to_thread(
+            store.respond, case_id, user["id"], body.status, body.note
+        )
+    except ValueError:
+        return JSONResponse({"error": "Неверный ответ"}, status_code=400)
+    except KeyError:
+        return JSONResponse({"error": "Событие не найдено"}, status_code=404)
+    return {"ok": True, "case": _audit_case_view(case)}
+
+
+@app.post("/api/payment-audit/week")
+async def payment_audit_week(body: PaymentWeekIn, user=Depends(require_user)):
+    if not _payment_audit_consented(user):
+        return JSONResponse({"error": "Сначала подтверди проверку рабочих диалогов"}, status_code=409)
+    store = await _get_payment_audit_store_async()
+    if store is None:
+        return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
+    try:
+        report = await asyncio.to_thread(
+            store.submit_week,
+            user["id"], _current_week_start(), body.amount, body.note
+        )
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "Неверная сумма"}, status_code=400)
+    return {"ok": True, "report": report, "commission": round(report["amount"] * PAYMENT_COMMISSION_RATE, 2)}
+
+
+@app.get("/api/admin/payment-audit")
+async def admin_payment_audit(days: int = 7, admin=Depends(require_admin)):
+    days = max(1, min(int(days), 90))
+    users = load_users()
+    profiles = load_profiles()
+    store = await _get_payment_audit_store_async()
+    if store is None:
+        return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
+    cases = await asyncio.to_thread(store.list_cases, days=days, limit=500)
+    summaries = []
+    week, next_week = _current_week_bounds()
+    for owner in users:
+        summary = await asyncio.to_thread(
+            store.weekly_summary,
+            owner["id"], week, next_week,
+            commission_rate=PAYMENT_COMMISSION_RATE,
+        )
+        week_report = await asyncio.to_thread(store.weekly_report, owner["id"], week)
+        week_reports = await asyncio.to_thread(store.recent_weekly_reports, owner["id"], 4)
+        summary.update({
+            "owner": owner["id"],
+            "username": owner.get("username") or owner["id"],
+            "consented": _payment_audit_consented(owner),
+            "consent_history": list(owner.get("payment_audit_consent_history") or [])[-20:],
+            "week_report": week_report,
+            "week_reports": week_reports,
+        })
+        summaries.append(summary)
+    return {
+        "days": days,
+        "week_start": week,
+        "commission_rate": PAYMENT_COMMISSION_RATE,
+        "summaries": summaries,
+        "cases": [_audit_case_view(c, profiles=profiles, users=users) for c in cases],
+        "ocr_queue": {
+            "active": len(_active_ocr_meta()),
+            "dropped": dict(state.audit_ocr_dropped),
+        },
+    }
+
+
+@app.post("/api/admin/payment-audit/cases/{case_id}/review")
+async def admin_payment_audit_review(case_id: str, body: PaymentCaseReviewIn,
+                                     admin=Depends(require_admin)):
+    store = await _get_payment_audit_store_async()
+    if store is None:
+        return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
+    amount = body.amount
+    if body.status == "confirmed" and amount is None:
+        return JSONResponse({"error": "Укажи подтверждённую сумму вручную"}, status_code=400)
+    try:
+        case = await asyncio.to_thread(
+            store.review, case_id, admin["id"], body.status, amount, body.note
+        )
+    except ValueError:
+        return JSONResponse({"error": "Неверное решение или сумма"}, status_code=400)
+    except KeyError:
+        return JSONResponse({"error": "Событие не найдено"}, status_code=404)
+    return {"ok": True, "case": _audit_case_view(case, users=load_users())}
 
 
 # ---------------------------------------------------------------------------
@@ -2462,6 +3394,21 @@ async def profile_status(pid: str, user=Depends(require_user)):
 @app.delete("/api/profiles/{pid}")
 async def delete_profile(pid: str, user=Depends(require_user)):
     profile = _owned_profile(pid, user)
+    store = await _get_payment_audit_store_async()
+    if store is None and os.path.exists(PAYMENT_AUDIT_DB):
+        return JSONResponse({"error": "Не удалось безопасно удалить данные проверки оплат"}, status_code=503)
+    state.audit_deleted_profiles.add(str(pid))
+    _cancel_audit_ocr_for_profiles([pid])
+    try:
+        async with _audit_owner_lock(profile.get("owner")):
+            if store is not None:
+                # Profile/session deletion is not evidence deletion. Detach its
+                # identifiers and keep cases until the disclosed retention expiry.
+                await asyncio.to_thread(store.archive_profile, pid)
+    except Exception as exc:
+        state.audit_deleted_profiles.discard(str(pid))
+        print(f"[payment-audit] delete profile {type(exc).__name__}")
+        return JSONResponse({"error": "Не удалось безопасно удалить данные проверки оплат"}, status_code=503)
     await _destroy_profile(profile)
     save_profiles([p for p in load_profiles() if p["id"] != pid])
     save_schedules([s for s in load_schedules() if s["profile_id"] != pid])

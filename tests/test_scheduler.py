@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 from datetime import datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import web
 
@@ -628,6 +628,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(web, "_bootstrap_admin"),
+            patch.object(web, "_get_payment_audit_store", return_value=MagicMock()),
             patch.object(web, "_resume_queued_sends", AsyncMock()),
             patch.object(web, "_scheduler_loop", scheduler_loop),
             patch.object(web, "_warm_response_listeners", warm_listeners),

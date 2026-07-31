@@ -5,6 +5,11 @@ __pycache__
 .DS_Store
 .claude
 profiles
+# секреты не должны попадать даже в контекст сборки (особенно для OCR-образа)
+.env
+.env.example
+tests
+.pytest_cache
 test_send_code.py
 README.md
 DEPLOY.md

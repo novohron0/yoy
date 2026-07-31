@@ -2,6 +2,16 @@ services:
   scheduler:
     build: .
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 1g
+    cpus: "1.5"
+    tmpfs:
+      - /tmp:size=128m,mode=1777
     # все переменные из .env (CRYPTOBOT_TOKEN, TZ, SECRET_KEY и т.п.) — внутрь контейнера
     env_file:
       - .env
@@ -17,9 +27,38 @@ services:
       # ПРИНУДИТЕЛЬНО вернуть вход admin/admin, даже если свой пароль уже задан и забыт.
       # Данные (профили/расписания) сохраняются — сбрасываются только логин/пароль.
       ADMIN_RESET_TOKEN: ${ADMIN_RESET_TOKEN:-1}
+      # Закрытый OCR-sidecar: адрес доступен только внутри Docker-сети.
+      PAYMENT_AUDIT_OCR_URL: http://ocr:8080
     volumes:
       # профили, расписания, пользователи, ключ подписи — переживают перезапуски
       - ./profiles:/app/profiles
+    networks:
+      - default
+      - ocr_internal
+
+  ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile.ocr
+    restart: unless-stopped
+    read_only: true
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 768m
+    # На простое распознавание получает целое ядро, но при нехватке CPU уступает
+    # соседям на этом же сервере (Ghostline/Vita/клатч) — распознавание чека
+    # подождёт, лента и рассылки важнее.
+    cpus: "1.0"
+    cpu_shares: 256
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    # Намеренно без env_file, volumes и опубликованных ports.
+    networks:
+      - ocr_internal
 
   caddy:
     image: caddy:2
@@ -43,3 +82,7 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+
+networks:
+  ocr_internal:
+    internal: true
