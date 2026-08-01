@@ -115,6 +115,25 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Сколько", context[0]["snippet"])
         self.assertEqual(context[1]["direction"], "outgoing")
 
+    async def test_quiet_peek_keeps_the_continuation_after_the_trigger(self):
+        messages = [SimpleNamespace(id=mid) for mid in (15, 14, 13, 12, 11)]
+        client = MagicMock()
+        client.get_messages = AsyncMock(return_value=messages)
+        trigger_ref = web.PaymentAuditStore.message_ref("p1", 12345, 13)
+
+        rows, matched = await web._peek_collect_messages(
+            client,
+            object(),
+            pid="p1",
+            chat_ref=12345,
+            target_refs={trigger_ref},
+            limit=80,
+        )
+
+        self.assertEqual([row.id for row in rows], [11, 12, 13, 14, 15])
+        self.assertEqual(matched.id, 13)
+        self.assertEqual([row.id for row in rows if row.id > matched.id], [14, 15])
+
     async def test_outgoing_sent_money_is_not_income(self):
         store = MagicMock()
         store.chat_key.return_value = "CHATKEY"

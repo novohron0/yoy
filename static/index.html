@@ -323,7 +323,19 @@
   .audit-chat { display: grid; gap: 5px; padding-top: 7px; }
   .audit-chat-row { max-width: 88%; padding: 7px 9px; border-radius: 9px; font-size: 11px; line-height: 1.4; color: #b9c6d3; background: var(--panel-3); }
   .audit-chat-row.outgoing { margin-left: auto; background: rgba(43,82,120,.55); }
+  .audit-chat-row.trigger { outline: 1px solid rgba(86,156,214,.65); }
   .audit-chat-who { display: block; margin-bottom: 2px; color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .04em; }
+  .audit-context-note {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    margin-top: 8px; padding: 8px 9px; border-radius: 9px;
+    background: rgba(74,127,191,.1); color: var(--muted); font-size: 10px; line-height: 1.4;
+  }
+  .audit-context-note .btn { flex-shrink: 0; padding: 7px 9px; font-size: 11px; }
+  .audit-continuation {
+    margin-top: 10px; padding: 9px 11px; border: 1px solid var(--border);
+    border-radius: 9px; background: var(--panel-2); color: var(--muted); font-size: 11px; line-height: 1.45;
+  }
+  .audit-continuation.has-new { border-color: rgba(86,156,214,.45); color: #b8d4ee; }
   .audit-review { margin-top: 10px; color: var(--muted); font-size: 11px; line-height: 1.5; }
   .audit-review b { color: var(--text); }
   .audit-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 11px; }
@@ -346,6 +358,8 @@
     .audit-amount { font-size: 19px; }
     .audit-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .audit-actions .btn { width: 100%; }
+    .audit-context-note { align-items: stretch; flex-direction: column; }
+    .audit-context-note .btn { width: 100%; }
   }
 </style>
 </head>
@@ -846,8 +860,8 @@ https://t.me/+AbCdEf..."></textarea>
 <!-- ============ Модалка: тихий просмотр оплаты ============ -->
 <div id="modal-payment-peek" class="overlay hidden" onclick="if(event.target===this)closePaymentPeek()">
   <div class="modal" style="width:520px">
-    <h2>Проверка перевода</h2>
-    <p class="sub" id="payment-peek-sub">История открывается без отправки сообщений и отметки «прочитано».</p>
+    <h2>Диалог и продолжение</h2>
+    <p class="sub" id="payment-peek-sub">Здесь загружается актуальная история из рабочего аккаунта.</p>
     <div id="payment-peek-body"><div class="hint">Загрузка…</div></div>
     <div class="modal-actions">
       <button class="btn ghost" onclick="closePaymentPeek()">Закрыть</button>
@@ -1303,7 +1317,7 @@ function paymentSignalBlock(c, maxRows) {
   }).join("");
 }
 
-function paymentContextDetails(c) {
+function paymentContextDetails(c, adminMode) {
   const rows = paymentChatRows(c, 5);
   if (!rows.length) return "";
   const body = rows.map(e => {
@@ -1312,7 +1326,10 @@ function paymentContextDetails(c) {
       <span class="audit-chat-who">${outgoing ? "рабочий аккаунт" : "клиент"}</span>${escapeHtml(e.snippet || "")}
     </div>`;
   }).join("");
-  return `<details class="audit-context"><summary>Показать переписку рядом · ${rows.length}</summary><div class="audit-chat">${body}</div></details>`;
+  const note = adminMode
+    ? `<div class="audit-context-note"><span>Это снимок в момент сигнала. Новые сообщения сюда сами не добавляются.</span><button class="btn ghost" onclick="peekPaymentCase('${escapeHtml(String(c.id || ""))}')">Загрузить продолжение</button></div>`
+    : `<div class="audit-context-note"><span>Это снимок переписки в момент сигнала, а не весь диалог.</span></div>`;
+  return `<details class="audit-context"><summary>Фрагмент в момент сигнала · ${rows.length}</summary><div class="audit-chat">${body}</div>${note}</details>`;
 }
 
 function paymentReviewLine(c) {
@@ -1325,7 +1342,7 @@ function paymentAdminActions(c, suggested, presentation) {
   const id = String(c.id || "");
   if (presentation.tone === "failed") {
     return `<div class="audit-actions">
-      <button class="btn" onclick="peekPaymentCase('${id}')">Проверить диалог</button>
+      <button class="btn" onclick="peekPaymentCase('${id}')">Диалог и продолжение</button>
       <button class="btn audit-negative" onclick="adminReviewPaymentCase('${id}','dismissed',null)">Не доход</button>
       <button class="btn audit-secondary" onclick="adminReviewPaymentCase('${id}','needs_info',null)">Уточнить</button>
       <button class="btn audit-secondary" onclick="adminReviewPaymentCase('${id}','confirmed','${suggested}')">Всё же подтвердить</button>
@@ -1333,7 +1350,7 @@ function paymentAdminActions(c, suggested, presentation) {
   }
   return `<div class="audit-actions">
     <button class="btn" onclick="adminReviewPaymentCase('${id}','confirmed','${suggested}')">${c.admin_status === "confirmed" ? "Изменить сумму" : "Подтвердить доход"}</button>
-    <button class="btn ghost" onclick="peekPaymentCase('${id}')">Проверить диалог</button>
+    <button class="btn ghost" onclick="peekPaymentCase('${id}')">Диалог и продолжение</button>
     <button class="btn audit-secondary" onclick="adminReviewPaymentCase('${id}','needs_info',null)">Уточнить</button>
     <button class="btn audit-negative" onclick="adminReviewPaymentCase('${id}','dismissed',null)">Не доход</button>
   </div>`;
@@ -1370,7 +1387,7 @@ function paymentCaseCard(c, adminMode) {
     </div>
     <div class="audit-tags">${paymentCategoryTags(c, 5)}</div>
     ${paymentSignalBlock(c, 2)}
-    ${paymentContextDetails(c)}
+    ${paymentContextDetails(c, adminMode)}
     ${paymentReviewLine(c)}
     ${adminMode ? paymentAdminActions(c, suggested, presentation) : paymentUserActions(c, presentation)}
   </article>`;
@@ -2690,7 +2707,7 @@ function renderAdminPaymentAudit(data) {
       ${auditKpi(money(totals.commission), "15% с подтверждённого", "")}
     </div>
     <div class="audit-workers">${summaryHtml || `<div class="audit-empty">Недельных данных пока нет.</div>`}</div>
-    <div class="audit-list-title"><strong>Сигналы за последние 7 дней</strong><span>важные показаны первыми · «Проверить диалог» не ставит «прочитано»</span></div>
+    <div class="audit-list-title"><strong>Сигналы за последние 7 дней</strong><span>важные показаны первыми · «Диалог и продолжение» не ставит «прочитано»</span></div>
     <div class="audit-list">${caseHtml}</div>`;
 }
 
@@ -2726,7 +2743,7 @@ async function peekPaymentCase(id) {
   const sub = el("payment-peek-sub");
   if (!modal || !body) return;
   body.innerHTML = `<div class="hint">Загрузка диалога…</div>`;
-  if (sub) sub.textContent = "История открывается без отправки сообщений и отметки «прочитано».";
+  if (sub) sub.textContent = "Загружаю актуальную историю без отправки сообщений и отметки «прочитано».";
   modal.classList.remove("hidden");
   const { ok, data } = await api(`/api/admin/payment-audit/cases/${id}/peek`);
   if (!ok) {
@@ -2760,15 +2777,25 @@ async function peekPaymentCase(id) {
       ${ocr}
     </div>`;
   }).join("") || `<div class="hint">Скринов в этом окне нет</div>`;
-  const msgs = (data.messages || []).map(m => {
+  const messageRows = data.messages || [];
+  const triggerId = Number(origin.trigger_message_id || 0);
+  const messagesAfter = triggerId ? messageRows.filter(m => Number(m.id || 0) > triggerId).length : 0;
+  const messagesBefore = triggerId ? messageRows.filter(m => Number(m.id || 0) < triggerId).length : 0;
+  const continuation = triggerId
+    ? (messagesAfter
+      ? `<div class="audit-continuation has-new"><b>После сигнала есть продолжение:</b> ${messagesAfter} новых сообщений. Ниже показаны ${messagesBefore} до сигнала, сам сигнал и ${messagesAfter} после него.</div>`
+      : `<div class="audit-continuation"><b>После сигнала новых сообщений пока нет.</b> Ниже показан актуальный фрагмент диалога.</div>`)
+    : `<div class="audit-continuation">Исходный сигнал не попал в загруженное окно. Ниже показаны последние ${messageRows.length} сообщений диалога.</div>`;
+  const msgs = messageRows.map(m => {
     const outgoing = m.direction === "outgoing";
     const who = outgoing ? "рабочий аккаунт" : "клиент";
     const when = (m.at || "").slice(11, 16);
-    return `<div class="audit-chat-row${outgoing ? " outgoing" : ""}"><span class="audit-chat-who">${who}${when ? ` · ${when}` : ""}${m.has_media ? " · вложение" : ""}${m.is_trigger ? " · сигнал" : ""}</span>${escapeHtml(m.text || "")}</div>`;
+    return `<div class="audit-chat-row${outgoing ? " outgoing" : ""}${m.is_trigger ? " trigger" : ""}"><span class="audit-chat-who">${who}${when ? ` · ${when}` : ""}${m.has_media ? " · вложение" : ""}${m.is_trigger ? " · сигнал" : ""}</span>${escapeHtml(m.text || "")}</div>`;
   }).join("") || `<div class="hint">Сообщений не видно</div>`;
   body.innerHTML = `${originHtml}
     <details class="audit-peek-section" open><summary>Скрины рядом · ${(data.photos || []).length}</summary>${photos}</details>
-    <details class="audit-peek-section" open><summary>Переписка рядом · ${(data.messages || []).length}</summary><div class="audit-chat">${msgs}</div></details>`;
+    ${continuation}
+    <details class="audit-peek-section" open><summary>Актуальный фрагмент · ${messageRows.length}</summary><div class="audit-chat">${msgs}</div></details>`;
 }
 
 function _paymentAmountsLabel(c) {
