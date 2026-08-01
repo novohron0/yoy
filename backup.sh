@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Бэкап данных (profiles/: аккаунты, пользователи, подписки, расписания, сессии).
+# Бэкап данных. Маленькие критичные данные (аккаунты, расписания, сессии,
+# факты оплат) храним в 14 копиях. Уже зашифрованные полные чаты складываем
+# отдельно в один latest-снимок: повторять до 2 ГБ четырнадцать раз нельзя.
+# Если PAYMENT_ARCHIVE_KEY задан в .env, сам .env сюда намеренно не входит:
+# его резервную копию нужно хранить отдельно.
 # Кладёт архив в ~/yoy-backups (вне репозитория, чтобы git его не трогал),
 # хранит последние 14 копий. Безопасно запускать по cron.
 set -e
@@ -15,10 +19,43 @@ if [ ! -d "$REPO/profiles" ]; then
 fi
 
 STAMP=$(date '+%Y%m%d-%H%M')
+
+# Сначала снимаем тяжёлый архив, а уже потом SQLite. Тогда при событии прямо
+# во время бэкапа компактный факт попадёт в более новый SQLite-снимок, даже
+# если соответствующий полный чат не успел попасть в tar.
+CHAT_ARCHIVES="$REPO/profiles/payment_chat_archives"
+CHAT_LATEST="$DEST/payment-chat-archives-latest.tar"
+CHAT_TMP="$DEST/.payment-chat-archives-$STAMP.tar.tmp"
+STAGE=""
+cleanup() {
+  rm -f -- "$CHAT_TMP"
+  if [ -n "$STAGE" ] && [ -d "$STAGE" ]; then
+    rm -rf -- "$STAGE"
+  fi
+}
+trap cleanup EXIT
+if [ -d "$CHAT_ARCHIVES" ]; then
+  NEED_KB=$(du -sk "$CHAT_ARCHIVES" | awk '{print $1}')
+  FREE_KB=$(df -Pk "$DEST" | awk 'NR==2 {print $4}')
+  RESERVE_KB=262144
+  if [ "$FREE_KB" -ge $((NEED_KB + RESERVE_KB)) ]; then
+    if tar -cf "$CHAT_TMP" -C "$REPO/profiles" payment_chat_archives; then
+      chmod 600 "$CHAT_TMP"
+      mv -f "$CHAT_TMP" "$CHAT_LATEST"
+    else
+      rm -f "$CHAT_TMP"
+      echo "$(date '+%F %T') полный архив чатов изменился во время копирования — сохранена предыдущая latest-копия"
+    fi
+  else
+    echo "$(date '+%F %T') мало места для latest-копии полных чатов — критичный бэкап фактов всё равно будет сделан"
+  fi
+fi
+
 STAGE=$(mktemp -d)
-trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/profiles"
-cp -a "$REPO/profiles/." "$STAGE/profiles/"
+# Не затаскиваем тяжёлый архив в staging и в каждую из 14 ежедневных копий.
+tar -cf - --exclude='profiles/payment_chat_archives' -C "$REPO" profiles \
+  | tar -xf - -C "$STAGE"
 
 # Копирование SQLite-файла вместе с живым WAL может дать повреждённый архив.
 # sqlite3.backup делает согласованный снимок, пока приложение продолжает работу.

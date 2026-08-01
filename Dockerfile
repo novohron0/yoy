@@ -11,7 +11,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY web.py userbot.py payment_audit.py payment_audit_store.py receipt_ocr.py ./
+COPY web.py userbot.py payment_audit.py payment_audit_store.py payment_chat_archive.py receipt_ocr.py ./
 COPY static ./static
 
 # profiles/ (сессии + расписания) монтируется как volume в compose

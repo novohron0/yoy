@@ -283,6 +283,7 @@
   .audit-list-title { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin: 16px 0 9px; }
   .audit-list-title strong { font-size: 14px; }
   .audit-list-title span { color: var(--muted); font-size: 11px; }
+  .audit-search { width: 100%; margin: 0 0 9px; }
   .audit-list { display: grid; gap: 10px; }
   .audit-card {
     position: relative; overflow: hidden; padding: 14px;
@@ -293,6 +294,25 @@
   .audit-card.medium::before, .audit-card.needs-info::before { background: var(--accent-3); }
   .audit-card.confirmed::before { background: var(--ok); }
   .audit-card.dismissed { opacity: .72; }
+  .audit-chat-group {
+    overflow: hidden; padding: 11px; border: 1px solid rgba(86,156,214,.3);
+    border-radius: 15px; background: rgba(16,25,36,.46);
+  }
+  .audit-chat-group + .audit-chat-group { margin-top: 2px; }
+  .audit-chat-group-head {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+    padding: 2px 3px 11px;
+  }
+  .audit-chat-group-title { min-width: 0; font-size: 14px; font-weight: 750; }
+  .audit-chat-group-title span {
+    display: block; overflow: hidden; margin-top: 3px; color: var(--muted);
+    font-size: 10px; font-weight: 500; line-height: 1.35; text-overflow: ellipsis;
+  }
+  .audit-chat-group-count {
+    flex-shrink: 0; padding: 4px 8px; border-radius: 999px;
+    background: rgba(74,127,191,.15); color: #9dbfe6; font-size: 10px;
+  }
+  .audit-chat-group-list { display: grid; gap: 8px; }
   .audit-case-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
   .audit-person { min-width: 0; }
   .audit-person-name { font-size: 14px; font-weight: 750; }
@@ -325,6 +345,7 @@
   .audit-chat-row.outgoing { margin-left: auto; background: rgba(43,82,120,.55); }
   .audit-chat-row.trigger { outline: 1px solid rgba(86,156,214,.65); }
   .audit-chat-who { display: block; margin-bottom: 2px; color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .04em; }
+  .audit-chat-revision { margin-top: 6px; padding-top: 5px; border-top: 1px dashed rgba(157,191,230,.25); color: #f0c487; font-size: 10px; }
   .audit-context-note {
     display: flex; align-items: center; justify-content: space-between; gap: 10px;
     margin-top: 8px; padding: 8px 9px; border-radius: 9px;
@@ -336,6 +357,22 @@
     border-radius: 9px; background: var(--panel-2); color: var(--muted); font-size: 11px; line-height: 1.45;
   }
   .audit-continuation.has-new { border-color: rgba(86,156,214,.45); color: #b8d4ee; }
+  .audit-archive {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+    margin-top: 10px; padding: 10px 11px; border: 1px solid var(--border);
+    border-radius: 10px; background: rgba(14,22,33,.58);
+  }
+  .audit-archive.ready { border-color: rgba(61,194,126,.32); }
+  .audit-archive.pending { border-color: rgba(86,156,214,.38); }
+  .audit-archive.error, .audit-archive.truncated { border-color: rgba(255,184,77,.38); }
+  .audit-archive.purged { opacity: .82; }
+  .audit-archive-copy { min-width: 0; color: #cbd8e5; font-size: 11px; line-height: 1.45; }
+  .audit-archive-copy b { display: block; margin-bottom: 2px; color: var(--text); font-size: 12px; }
+  .audit-archive-copy span { color: var(--muted); }
+  .audit-archive-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; gap: 6px; max-width: 310px; }
+  .audit-archive-actions .btn { padding: 7px 9px; border-radius: 8px; font-size: 10px; }
+  .audit-archive-actions .btn.audit-negative { background: transparent; border: 1px solid rgba(255,107,107,.32); color: var(--err); }
+  .audit-archive-actions .btn:disabled { cursor: not-allowed; opacity: .45; }
   .audit-review { margin-top: 10px; color: var(--muted); font-size: 11px; line-height: 1.5; }
   .audit-review b { color: var(--text); }
   .audit-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 11px; }
@@ -347,6 +384,15 @@
   .audit-peek-section { margin-top: 12px; }
   .audit-peek-section > summary { cursor: pointer; color: var(--text); font-size: 13px; font-weight: 700; }
   .audit-photo { margin-top: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+  .audit-related { display: grid; gap: 6px; margin-top: 9px; }
+  .audit-related-row {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px;
+    padding: 8px 10px; border: 1px solid var(--border); border-radius: 9px;
+    background: var(--panel-2); font-size: 11px;
+  }
+  .audit-related-row b { overflow: hidden; text-overflow: ellipsis; }
+  .audit-related-row span { color: var(--muted); text-align: right; }
+  .audit-related-row.current { border-color: rgba(86,156,214,.5); }
 
   @media (max-width: 640px) {
     .audit-head { display: block; }
@@ -360,6 +406,14 @@
     .audit-actions .btn { width: 100%; }
     .audit-context-note { align-items: stretch; flex-direction: column; }
     .audit-context-note .btn { width: 100%; }
+    .audit-chat-group { padding: 8px; }
+    .audit-chat-group-head { display: block; }
+    .audit-chat-group-count { display: inline-flex; margin-top: 7px; }
+    .audit-archive { display: block; }
+    .audit-archive-actions { display: grid; grid-template-columns: 1fr; max-width: none; margin-top: 9px; }
+    .audit-archive-actions .btn { width: 100%; min-height: 38px; }
+    .audit-related-row { grid-template-columns: 1fr; gap: 3px; }
+    .audit-related-row span { text-align: left; }
   }
 </style>
 </head>
@@ -860,8 +914,8 @@ https://t.me/+AbCdEf..."></textarea>
 <!-- ============ Модалка: тихий просмотр оплаты ============ -->
 <div id="modal-payment-peek" class="overlay hidden" onclick="if(event.target===this)closePaymentPeek()">
   <div class="modal" style="width:520px">
-    <h2>Диалог и продолжение</h2>
-    <p class="sub" id="payment-peek-sub">Здесь загружается актуальная история из рабочего аккаунта.</p>
+    <h2>Полная проверка чата</h2>
+    <p class="sub" id="payment-peek-sub">Здесь открывается сохранённый чат целиком, чтобы сверить факт и сумму оплаты.</p>
     <div id="payment-peek-body"><div class="hint">Загрузка…</div></div>
     <div class="modal-actions">
       <button class="btn ghost" onclick="closePaymentPeek()">Закрыть</button>
@@ -1002,6 +1056,7 @@ let state = {
   profilesById: {},
   billing: null,
   paymentAudit: null,
+  adminPaymentAudit: null,
   editingSid: null,
   lastSearch: [],
   helpReturn: null,   // куда вернуться из обучения
@@ -1327,9 +1382,53 @@ function paymentContextDetails(c, adminMode) {
     </div>`;
   }).join("");
   const note = adminMode
-    ? `<div class="audit-context-note"><span>Это снимок в момент сигнала. Новые сообщения сюда сами не добавляются.</span><button class="btn ghost" onclick="peekPaymentCase('${escapeHtml(String(c.id || ""))}')">Загрузить продолжение</button></div>`
+    ? `<div class="audit-context-note"><span>Это короткий снимок в момент сигнала. Для проверки суммы открой весь автоматически сохранённый чат.</span><button class="btn ghost" onclick="peekPaymentCase('${escapeHtml(String(c.id || ""))}')">Проверить весь чат</button></div>`
     : `<div class="audit-context-note"><span>Это снимок переписки в момент сигнала, а не весь диалог.</span></div>`;
   return `<details class="audit-context"><summary>Фрагмент в момент сигнала · ${rows.length}</summary><div class="audit-chat">${body}</div>${note}</details>`;
+}
+
+function paymentArchivePresentation(c) {
+  const archive = c.archive || {};
+  const status = archive.status || "missing";
+  const messages = Math.max(0, Number(archive.message_count || 0));
+  const media = Math.max(0, Number(archive.media_count || 0));
+  const captured = archive.captured_at
+    ? String(archive.captured_at).slice(0, 16).replace("T", " ")
+    : "";
+  if (status === "pending") {
+    return { status, tone: "pending", title: "Сохраняем весь чат…", detail: "Архив создаётся автоматически после сигнала. Обнови карточку через несколько секунд." };
+  }
+  if (status === "ready") {
+    const counts = `${messages} сообщ. · ${media} влож.`;
+    if (archive.truncated) {
+      const storage = archive.last_error === "storage_quota"
+        ? " Достигнут лимит места: текстовый факт сохранён, часть вложений/истории пропущена."
+        : " Перед решением попробуй обновить архив.";
+      return { status, tone: "truncated", title: "Сохранена только часть чата", detail: `${counts}${captured ? ` · ${captured}` : ""}.${storage}` };
+    }
+    return { status, tone: "ready", title: "Весь чат сохранён", detail: `${counts}${captured ? ` · ${captured}` : ""}. Его можно открыть, даже если сообщения удалят в Telegram.` };
+  }
+  if (status === "error") {
+    const reason = archive.last_error ? ` Причина: ${archive.last_error}` : "";
+    return { status, tone: "error", title: "Не удалось сохранить весь чат", detail: `Нажми «Скачать/обновить весь чат».${reason}` };
+  }
+  if (status === "purged") {
+    return { status, tone: "purged", title: "Оставлены только факты оплаты", detail: `Полный чат удалён для экономии места. Сумма, сигнал и решение сохранены${captured ? ` · ${captured}` : ""}.` };
+  }
+  return { status: "missing", tone: "missing", title: "Полный чат ещё не сохранён", detail: "Нажми кнопку ниже, чтобы скачать его для проверки до возможного удаления сообщений." };
+}
+
+function paymentArchiveBlock(c) {
+  const view = paymentArchivePresentation(c);
+  const id = escapeHtml(String(c.id || ""));
+  const canPurge = !["missing", "purged"].includes(view.status);
+  return `<div class="audit-archive ${view.tone}">
+    <div class="audit-archive-copy"><b>${escapeHtml(view.title)}</b><span>${escapeHtml(view.detail)}</span></div>
+    <div class="audit-archive-actions">
+      <button class="btn ghost" onclick="archivePaymentCase('${id}')">${view.status === "pending" ? "Проверить/повторить сохранение" : "Скачать/обновить весь чат"}</button>
+      ${canPurge ? `<button class="btn audit-negative" onclick="purgePaymentCaseArchive('${id}')">Оставить только оплаты</button>` : ""}
+    </div>
+  </div>`;
 }
 
 function paymentReviewLine(c) {
@@ -1342,7 +1441,7 @@ function paymentAdminActions(c, suggested, presentation) {
   const id = String(c.id || "");
   if (presentation.tone === "failed") {
     return `<div class="audit-actions">
-      <button class="btn" onclick="peekPaymentCase('${id}')">Диалог и продолжение</button>
+      <button class="btn" onclick="peekPaymentCase('${id}')">Проверить весь чат</button>
       <button class="btn audit-negative" onclick="adminReviewPaymentCase('${id}','dismissed',null)">Не доход</button>
       <button class="btn audit-secondary" onclick="adminReviewPaymentCase('${id}','needs_info',null)">Уточнить</button>
       <button class="btn audit-secondary" onclick="adminReviewPaymentCase('${id}','confirmed','${suggested}')">Всё же подтвердить</button>
@@ -1350,7 +1449,7 @@ function paymentAdminActions(c, suggested, presentation) {
   }
   return `<div class="audit-actions">
     <button class="btn" onclick="adminReviewPaymentCase('${id}','confirmed','${suggested}')">${c.admin_status === "confirmed" ? "Изменить сумму" : "Подтвердить доход"}</button>
-    <button class="btn ghost" onclick="peekPaymentCase('${id}')">Диалог и продолжение</button>
+    <button class="btn ghost" onclick="peekPaymentCase('${id}')">Проверить весь чат</button>
     <button class="btn audit-secondary" onclick="adminReviewPaymentCase('${id}','needs_info',null)">Уточнить</button>
     <button class="btn audit-negative" onclick="adminReviewPaymentCase('${id}','dismissed',null)">Не доход</button>
   </div>`;
@@ -1368,7 +1467,7 @@ function paymentUserActions(c, presentation) {
   </div>`;
 }
 
-function paymentCaseCard(c, adminMode) {
+function paymentCaseCard(c, adminMode, showArchive) {
   const presentation = paymentCasePresentation(c);
   const rubAmounts = [...new Set((c.amounts || []).filter(a => a.currency === "RUB").map(a => Number(a.value) || 0).filter(v => v > 0))];
   const suggested = rubAmounts.length === 1 ? rubAmounts[0] : "";
@@ -1388,6 +1487,7 @@ function paymentCaseCard(c, adminMode) {
     <div class="audit-tags">${paymentCategoryTags(c, 5)}</div>
     ${paymentSignalBlock(c, 2)}
     ${paymentContextDetails(c, adminMode)}
+    ${adminMode && showArchive !== false ? paymentArchiveBlock(c) : ""}
     ${paymentReviewLine(c)}
     ${adminMode ? paymentAdminActions(c, suggested, presentation) : paymentUserActions(c, presentation)}
   </article>`;
@@ -2660,9 +2760,55 @@ function adminStatsHtml(st) {
     ${recent ? `<details style="margin-top:3px"><summary class="si-to" style="cursor:pointer;color:var(--muted)">последние рассылки + текст</summary>${recent}</details>` : ""}`;
 }
 
+function paymentChatGroupKey(c) {
+  // chat_label — только короткая подпись для экрана; она не уникальна.
+  // Группируем по полному непрозрачному ключу, иначе два разных клиента с
+  // одинаковыми последними шестью символами окажутся одной перепиской.
+  const owner = String(c.owner || c.username || "");
+  const profile = String(c.profile_id || c.profile_name || "");
+  const chat = String(c.chat_key || c.chat_id || c.peer_id || c.id || "");
+  return JSON.stringify([owner, profile, chat]);
+}
+
+function paymentChatGroupsHtml(cases) {
+  const groups = new Map();
+  for (const c of cases) {
+    const key = paymentChatGroupKey(c);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(c);
+  }
+  return [...groups.values()].map(rows => {
+    const first = rows[0] || {};
+    const chat = first.chat_label || "Чат без названия";
+    const username = first.username || "Сотрудник";
+    const profile = first.profile_name || "рабочий аккаунт";
+    const archiveCase = rows.find(c => (c.archive || {}).status === "ready" && !(c.archive || {}).truncated)
+      || rows.find(c => (c.archive || {}).status === "pending")
+      || first;
+    const archive = paymentArchivePresentation(archiveCase);
+    const search = `${chat} ${username} ${profile} ${rows.map(c => (c.amounts || []).map(a => a.value || "").join(" ")).join(" ")}`.toLowerCase();
+    return `<section class="audit-chat-group" data-audit-search="${escapeHtml(search)}">
+      <div class="audit-chat-group-head">
+        <div class="audit-chat-group-title">${escapeHtml(chat)}<span>${escapeHtml(username)} · ${escapeHtml(profile)} · ${escapeHtml(archive.title)}</span></div>
+        <div class="audit-chat-group-count">сигналов: ${rows.length}</div>
+      </div>
+      ${paymentArchiveBlock(archiveCase)}
+      <div class="audit-chat-group-list" style="margin-top:8px">${rows.map(c => paymentCaseCard(c, true, false)).join("")}</div>
+    </section>`;
+  }).join("");
+}
+
+function filterPaymentChatGroups(value) {
+  const query = String(value || "").trim().toLowerCase();
+  document.querySelectorAll("#admin-payment-audit .audit-chat-group").forEach(group => {
+    group.style.display = !query || String(group.dataset.auditSearch || "").includes(query) ? "" : "none";
+  });
+}
+
 function renderAdminPaymentAudit(data) {
   const box = el("admin-payment-audit");
   if (!box) return;
+  state.adminPaymentAudit = data || null;
   if (!data) { box.innerHTML = `<div class="audit-empty">Проверка оплат временно недоступна. Рассылки продолжают работать.</div>`; return; }
   const summaries = (data.summaries || []).filter(s => s.cases || s.week_report || s.pending || s.confirmed);
   const ocrQueue = data.ocr_queue || { active: 0, dropped: {} };
@@ -2694,8 +2840,11 @@ function renderAdminPaymentAudit(data) {
     return byState || String(b.last_at || "").localeCompare(String(a.last_at || ""));
   });
   const caseHtml = cases.length
-    ? cases.map(c => paymentCaseCard(c, true)).join("")
-    : `<div class="audit-empty">За последние 7 дней платёжных сигналов нет.</div>`;
+    ? paymentChatGroupsHtml(cases)
+    : `<div class="audit-empty">Сохранённых платёжных сигналов пока нет.</div>`;
+  const moreHtml = data.has_more
+    ? `<button class="btn ghost full" style="margin-top:12px" onclick="loadMoreAdminPaymentAudit(this)">Показать более старые сигналы · сейчас ${cases.length}</button>`
+    : (Number(data.offset || 0) > 0 ? `<div class="hint" style="margin-top:10px;text-align:center">Показана вся сохранённая история · ${cases.length}</div>` : "");
   box.innerHTML = `<div class="audit-head">
       <div><h3>Проверка оплат</h3><div class="audit-head-note">Сначала проверяй важные карточки. Сигнал из чата или скрин чека — это повод сверить перевод, а не доказательство поступления денег.</div></div>
       <div class="audit-health ${ocrDropped ? "warn" : "ok"}">OCR в работе: ${Number(ocrQueue.active || 0)}${ocrDropped ? ` · пропущено: ${ocrDropped}` : ""}</div>
@@ -2707,8 +2856,26 @@ function renderAdminPaymentAudit(data) {
       ${auditKpi(money(totals.commission), "15% с подтверждённого", "")}
     </div>
     <div class="audit-workers">${summaryHtml || `<div class="audit-empty">Недельных данных пока нет.</div>`}</div>
-    <div class="audit-list-title"><strong>Сигналы за последние 7 дней</strong><span>важные показаны первыми · «Диалог и продолжение» не ставит «прочитано»</span></div>
-    <div class="audit-list">${caseHtml}</div>`;
+    <input class="audit-search" type="search" placeholder="Найти сотрудника, аккаунт, диалог или сумму…" oninput="filterPaymentChatGroups(this.value)" />
+    <div class="audit-list-title"><strong>Все сохранённые чаты с сигналами</strong><span>сигналы одного чата собраны вместе · архив доступен до вашей ручной очистки</span></div>
+    <div class="audit-list">${caseHtml}</div>
+    ${moreHtml}`;
+}
+
+async function loadMoreAdminPaymentAudit(button) {
+  const current = state.adminPaymentAudit;
+  if (!current || !current.has_more) return;
+  if (button) { button.disabled = true; button.textContent = "Загрузка…"; }
+  const offset = Number(current.next_offset || (current.cases || []).length || 0);
+  const days = Number(current.days || 36500);
+  const { ok, data } = await api(`/api/admin/payment-audit?days=${days}&limit=300&offset=${offset}`);
+  if (!ok) {
+    if (button) { button.disabled = false; button.textContent = "Повторить загрузку"; }
+    return toast(data.error || "Не удалось загрузить старые сигналы", "bad");
+  }
+  const byId = new Map((current.cases || []).map(item => [String(item.id || ""), item]));
+  for (const item of (data.cases || [])) byId.set(String(item.id || ""), item);
+  renderAdminPaymentAudit({ ...data, cases: [...byId.values()] });
 }
 
 async function adminReviewPaymentCase(id, status, suggested) {
@@ -2730,6 +2897,31 @@ async function adminReviewPaymentCase(id, status, suggested) {
   loadAdminUsers();
 }
 
+async function archivePaymentCase(id) {
+  const modal = el("modal-payment-peek");
+  const reopenModal = Boolean(modal && !modal.classList.contains("hidden"));
+  const { ok, data } = await post(`/api/admin/payment-audit/cases/${id}/archive`, {});
+  if (!ok) return toast(data.error || "Не удалось сохранить весь чат", "bad");
+  const archive = data.archive || (data.case || {}).archive || {};
+  toast(archive.status === "pending" ? "Сохранение полного чата началось" : "Полный чат сохранён ✓", "ok");
+  await loadAdminUsers();
+  if (reopenModal) await peekPaymentCase(id);
+}
+
+async function purgePaymentCaseArchive(id) {
+  const agreed = confirm(
+    "Удалить сохранённый полный чат и вложения?\n\n"
+    + "Останутся: факт сигнала, найденная сумма, подтверждённая сумма и твоё решение. "
+    + "Вернуть переписку получится только если её ещё не удалили в Telegram."
+  );
+  if (!agreed) return;
+  const { ok, data } = await api(`/api/admin/payment-audit/cases/${id}/archive`, { method: "DELETE" });
+  if (!ok) return toast(data.error || "Не удалось очистить архив", "bad");
+  closePaymentPeek();
+  toast("Полный чат удалён, факты оплаты сохранены ✓", "ok");
+  await loadAdminUsers();
+}
+
 function closePaymentPeek() {
   const box = el("modal-payment-peek");
   if (box) box.classList.add("hidden");
@@ -2742,19 +2934,23 @@ async function peekPaymentCase(id) {
   const body = el("payment-peek-body");
   const sub = el("payment-peek-sub");
   if (!modal || !body) return;
-  body.innerHTML = `<div class="hint">Загрузка диалога…</div>`;
-  if (sub) sub.textContent = "Загружаю актуальную историю без отправки сообщений и отметки «прочитано».";
+  body.innerHTML = `<div class="hint">Загрузка полного чата…</div>`;
+  if (sub) sub.textContent = "Открываю сохранённую историю для сверки факта и суммы оплаты.";
   modal.classList.remove("hidden");
   const { ok, data } = await api(`/api/admin/payment-audit/cases/${id}/peek`);
   if (!ok) {
     body.innerHTML = `<div class="hint" style="color:var(--err)">${escapeHtml(data.error || "Не удалось открыть")}</div>`;
     return;
   }
+  const responseCase = data.case || {};
+  const archive = data.archive || responseCase.archive || {};
+  const modalCase = { ...responseCase, id: responseCase.id || id, archive };
+  const archived = Boolean(data.archived);
   const peer = data.peer || {};
   const peerName = peer.username ? `${peer.name || ""} (@${peer.username})` : (peer.name || "клиент");
-  const amountsLabel = _paymentAmountsLabel(data.case);
+  const amountsLabel = _paymentAmountsLabel(responseCase);
   if (sub) {
-    sub.textContent = `${peerName} · ${amountsLabel} · ${data.hint || "тихо, только чтение"}`;
+    sub.textContent = `${peerName} · ${amountsLabel} · ${archived ? "сохранённая копия" : (data.hint || "чтение без отметки «прочитано»")}`;
   }
   const origin = data.origin || {};
   const detector = (origin.detector || []).map(x =>
@@ -2765,15 +2961,35 @@ async function peekPaymentCase(id) {
       ${detector ? `<div class="audit-tags">${detector}</div>` : ""}
       <div class="audit-status ${origin.trigger_found ? "confirmed" : "needs-info"}">${origin.trigger_found ? "✓ Исходное сообщение найдено" : "? Сверь сообщение и скрины ниже"}</div>
     </div>`;
+  const relatedCases = [...(data.related_cases || [])];
+  if (responseCase.id && !relatedCases.some(item => String(item.id || "") === String(responseCase.id))) {
+    relatedCases.unshift(responseCase);
+  }
+  const relatedRows = relatedCases.map(item => {
+    const view = paymentCasePresentation(item);
+    const when = String(item.last_at || item.created_at || "").slice(0, 16).replace("T", " ");
+    const current = String(item.id || "") === String(id);
+    const decision = item.admin_status === "confirmed" && item.admin_amount != null
+      ? ` · подтверждено ${money(item.admin_amount)}`
+      : "";
+    return `<div class="audit-related-row${current ? " current" : ""}">
+      <b>${paymentAmounts(item)}${current ? " · текущий сигнал" : ""}</b>
+      <span>${escapeHtml(view.label)}${decision}${when ? ` · ${escapeHtml(when)}` : ""}</span>
+    </div>`;
+  }).join("");
+  const relatedHtml = relatedRows
+    ? `<details class="audit-peek-section" open><summary>Оплаты в этом диалоге · ${relatedCases.length}</summary><div class="audit-related">${relatedRows}</div></details>`
+    : "";
   const photos = (data.photos || []).map(p => {
     const badge = p.matches_case_amount
       ? `<span class="audit-status confirmed">✓ сумма совпадает</span>`
       : (p.is_trigger ? `<span class="audit-status medium">сообщение-сигнал</span>` : "");
     const ocr = p.ocr_text ? `<details class="audit-context"><summary>Показать распознанный текст</summary><div class="audit-signal">${escapeHtml(p.ocr_text)}</div></details>` : "";
     const who = p.direction === "outgoing" ? "аккаунт" : "клиент";
+    const photoSrc = p.data_url || p.url || "";
     return `<div class="audit-photo">
-      <div class="audit-meta">${who} · скрин #${p.message_id} ${badge}</div>
-      <img src="${p.data_url}" alt="Скрин из рабочего диалога" loading="lazy" style="max-width:100%;border-radius:10px;border:1px solid var(--border);margin-top:7px" />
+      <div class="audit-meta">${who} · скрин #${p.message_id}${p.versioned ? " · сохранённая версия" : ""} ${badge}</div>
+      ${photoSrc ? `<img src="${escapeHtml(String(photoSrc))}" alt="Скрин из рабочего диалога" loading="lazy" style="max-width:100%;border-radius:10px;border:1px solid var(--border);margin-top:7px" />` : `<div class="hint" style="margin-top:7px">Вложение сохранено без предпросмотра</div>`}
       ${ocr}
     </div>`;
   }).join("") || `<div class="hint">Скринов в этом окне нет</div>`;
@@ -2781,21 +2997,29 @@ async function peekPaymentCase(id) {
   const triggerId = Number(origin.trigger_message_id || 0);
   const messagesAfter = triggerId ? messageRows.filter(m => Number(m.id || 0) > triggerId).length : 0;
   const messagesBefore = triggerId ? messageRows.filter(m => Number(m.id || 0) < triggerId).length : 0;
-  const continuation = triggerId
-    ? (messagesAfter
-      ? `<div class="audit-continuation has-new"><b>После сигнала есть продолжение:</b> ${messagesAfter} новых сообщений. Ниже показаны ${messagesBefore} до сигнала, сам сигнал и ${messagesAfter} после него.</div>`
-      : `<div class="audit-continuation"><b>После сигнала новых сообщений пока нет.</b> Ниже показан актуальный фрагмент диалога.</div>`)
-    : `<div class="audit-continuation">Исходный сигнал не попал в загруженное окно. Ниже показаны последние ${messageRows.length} сообщений диалога.</div>`;
+  const archiveReady = archived && archive.status === "ready";
+  const continuation = archived
+    ? (archiveReady
+      ? `<div class="audit-continuation${archive.truncated ? "" : " has-new"}"><b>${archive.truncated ? "Сработал защитный лимит — архив неполный." : "Сохранённый чат открыт целиком."}</b> ${messageRows.length} сообщений${triggerId ? `: ${messagesBefore} до сигнала и ${messagesAfter} после` : ""}. ${archive.truncated ? "Проверь сохранённую часть и при необходимости обнови архив." : "Можно спокойно прочитать его и сверить сумму."}</div>`
+      : `<div class="audit-continuation"><b>${archive.status === "pending" ? "Полный чат ещё сохраняется." : (archive.status === "purged" ? "Переписка удалена, оставлены только оплаты." : "Загрузка архива завершилась с ошибкой.")}</b> Уже сохранено сообщений: ${messageRows.length}.${archive.status === "error" ? " Нажми «Скачать/обновить весь чат», чтобы повторить." : ""}</div>`)
+    : (triggerId
+      ? `<div class="audit-continuation has-new"><b>Загружена актуальная переписка:</b> ${messageRows.length} сообщений, из них ${messagesAfter} после сигнала. Сохрани её кнопкой выше, пока сообщения доступны в Telegram.</div>`
+      : `<div class="audit-continuation">Загружено ${messageRows.length} сообщений. Сохрани весь чат кнопкой выше до возможного удаления переписки.</div>`);
   const msgs = messageRows.map(m => {
     const outgoing = m.direction === "outgoing";
     const who = outgoing ? "рабочий аккаунт" : "клиент";
-    const when = (m.at || "").slice(11, 16);
-    return `<div class="audit-chat-row${outgoing ? " outgoing" : ""}${m.is_trigger ? " trigger" : ""}"><span class="audit-chat-who">${who}${when ? ` · ${when}` : ""}${m.has_media ? " · вложение" : ""}${m.is_trigger ? " · сигнал" : ""}</span>${escapeHtml(m.text || "")}</div>`;
+    const when = String(m.at || "").slice(5, 16).replace("T", " ");
+    const previous = [...(m.revisions || [])].reverse().map(revision =>
+      `<div class="audit-chat-revision">${revision.original ? "Сначала было" : "Раньше было"}: ${escapeHtml(revision.text || "")}</div>`
+    ).join("");
+    return `<div class="audit-chat-row${outgoing ? " outgoing" : ""}${m.is_trigger ? " trigger" : ""}"><span class="audit-chat-who">${who}${when ? ` · ${when}` : ""}${m.has_media ? " · вложение" : ""}${m.is_trigger ? " · сигнал" : ""}${m.edited ? " · изменено" : ""}</span>${escapeHtml(m.text || "")}${previous}</div>`;
   }).join("") || `<div class="hint">Сообщений не видно</div>`;
   body.innerHTML = `${originHtml}
-    <details class="audit-peek-section" open><summary>Скрины рядом · ${(data.photos || []).length}</summary>${photos}</details>
+    ${paymentArchiveBlock(modalCase)}
+    ${relatedHtml}
     ${continuation}
-    <details class="audit-peek-section" open><summary>Актуальный фрагмент · ${messageRows.length}</summary><div class="audit-chat">${msgs}</div></details>`;
+    <details class="audit-peek-section" open><summary>${archiveReady && !archive.truncated ? "Весь сохранённый чат" : "Сообщения для проверки"} · ${messageRows.length}</summary><div class="audit-chat">${msgs}</div></details>
+    <details class="audit-peek-section" open><summary>Вложения и скрины · ${(data.photos || []).length}</summary>${photos}</details>`;
 }
 
 function _paymentAmountsLabel(c) {
@@ -2809,7 +3033,7 @@ async function loadAdminUsers() {
   const box = el("admin-list");
   box.innerHTML = `<div class="hint">Загрузка…</div>`;
   const [{ ok, data }, statsRes, paymentRes] = await Promise.all([
-    api("/api/admin/users"), api("/api/admin/stats"), api("/api/admin/payment-audit?days=7")
+    api("/api/admin/users"), api("/api/admin/stats"), api("/api/admin/payment-audit?days=36500")
   ]);
   if (!ok) { box.innerHTML = `<div class="hint">${escapeHtml(data.error || "Ошибка")}</div>`; return; }
   const statsById = {};

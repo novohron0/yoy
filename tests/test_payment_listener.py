@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 import unittest
 from datetime import datetime, timezone
@@ -26,13 +27,33 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         for task in list(web.state.audit_ocr_tasks):
             task.cancel()
+        for meta in list(web.state.audit_archive_tasks.values()):
+            task = meta.get("task")
+            if task is not None:
+                task.cancel()
         web.state.audit_ocr_tasks.clear()
+        web.state.audit_archive_tasks.clear()
         web.state.audit_ocr_recent.clear()
         web.state.audit_ocr_dropped = {"queue": 0, "quota": 0, "invalid": 0}
         web.state.audit_deleted_owners.clear()
         web.state.audit_deleted_profiles.clear()
         web.state.audit_owner_locks.clear()
         web.state.audit_ocr_semaphore = None
+        web.state.audit_archive_semaphore = None
+        web.state.audit_archive_media_semaphore = None
+        # Ordinary listener tests must never create encrypted artifacts in the
+        # repository's real profiles/ directory. Archive-specific tests replace
+        # this mock with their own instance inside the test body.
+        self.default_archive = MagicMock()
+        self.default_archive.load.return_value = None
+        self.default_archive.summary.return_value = {"status": "missing"}
+        self.archive_patcher = patch.object(
+            web,
+            "_get_payment_chat_archive_async",
+            AsyncMock(return_value=self.default_archive),
+        )
+        self.archive_patcher.start()
+        self.addCleanup(self.archive_patcher.stop)
 
     def work_user(self, **extra):
         """Одобренный рабочий пользователь: проверка оплат включена для всех таких."""
@@ -80,11 +101,13 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("5 000 ₽", snippet)
         self.assertNotIn("Секретная", snippet)
 
-    async def test_passes_nearby_chat_context_for_quick_review(self):
+    async def test_seeds_and_schedules_full_chat_archive_before_background_fetch(self):
         store = MagicMock()
         store.chat_key.return_value = "CHATKEY"
         store.event_key.return_value = "EVENTKEY"
+        store.message_ref.return_value = "MESSAGEREF"
         store.record_event.return_value = {
+            "id": "case1",
             "level": "high",
             "created_at": "t1",
             "updated_at": "t2",
@@ -96,24 +119,23 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
             "chat_label": "Диалог #ABC",
         }
         client = AsyncMock()
-        # Telethon отдаёт историю newest-first — как в реальном get_messages.
-        client.get_messages.return_value = [
-            SimpleNamespace(raw_text="Скинул 5 000 ₽ по СБП", out=False, media=None, message="Скинул 5 000 ₽ по СБП"),
-            SimpleNamespace(raw_text="5000", out=True, media=None, message="5000"),
-            SimpleNamespace(raw_text="Сколько?", out=False, media=None, message="Сколько?"),
-        ]
+        archive = MagicMock()
         with (
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
             patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "payment_audit_store", store),
+            patch.object(web, "_get_payment_chat_archive_async", AsyncMock(return_value=archive)),
+            patch.object(web, "_schedule_payment_chat_archive") as schedule,
         ):
             await web._handle_payment_message(client, "p1", FakeEvent())
 
-        context = store.record_event.call_args.kwargs["context"]
-        self.assertGreaterEqual(len(context), 2)
-        self.assertEqual(context[0]["direction"], "incoming")
-        self.assertIn("Сколько", context[0]["snippet"])
-        self.assertEqual(context[1]["direction"], "outgoing")
+        self.assertIsNone(store.record_event.call_args.kwargs["context"])
+        seeded_rows = archive.merge.call_args.args[3]
+        self.assertEqual(len(seeded_rows), 1)
+        self.assertEqual(seeded_rows[0]["id"], 77)
+        self.assertIn("5 000 ₽", seeded_rows[0]["text"])
+        schedule.assert_called_once()
+        client.get_messages.assert_not_awaited()
 
     async def test_quiet_peek_keeps_the_continuation_after_the_trigger(self):
         messages = [SimpleNamespace(id=mid) for mid in (15, 14, 13, 12, 11)]
@@ -133,6 +155,112 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row.id for row in rows], [11, 12, 13, 14, 15])
         self.assertEqual(matched.id, 13)
         self.assertEqual([row.id for row in rows if row.id > matched.id], [14, 15])
+
+    async def test_full_archive_fetches_all_available_chat_messages(self):
+        history = [
+            SimpleNamespace(
+                id=mid,
+                raw_text=f"message {mid}",
+                message=f"message {mid}",
+                out=mid % 2 == 0,
+                date=datetime(2026, 8, 1, 10, mid, tzinfo=timezone.utc),
+                edit_date=None,
+                media=None,
+                photo=None,
+                file=None,
+            )
+            for mid in (3, 2, 1)
+        ]
+        client = AsyncMock()
+        client.get_messages.return_value = history
+        archive = MagicMock()
+        web.state.audit_archive_semaphore = None
+        with (
+            patch.object(web, "_get_payment_chat_archive_async", AsyncMock(return_value=archive)),
+            patch.object(web, "_payment_audit_scope_active", return_value=True),
+        ):
+            await web._capture_payment_chat(
+                client,
+                owner="u1",
+                pid="p1",
+                chat_id=12345,
+                chat_key="CHATKEY",
+            )
+
+        client.get_messages.assert_awaited_once()
+        merge_calls = [call for call in archive.merge.call_args_list if call.args[3]]
+        self.assertEqual(len(merge_calls), 1)
+        self.assertEqual({row["id"] for row in merge_calls[0].args[3]}, {1, 2, 3})
+        self.assertEqual(archive.mark_status.call_args.args[3], "ready")
+
+    async def test_ordinary_continuation_is_appended_after_first_signal(self):
+        store = MagicMock()
+        store.chat_key.return_value = "CHATKEY"
+        archive = MagicMock()
+        archive.load.return_value = {"status": "ready", "messages": []}
+        event = FakeEvent("Хорошо, встречаемся завтра в десять")
+        with (
+            patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
+            patch.object(web, "get_user", return_value=self.work_user()),
+            patch.object(web, "payment_audit_store", store),
+            patch.object(web, "_get_payment_chat_archive_async", AsyncMock(return_value=archive)),
+        ):
+            await web._handle_payment_message(MagicMock(), "p1", event)
+
+        store.record_event.assert_not_called()
+        saved_rows = archive.merge.call_args.args[3]
+        self.assertEqual(saved_rows[0]["id"], event.id)
+        self.assertIn("встречаемся завтра", saved_rows[0]["text"])
+        self.assertEqual(archive.merge.call_args.kwargs["status"], "ready")
+
+    async def test_new_signal_during_capture_forces_one_fresh_pass(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def capture(client, **kwargs):
+            calls.append((client, kwargs["chat_id"]))
+            if len(calls) == 1:
+                started.set()
+                await release.wait()
+
+        with patch.object(web, "_capture_payment_chat", new=capture):
+            first = web._schedule_payment_chat_archive(
+                "client-1", owner="u1", pid="p1", chat_id=1, chat_key="CHATKEY"
+            )
+            await started.wait()
+            second = web._schedule_payment_chat_archive(
+                "client-2", owner="u1", pid="p1", chat_id=1, chat_key="CHATKEY"
+            )
+            self.assertIs(first, second)
+            release.set()
+            await first
+
+        self.assertEqual(calls, [("client-1", 1), ("client-2", 1)])
+
+    async def test_cancel_safe_thread_finishes_before_cancellation_returns(self):
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def write():
+            started.set()
+            release.wait(2)
+            finished.set()
+
+        task = asyncio.create_task(web._cancel_safe_to_thread(write))
+        try:
+            while not started.is_set():
+                await asyncio.sleep(0.001)
+            task.cancel()
+            await asyncio.sleep(0.02)
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertTrue(finished.is_set())
+        finally:
+            release.set()
 
     async def test_outgoing_sent_money_is_not_income(self):
         store = MagicMock()
@@ -622,7 +750,9 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(web, "_current_week_bounds", return_value=("2026-07-27", "2026-08-03")),
             patch.object(web, "_payment_ocr_available", new=AsyncMock(return_value=True)),
         ):
-            result = await web.payment_audit_info(user=self.work_user())
+            result = await web.payment_audit_info(
+                response=web.Response(), user=self.work_user()
+            )
 
         store.weekly_summary.assert_called_once_with(
             "u1", "2026-07-27", "2026-08-03",

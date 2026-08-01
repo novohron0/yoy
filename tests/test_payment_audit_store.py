@@ -98,6 +98,44 @@ class PaymentAuditStoreTests(unittest.TestCase):
             "a",
         )
 
+    def test_lists_all_payment_facts_for_one_chat_together(self):
+        completed = {
+            "score": 82,
+            "categories": ["transfer_completed"],
+            "event_status": "completed",
+            "income_claim": True,
+        }
+        first = self.record("chat-one", chat_id=123, minute=1, **completed)
+        second = self.record("chat-two", chat_id=123, minute=2, **completed)
+        self.record("other-chat", chat_id=456, minute=3, **completed)
+
+        rows = self.store.list_chat_cases("u1", first["chat_key"])
+
+        self.assertEqual([row["id"] for row in rows], [first["id"], second["id"]])
+        self.assertEqual(len(self.store.chat_message_refs("u1", first["chat_key"])), 2)
+
+    def test_compacts_chat_to_payment_facts_without_losing_amount_or_decision(self):
+        case = self.record(
+            "compact",
+            score=82,
+            categories=["transfer_completed"],
+            amounts=[{"value": 5000, "currency": "RUB"}],
+            event_status="completed",
+            income_claim=True,
+            context=[{"direction": "incoming", "snippet": "скинул 5000 ₽"}],
+        )
+        self.store.review(case["id"], "admin-1", "confirmed", 5000, "проверено")
+
+        changed = self.store.compact_chat("u1", case["chat_key"], "admin-1")
+        compacted = self.store.get_case(case["id"])
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(compacted["evidence"], [])
+        self.assertEqual(compacted["context"], [])
+        self.assertEqual(compacted["amounts"], [{"value": 5000.0, "currency": "RUB"}])
+        self.assertEqual(compacted["admin_status"], "confirmed")
+        self.assertEqual(compacted["admin_amount"], 5000.0)
+
     def test_masks_financial_and_contact_identifiers_but_keeps_amount(self):
         original = (
             "Сумма 5000, карта 2200 7012 3456 7890, "
@@ -581,6 +619,29 @@ class PaymentAuditStoreTests(unittest.TestCase):
         with self.store._connection() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM payment_weekly_report_log").fetchone()[0], 0)
 
+    def test_zero_retention_keeps_payment_facts_until_manual_deletion(self):
+        permanent = PaymentAuditStore(
+            os.path.join(self.tmp.name, "permanent.sqlite3"),
+            "test-secret",
+            retention_days=0,
+        )
+        case = permanent.record_event(
+            event_key=permanent.event_key("p1", 1, 1, "message"),
+            owner="u1",
+            profile_id="p1",
+            chat_key=permanent.chat_key("p1", 1),
+            observed_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+            direction="incoming",
+            analysis={"score": 80, "categories": ["transfer_completed"]},
+            snippet="скинул 5000 ₽",
+            source="message",
+        )
+
+        removed = permanent.cleanup(datetime(2030, 1, 1, tzinfo=timezone.utc))
+
+        self.assertEqual(removed, 0)
+        self.assertEqual(permanent.get_case(case["id"])["id"], case["id"])
+
     def test_every_operation_closes_its_connection(self):
         raw = sqlite3.connect(self.store.path)
         raw.row_factory = sqlite3.Row
@@ -669,6 +730,25 @@ class PaymentAuditStoreTests(unittest.TestCase):
         case = self.record("one")
         with self.assertRaises(KeyError):
             self.store.respond(case["id"], "u2", "personal")
+
+    def test_case_history_can_be_loaded_in_stable_pages_without_a_hard_cutoff(self):
+        now = datetime.now(timezone.utc)
+        created = [
+            self.record(
+                f"page-{index}",
+                at=now - timedelta(minutes=index),
+                chat_id=10_000 + index,
+            )
+            for index in range(5)
+        ]
+
+        first = self.store.list_cases(owner="u1", days=7, limit=2, offset=0)
+        second = self.store.list_cases(owner="u1", days=7, limit=2, offset=2)
+        last = self.store.list_cases(owner="u1", days=7, limit=2, offset=4)
+
+        self.assertEqual([row["id"] for row in first], [row["id"] for row in created[:2]])
+        self.assertEqual([row["id"] for row in second], [row["id"] for row in created[2:4]])
+        self.assertEqual([row["id"] for row in last], [created[4]["id"]])
 
     def test_archive_profile_detaches_active_link_but_keeps_cases_until_owner_purge(self):
         message_id = 333

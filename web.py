@@ -31,6 +31,7 @@ import os
 import random
 import re
 import secrets
+import tempfile
 import threading
 import time
 import uuid
@@ -39,6 +40,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs, urlencode
 
 from payment_audit import analyze_payment_signal
+from payment_chat_archive import PaymentChatArchive, PaymentChatArchiveError
 from payment_audit_store import PaymentAuditStore, mask_sensitive_text, normalize_chat_context
 from receipt_ocr import (
     OcrLimits,
@@ -86,6 +88,8 @@ NOTIFS_KEEP = int(os.environ.get("NOTIFS_KEEP", "100"))
 RESPONSES_JSON = os.path.join(PROFILES_DIR, "responses.json")  # счётчик входящих в личку (отклик на рассылки)
 RESP_KEEP_DAYS = int(os.environ.get("RESP_KEEP_DAYS", "30"))
 PAYMENT_AUDIT_DB = os.path.join(PROFILES_DIR, "payment_audit.sqlite3")
+PAYMENT_CHAT_ARCHIVE_DIR = os.path.join(PROFILES_DIR, "payment_chat_archives")
+PAYMENT_CHAT_ARCHIVE_KEY_FILE = os.path.join(PROFILES_DIR, "payment_archive.key")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 os.makedirs(PROFILES_DIR, exist_ok=True)
@@ -112,8 +116,44 @@ if not SECRET_KEY:
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"
 
 # --- Прозрачная проверка оплат в рабочих Telegram-аккаунтах ---
-PAYMENT_AUDIT_VERSION = "2026-07-30-v1"
-PAYMENT_AUDIT_RETENTION_DAYS = int(os.environ.get("PAYMENT_AUDIT_RETENTION_DAYS", "60"))
+PAYMENT_AUDIT_VERSION = "2026-08-01-v2"
+# Минимальные факты и решения нужны для недельной/годовой сверки дольше, чем
+# тяжёлый архив полной переписки. Старое имя env оставлено как fallback.
+PAYMENT_AUDIT_RETENTION_DAYS = int(os.environ.get(
+    "PAYMENT_FACT_RETENTION_DAYS",
+    os.environ.get("PAYMENT_AUDIT_RETENTION_DAYS", "0"),
+))
+PAYMENT_CHAT_ARCHIVE_RETENTION_DAYS = int(os.environ.get(
+    # 0 = хранить до ручной кнопки «Оставить только оплаты».
+    "PAYMENT_CHAT_ARCHIVE_RETENTION_DAYS", "0"
+))
+PAYMENT_CHAT_ARCHIVE_MAX_MESSAGES = int(os.environ.get(
+    "PAYMENT_CHAT_ARCHIVE_MAX_MESSAGES", "5000"
+))
+PAYMENT_CHAT_ARCHIVE_MAX_TEXT_BYTES = int(os.environ.get(
+    "PAYMENT_CHAT_ARCHIVE_MAX_TEXT_BYTES", str(10 * 1024 * 1024)
+))
+PAYMENT_CHAT_ARCHIVE_MAX_MEDIA_ITEMS = int(os.environ.get(
+    "PAYMENT_CHAT_ARCHIVE_MAX_MEDIA_ITEMS", "50"
+))
+PAYMENT_CHAT_ARCHIVE_MAX_MEDIA_BYTES = int(os.environ.get(
+    "PAYMENT_CHAT_ARCHIVE_MAX_MEDIA_BYTES", str(10 * 1024 * 1024)
+))
+PAYMENT_CHAT_ARCHIVE_MAX_TOTAL_MEDIA_BYTES = int(os.environ.get(
+    "PAYMENT_CHAT_ARCHIVE_MAX_TOTAL_MEDIA_BYTES", str(50 * 1024 * 1024)
+))
+PAYMENT_CHAT_ARCHIVE_OWNER_BYTES = int(os.environ.get(
+    "PAYMENT_CHAT_ARCHIVE_OWNER_BYTES", str(512 * 1024 * 1024)
+))
+PAYMENT_CHAT_ARCHIVE_GLOBAL_BYTES = int(os.environ.get(
+    "PAYMENT_CHAT_ARCHIVE_GLOBAL_BYTES", str(2 * 1024 * 1024 * 1024)
+))
+PAYMENT_CHAT_ARCHIVE_MIN_FREE_BYTES = int(os.environ.get(
+    "PAYMENT_CHAT_ARCHIVE_MIN_FREE_BYTES", str(512 * 1024 * 1024)
+))
+PAYMENT_CHAT_ARCHIVE_TIMEOUT = float(os.environ.get(
+    "PAYMENT_CHAT_ARCHIVE_TIMEOUT", "120"
+))
 PAYMENT_AUDIT_OCR_MAX_BYTES = int(os.environ.get("PAYMENT_AUDIT_OCR_MAX_BYTES", str(10 * 1024 * 1024)))
 PAYMENT_AUDIT_OCR_PER_HOUR = int(os.environ.get("PAYMENT_AUDIT_OCR_PER_HOUR", "30"))
 PAYMENT_AUDIT_OCR_QUEUE_MAX = int(os.environ.get("PAYMENT_AUDIT_OCR_QUEUE_MAX", "20"))
@@ -123,6 +163,8 @@ PAYMENT_COMMISSION_RATE = 0.15
 payment_audit_store = None
 _payment_audit_store_retry_at = 0.0
 _payment_audit_store_lock = threading.Lock()
+payment_chat_archive = None
+_payment_chat_archive_lock = threading.Lock()
 _payment_ocr_health_cache = (0.0, False)
 receipt_ocr = RemoteReceiptOcr(
     base_url=os.environ.get("PAYMENT_AUDIT_OCR_URL", "http://ocr:8080"),
@@ -162,6 +204,86 @@ def _get_payment_audit_store():
 
 async def _get_payment_audit_store_async():
     return await asyncio.to_thread(_get_payment_audit_store)
+
+
+def _payment_archive_key():
+    """Load a dedicated archive key; production should provide it via .env."""
+    def validate(value):
+        text = str(value or "").strip()
+        valid = bool(re.fullmatch(r"[0-9a-fA-F]{64}", text))
+        if not valid:
+            try:
+                valid = len(base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))) == 32
+            except Exception:
+                valid = False
+        if not valid:
+            raise PaymentChatArchiveError(
+                "PAYMENT_ARCHIVE_KEY must be 32 bytes (64 hex characters)"
+            )
+        return text
+
+    def read_file():
+        with open(PAYMENT_CHAT_ARCHIVE_KEY_FILE, "r", encoding="utf-8") as handle:
+            return validate(handle.read())
+
+    configured = (os.environ.get("PAYMENT_ARCHIVE_KEY") or "").strip()
+    if configured:
+        return validate(configured)
+    if os.path.exists(PAYMENT_CHAT_ARCHIVE_KEY_FILE):
+        return read_file()
+    value = secrets.token_hex(32)
+    fd, tmp_name = tempfile.mkstemp(prefix=".payment-archive-key-", dir=PROFILES_DIR)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        fd = -1
+        try:
+            # link() publishes without overwriting a key another process created.
+            os.link(tmp_name, PAYMENT_CHAT_ARCHIVE_KEY_FILE)
+        except FileExistsError:
+            return read_file()
+        try:
+            dir_fd = os.open(PROFILES_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+        return value
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
+def _get_payment_chat_archive():
+    global payment_chat_archive
+    with _payment_chat_archive_lock:
+        if payment_chat_archive is None:
+            payment_chat_archive = PaymentChatArchive(
+                PAYMENT_CHAT_ARCHIVE_DIR,
+                _payment_archive_key(),
+                max_messages=max(1, PAYMENT_CHAT_ARCHIVE_MAX_MESSAGES),
+                max_text_bytes=max(1024, PAYMENT_CHAT_ARCHIVE_MAX_TEXT_BYTES),
+                max_media_items=max(0, PAYMENT_CHAT_ARCHIVE_MAX_MEDIA_ITEMS),
+                max_media_bytes=max(1024, PAYMENT_CHAT_ARCHIVE_MAX_MEDIA_BYTES),
+                max_total_media_bytes=max(1024, PAYMENT_CHAT_ARCHIVE_MAX_TOTAL_MEDIA_BYTES),
+                max_owner_bytes=max(0, PAYMENT_CHAT_ARCHIVE_OWNER_BYTES),
+                max_global_bytes=max(0, PAYMENT_CHAT_ARCHIVE_GLOBAL_BYTES),
+                min_free_bytes=max(0, PAYMENT_CHAT_ARCHIVE_MIN_FREE_BYTES),
+            )
+        return payment_chat_archive
+
+
+async def _get_payment_chat_archive_async():
+    return await asyncio.to_thread(_get_payment_chat_archive)
 
 
 async def _payment_ocr_available():
@@ -640,6 +762,7 @@ class State:
     # ссылкой и корректно отменяем при остановке контейнера.
     audit_tasks: set[asyncio.Task] = set()
     audit_ocr_tasks: dict[asyncio.Task, dict] = {}
+    audit_archive_tasks: dict[str, dict] = {}
     audit_ocr_recent: dict[str, list[tuple[float, bool]]] = {}
     audit_ocr_dropped: dict[str, int] = {"queue": 0, "quota": 0, "invalid": 0}
     audit_deleted_owners: set[str] = set()
@@ -648,7 +771,10 @@ class State:
     # in-flight Telegram callback from recreating evidence after it was deleted.
     audit_owner_locks: dict[str, asyncio.Lock] = {}
     audit_ocr_semaphore = None
+    audit_archive_semaphore = None
+    audit_archive_media_semaphore = None
     audit_cleanup_at = 0.0
+    audit_archive_resume_at = 0.0
     scheduler_task = None
     warm_task = None
 
@@ -910,6 +1036,413 @@ async def _payment_chat_context(client, chat_id, *, limit=5):
     return normalize_chat_context(rows, limit=5, snippet_limit=120)
 
 
+def _payment_archive_task_key(owner, pid, chat_key):
+    return f"{owner}:{pid}:{chat_key}"
+
+
+def _payment_archive_message_row(message):
+    """Convert a Telethon message/event to a masked archival row."""
+    try:
+        message_id = int(getattr(message, "id", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if message_id <= 0:
+        return None
+    raw = getattr(message, "raw_text", None)
+    if not isinstance(raw, str):
+        raw = getattr(message, "message", None)
+    text = raw if isinstance(raw, str) else ""
+    file_obj = getattr(message, "file", None)
+    media_type = str(getattr(file_obj, "mime_type", "") or "")[:80]
+    has_media = bool(
+        getattr(message, "media", None) is not None
+        or getattr(message, "photo", None) is not None
+        or file_obj is not None
+    )
+    if not text.strip() and has_media:
+        text = "[фото/вложение]" if (
+            getattr(message, "photo", None) is not None or media_type.startswith("image/")
+        ) else "[вложение]"
+    if not text.strip():
+        return None
+
+    def iso(value):
+        if not isinstance(value, datetime):
+            return ""
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+    return {
+        "id": message_id,
+        "direction": "outgoing" if bool(getattr(message, "out", False)) else "incoming",
+        "text": mask_sensitive_text(text, 4000),
+        "at": iso(getattr(message, "date", None)),
+        "edited_at": iso(getattr(message, "edit_date", None)),
+        "has_media": has_media,
+        "media_type": media_type,
+    }
+
+
+def _payment_archive_image_candidate(message):
+    file_obj = getattr(message, "file", None)
+    mime = str(getattr(file_obj, "mime_type", "") or "")
+    is_image = bool(getattr(message, "photo", None) is not None or mime.startswith("image/"))
+    try:
+        size = int(getattr(file_obj, "size", 0) or 0)
+    except (TypeError, ValueError):
+        size = 0
+    return is_image, mime, max(0, size)
+
+
+async def _prime_payment_chat_archive_locked(
+    archive,
+    *,
+    owner,
+    pid,
+    chat_key,
+    event,
+    media_data=None,
+    media_mime="",
+    case_outbox=None,
+):
+    """Persist a trigger while the caller holds the owner's audit lock."""
+    if not _payment_audit_scope_active(owner, pid):
+        return None
+    row = _payment_archive_message_row(event)
+    if row is None:
+        return await _cancel_safe_to_thread(archive.summary, owner, pid, chat_key)
+    media = []
+    if isinstance(media_data, (bytes, bytearray)):
+        media.append({
+            "message_id": row["id"],
+            "mime": media_mime or row.get("media_type") or "",
+            "data": bytes(media_data),
+        })
+    return await _cancel_safe_to_thread(
+        archive.merge,
+        owner,
+        pid,
+        chat_key,
+        [row],
+        media=media,
+        status="pending",
+        reopen_purged=True,
+        reopen_at=row.get("edited_at") or row.get("at") or None,
+        case_outbox=case_outbox,
+    )
+
+
+async def _prime_payment_chat_archive(archive, **kwargs):
+    """Persist the trigger atomically against compact/delete operations."""
+    owner = kwargs.get("owner")
+    async with _audit_owner_lock(owner):
+        return await _prime_payment_chat_archive_locked(archive, **kwargs)
+
+
+async def _append_existing_payment_chat_message(
+    archive, *, owner, pid, chat_key, event,
+):
+    """Append every continuation/edit after a chat has produced its first signal."""
+    row = _payment_archive_message_row(event)
+    if row is None:
+        return {"appended": False, "image_media": False, "status": "missing"}
+    async with _audit_owner_lock(owner):
+        if not _payment_audit_scope_active(owner, pid):
+            return {"appended": False, "image_media": False, "status": "missing"}
+        manifest = await _cancel_safe_to_thread(archive.load, owner, pid, chat_key)
+        status = str((manifest or {}).get("status") or "missing")
+        if status not in {"pending", "ready", "error"}:
+            return {"appended": False, "image_media": False, "status": status}
+        await _cancel_safe_to_thread(
+            archive.merge,
+            owner,
+            pid,
+            chat_key,
+            [row],
+            status=status,
+            reopen_purged=False,
+        )
+    is_image, _mime, _size = _payment_archive_image_candidate(event)
+    return {"appended": True, "image_media": is_image, "status": status}
+
+
+def _merge_payment_continuation_media_sync(
+    archive, owner, pid, chat_key, media,
+):
+    """Preserve the live capture status while a slow media download finishes."""
+    manifest = archive.load(owner, pid, chat_key)
+    status = str((manifest or {}).get("status") or "missing")
+    if status not in {"pending", "ready", "error"}:
+        return archive.summary(owner, pid, chat_key)
+    return archive.merge(
+        owner, pid, chat_key, [], media=media, status=status, reopen_purged=False
+    )
+
+
+def _mark_payment_continuation_media_error_sync(archive, owner, pid, chat_key):
+    manifest = archive.load(owner, pid, chat_key)
+    status = str((manifest or {}).get("status") or "missing")
+    if status not in {"pending", "ready", "error"}:
+        return archive.summary(owner, pid, chat_key)
+    return archive.mark_status(
+        owner, pid, chat_key, status, error="media_download", truncated=True
+    )
+
+
+async def _capture_payment_continuation_media(
+    client, archive, *, owner, pid, chat_key, event, status,
+):
+    """Save a newly arrived image directly, before it can be deleted remotely."""
+    is_image, mime, declared_size = _payment_archive_image_candidate(event)
+    if not is_image or declared_size > max(1024, PAYMENT_CHAT_ARCHIVE_MAX_MEDIA_BYTES):
+        return
+    try:
+        async with asyncio.timeout(max(2.0, min(30.0, PAYMENT_AUDIT_DOWNLOAD_TIMEOUT))):
+            raw = await client.download_media(event.message, file=bytes)
+        if (
+            not isinstance(raw, (bytes, bytearray))
+            or not _payment_raster_magic_allowed(raw)
+            or len(raw) > max(1024, PAYMENT_CHAT_ARCHIVE_MAX_MEDIA_BYTES)
+        ):
+            raise ValueError("invalid_media")
+        await _payment_archive_write(
+            archive, owner, pid, _merge_payment_continuation_media_sync,
+            archive, owner, pid, chat_key, [{
+                "message_id": int(getattr(event, "id", 0) or 0),
+                "mime": mime,
+                "data": bytes(raw),
+            }],
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        await _payment_archive_write(
+            archive, owner, pid, _mark_payment_continuation_media_error_sync,
+            archive, owner, pid, chat_key,
+        )
+
+
+async def _capture_payment_chat(client, *, owner, pid, chat_id, chat_key):
+    """Fetch and encrypt a full readable chat snapshot without sending read ACKs."""
+    archive = await _get_payment_chat_archive_async()
+    if state.audit_archive_semaphore is None:
+        # Text snapshots are urgent; two short chats may backfill in parallel.
+        state.audit_archive_semaphore = asyncio.Semaphore(2)
+    if state.audit_archive_media_semaphore is None:
+        # Heavy images are downloaded one at a time and never block text capture.
+        state.audit_archive_media_semaphore = asyncio.Semaphore(1)
+    if not _payment_audit_scope_active(owner, pid):
+        return
+    await _payment_archive_write(
+        archive, owner, pid, archive.mark_status,
+        owner, pid, chat_key, "pending",
+        truncated=False, reset_truncated=True,
+    )
+    truncated = False
+    try:
+        max_messages = max(1, min(50_000, PAYMENT_CHAT_ARCHIVE_MAX_MESSAGES))
+        capture_deadline = time.monotonic() + max(10.0, PAYMENT_CHAT_ARCHIVE_TIMEOUT)
+        async with state.audit_archive_semaphore:
+            if not _payment_audit_scope_active(owner, pid):
+                return
+            async with asyncio.timeout(max(5.0, capture_deadline - time.monotonic())):
+                history = list(await client.get_messages(chat_id, limit=max_messages + 1) or [])
+            if len(history) > max_messages:
+                history = history[:max_messages]
+                truncated = True
+            rows = [row for row in (_payment_archive_message_row(msg) for msg in history) if row]
+            if not _payment_audit_scope_active(owner, pid):
+                return
+            summary = await _payment_archive_write(
+                archive,
+                owner,
+                pid,
+                archive.merge,
+                owner,
+                pid,
+                chat_key,
+                rows,
+                status="pending",
+                truncated=truncated,
+            )
+            truncated = bool(truncated or (summary or {}).get("truncated"))
+
+        media_count = 0
+        media_total = 0
+        media_batch = []
+        for message in history:
+            is_image, mime, declared_size = _payment_archive_image_candidate(message)
+            if not is_image:
+                continue
+            if media_count >= max(0, PAYMENT_CHAT_ARCHIVE_MAX_MEDIA_ITEMS):
+                truncated = True
+                break
+            if declared_size > max(1024, PAYMENT_CHAT_ARCHIVE_MAX_MEDIA_BYTES):
+                truncated = True
+                continue
+            remaining = capture_deadline - time.monotonic()
+            if remaining <= 1:
+                truncated = True
+                break
+            try:
+                async with state.audit_archive_media_semaphore:
+                    async with asyncio.timeout(
+                        max(1.0, min(30.0, PAYMENT_AUDIT_DOWNLOAD_TIMEOUT, remaining))
+                    ):
+                        raw = await client.download_media(message, file=bytes)
+            except Exception:
+                truncated = True
+                continue
+            if not isinstance(raw, (bytes, bytearray)):
+                truncated = True
+                continue
+            raw = bytes(raw)
+            if (
+                not _payment_raster_magic_allowed(raw)
+                or len(raw) > max(1024, PAYMENT_CHAT_ARCHIVE_MAX_MEDIA_BYTES)
+            ):
+                truncated = True
+                continue
+            if media_total + len(raw) > max(1024, PAYMENT_CHAT_ARCHIVE_MAX_TOTAL_MEDIA_BYTES):
+                truncated = True
+                break
+            media_batch.append({
+                "message_id": int(getattr(message, "id", 0) or 0),
+                "mime": mime,
+                "data": raw,
+            })
+            media_count += 1
+            media_total += len(raw)
+            if len(media_batch) >= 5:
+                if not _payment_audit_scope_active(owner, pid):
+                    return
+                summary = await _payment_archive_write(
+                    archive,
+                    owner,
+                    pid,
+                    archive.merge,
+                    owner,
+                    pid,
+                    chat_key,
+                    [],
+                    media=media_batch,
+                    status="pending",
+                    truncated=truncated,
+                )
+                truncated = bool(truncated or (summary or {}).get("truncated"))
+                media_batch = []
+        if media_batch and _payment_audit_scope_active(owner, pid):
+            summary = await _payment_archive_write(
+                archive,
+                owner,
+                pid,
+                archive.merge,
+                owner,
+                pid,
+                chat_key,
+                [],
+                media=media_batch,
+                status="pending",
+                truncated=truncated,
+            )
+            truncated = bool(truncated or (summary or {}).get("truncated"))
+        if not _payment_audit_scope_active(owner, pid):
+            return
+        await _payment_archive_write(
+            archive,
+            owner,
+            pid,
+            archive.mark_status,
+            owner,
+            pid,
+            chat_key,
+            "ready",
+            truncated=truncated,
+        )
+    except asyncio.CancelledError:
+        raise
+    except FloodWaitError as exc:
+        await _payment_archive_write(
+            archive, owner, pid, archive.mark_status,
+            owner, pid, chat_key, "error",
+            error=f"FloodWaitError:{max(30, min(3600, int(exc.seconds or 0)))}",
+            truncated=truncated,
+        )
+    except Exception as exc:
+        await _payment_archive_write(
+            archive, owner, pid, archive.mark_status,
+            owner, pid, chat_key, "error",
+            error=type(exc).__name__, truncated=truncated,
+        )
+
+
+def _schedule_payment_chat_archive(client, *, owner, pid, chat_id, chat_key):
+    key = _payment_archive_task_key(owner, pid, chat_key)
+    existing = state.audit_archive_tasks.get(key)
+    if existing and not existing["task"].done():
+        # A signal may arrive after the running task already fetched history.
+        # Remember it and perform exactly one fresh pass when the current pass ends.
+        existing["dirty"] = True
+        existing["client"] = client
+        existing["chat_id"] = chat_id
+        return existing["task"]
+
+    async def runner():
+        try:
+            while True:
+                current = asyncio.current_task()
+                meta = state.audit_archive_tasks.get(key)
+                if meta is None or meta.get("task") is not current:
+                    return
+                meta["dirty"] = False
+                await _capture_payment_chat(
+                    meta.get("client") or client,
+                    owner=owner,
+                    pid=pid,
+                    chat_id=meta.get("chat_id", chat_id),
+                    chat_key=chat_key,
+                )
+                meta = state.audit_archive_tasks.get(key)
+                if meta is None or meta.get("task") is not current or not meta.get("dirty"):
+                    break
+        finally:
+            current = asyncio.current_task()
+            meta = state.audit_archive_tasks.get(key)
+            if meta and meta.get("task") is current:
+                state.audit_archive_tasks.pop(key, None)
+
+    task = _track_audit_task(runner())
+    state.audit_archive_tasks[key] = {
+        "task": task,
+        "owner": str(owner),
+        "pid": str(pid),
+        "chat_key": str(chat_key),
+        "client": client,
+        "chat_id": chat_id,
+        "dirty": False,
+    }
+    return task
+
+
+async def _cancel_payment_archive_tasks(*, owner=None, profile_ids=None, chat_key=None):
+    profiles = {str(pid) for pid in (profile_ids or [])}
+    tasks = []
+    for meta in list(state.audit_archive_tasks.values()):
+        if owner is not None and meta.get("owner") != str(owner):
+            continue
+        if profiles and meta.get("pid") not in profiles:
+            continue
+        if chat_key is not None and meta.get("chat_key") != str(chat_key):
+            continue
+        task = meta.get("task")
+        if task is not None and not task.done():
+            task.cancel()
+            tasks.append(task)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def _payment_amounts_label(case):
     amounts = [
         a for a in (case.get("amounts") or [])
@@ -1074,6 +1607,30 @@ def _audit_owner_lock(owner):
     return lock
 
 
+async def _cancel_safe_to_thread(func, /, *args, **kwargs):
+    """Keep a filesystem mutation alive until its worker thread really stopped.
+
+    Cancelling ``asyncio.to_thread`` only cancels the awaiter. Without the shield,
+    compact/delete could run while the old thread writes the archive back.
+    """
+    worker = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        try:
+            await worker
+        finally:
+            raise
+
+
+async def _payment_archive_write(archive, owner, pid, func, /, *args, **kwargs):
+    """Serialize archive writes with profile/owner deletion and manual compact."""
+    async with _audit_owner_lock(owner):
+        if not _payment_audit_scope_active(owner, pid):
+            return None
+        return await _cancel_safe_to_thread(func, *args, **kwargs)
+
+
 def _payment_audit_scope_active(owner, pid):
     if _payment_audit_scope_blocked(owner, pid):
         return False
@@ -1087,36 +1644,166 @@ def _payment_audit_scope_active(owner, pid):
     )
 
 
-async def _record_payment_event(store, *, owner, pid, **kwargs):
-    """Commit one audit event atomically against revoke/delete operations."""
+def _payment_case_outbox(record_kwargs):
+    """Return a small JSON-safe replay record for the encrypted archive."""
+    allowed = {
+        "event_key", "chat_key", "observed_at", "direction", "analysis",
+        "snippet", "source", "media_hash", "message_ref", "chat_ref", "context",
+    }
+    unknown = set(record_kwargs) - allowed
+    if unknown:
+        raise ValueError("unsupported payment outbox fields")
+
+    def encode(value):
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+        raise TypeError(f"unsupported outbox value: {type(value).__name__}")
+
+    record = json.loads(json.dumps(
+        record_kwargs,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=encode,
+        allow_nan=False,
+    ))
+    if not str(record.get("event_key") or "") or not str(record.get("chat_key") or ""):
+        raise ValueError("incomplete payment outbox")
+    return {"version": 1, "record": record}
+
+
+def _payment_archive_stage(archive_seed):
+    """Prepare Telegram data on the event loop before a SQLite worker uses it."""
+    if not isinstance(archive_seed, dict):
+        return None
+    chat_key = str(archive_seed.get("chat_key") or "")
+    event = archive_seed.get("event")
+    row = _payment_archive_message_row(event)
+    if not chat_key or row is None:
+        return None
+    media = []
+    media_data = archive_seed.get("media_data")
+    if isinstance(media_data, (bytes, bytearray)):
+        media.append({
+            "message_id": row["id"],
+            "mime": archive_seed.get("media_mime") or row.get("media_type") or "",
+            "data": bytes(media_data),
+        })
+    return chat_key, row, media
+
+
+def _stage_payment_case_sync(archive, *, owner, pid, stage, outbox):
+    """Durably seed trigger + replay record before SQLite commits the case."""
+    chat_key, row, media = stage
+    return archive.merge(
+        owner,
+        pid,
+        chat_key,
+        [row],
+        media=media,
+        status="pending",
+        reopen_purged=True,
+        reopen_at=row.get("edited_at") or row.get("at") or None,
+        case_outbox=outbox,
+    )
+
+
+async def _record_payment_event(store, *, owner, pid, archive_seed=None, **kwargs):
+    """Commit one event with an encrypted crash-replay marker for its trigger."""
     async with _audit_owner_lock(owner):
         if not _payment_audit_scope_active(owner, pid):
             return None
-        return await asyncio.to_thread(
+        archive = None
+        stage = _payment_archive_stage(archive_seed)
+        staged = False
+        if stage is not None:
+            if stage[0] != str(kwargs.get("chat_key") or ""):
+                raise ValueError("archive seed does not match payment chat")
+            try:
+                archive = await _get_payment_chat_archive_async()
+                await _cancel_safe_to_thread(
+                    _stage_payment_case_sync,
+                    archive,
+                    owner=owner,
+                    pid=pid,
+                    stage=stage,
+                    outbox=_payment_case_outbox(kwargs),
+                )
+                staged = True
+            except Exception as exc:
+                # The compact payment fact is still better than losing the signal
+                # when the optional heavy archive cannot be initialized.
+                archive = None
+                print(f"[payment-archive] prepare {type(exc).__name__}")
+        case = await _cancel_safe_to_thread(
             store.record_event,
             owner=owner,
             profile_id=pid,
             **kwargs,
         )
+        if isinstance(case, dict) and case.get("id") and archive is not None and staged:
+            try:
+                await _cancel_safe_to_thread(
+                    archive.clear_case_outbox,
+                    owner,
+                    pid,
+                    stage[0],
+                )
+            except Exception as exc:
+                # Leaving the marker is intentional: startup replay is idempotent.
+                print(f"[payment-archive] outbox-clear {type(exc).__name__}")
+        return case
 
 
 async def _record_payment_retraction(store, *, owner, pid, chat_key,
-                                     message_ref, record_kwargs):
+                                     message_ref, record_kwargs, archive_seed=None):
     """Check-and-retract the same message under one audit/delete lock."""
     async with _audit_owner_lock(owner):
         if not _payment_audit_scope_active(owner, pid):
             return None
-        exists = await asyncio.to_thread(
+        exists = await _cancel_safe_to_thread(
             store.has_message, owner, pid, chat_key, message_ref
         )
         if not exists:
             return None
-        return await asyncio.to_thread(
+        archive = None
+        stage = _payment_archive_stage(archive_seed)
+        staged = False
+        if stage is not None:
+            if stage[0] != str(chat_key) or stage[0] != str(record_kwargs.get("chat_key") or ""):
+                raise ValueError("archive seed does not match payment chat")
+            try:
+                archive = await _get_payment_chat_archive_async()
+                await _cancel_safe_to_thread(
+                    _stage_payment_case_sync,
+                    archive,
+                    owner=owner,
+                    pid=pid,
+                    stage=stage,
+                    outbox=_payment_case_outbox(record_kwargs),
+                )
+                staged = True
+            except Exception as exc:
+                archive = None
+                print(f"[payment-archive] prepare-retraction {type(exc).__name__}")
+        case = await _cancel_safe_to_thread(
             store.record_event,
             owner=owner,
             profile_id=pid,
             **record_kwargs,
         )
+        if isinstance(case, dict) and case.get("id") and archive is not None and staged:
+            try:
+                await _cancel_safe_to_thread(
+                    archive.clear_case_outbox,
+                    owner,
+                    pid,
+                    stage[0],
+                )
+            except Exception as exc:
+                print(f"[payment-archive] retraction-outbox-clear {type(exc).__name__}")
+        return case
 
 
 def _active_ocr_meta():
@@ -1171,6 +1858,7 @@ def _audit_ocr_allowed(pid, *, priority=False):
 async def _audit_receipt_media(client, event, *, owner, pid, chat_id, direction,
                                media_type, is_forwarded=False, priority=False,
                                message_source="message"):
+    archive_media_data = None
     if _payment_audit_scope_blocked(owner, pid):
         return
     user = get_user(owner)
@@ -1220,6 +1908,9 @@ async def _audit_receipt_media(client, event, *, owner, pid, chat_id, direction,
             return
         try:
             result = await receipt_ocr.analyze_bytes_async(data)
+            # OCR already downloaded the likely receipt. Keep one bounded copy
+            # until the case is recorded so a Telegram deletion cannot erase it.
+            archive_media_data = bytes(data)
         except ReceiptOcrError as exc:
             print(f"[payment-audit] OCR {type(exc).__name__}")
             return
@@ -1304,13 +1995,13 @@ async def _audit_receipt_media(client, event, *, owner, pid, chat_id, direction,
     ocr_version = "ocr:" + _payment_event_version(
         event, message_source, getattr(event, "raw_text", "") or ""
     )
-    context = await _payment_chat_context(client, chat_id)
+    chat_key = store.chat_key(pid, chat_id)
     case = await _record_payment_event(
         store,
         owner=owner,
         pid=pid,
         event_key=store.event_key(pid, chat_id, message_id, ocr_version),
-        chat_key=store.chat_key(pid, chat_id),
+        chat_key=chat_key,
         message_ref=store.message_ref(pid, chat_id, message_id),
         chat_ref=chat_id,
         observed_at=_payment_observed_at(event, message_source),
@@ -1321,9 +2012,23 @@ async def _audit_receipt_media(client, event, *, owner, pid, chat_id, direction,
         # amount/categories for this exact Telegram message are replaced.
         source="edited" if message_source == "edited" else "ocr",
         media_hash=result.media_sha256,
-        context=context,
+        context=None,
+        archive_seed={
+            "chat_key": chat_key,
+            "event": event,
+            "media_data": archive_media_data,
+            "media_mime": media_type,
+        },
     )
-    if case:
+    archive_media_data = None
+    if isinstance(case, dict) and case.get("id"):
+        _schedule_payment_chat_archive(
+            client,
+            owner=owner,
+            pid=pid,
+            chat_id=chat_id,
+            chat_key=chat_key,
+        )
         owner_user = get_user(owner) or {}
         _notify_admins_payment_case(case, owner_name=owner_user.get("username") or "")
 
@@ -1362,11 +2067,6 @@ async def _handle_payment_message(client, pid, event, *, source="message"):
         event_version = _payment_event_version(event, source, text)
         message_ref = store.message_ref(pid, event.chat_id, event.id)
         chat_key = store.chat_key(pid, event.chat_id)
-        context = None
-        if analysis.get("detected") or (
-            analysis.get("money_mentioned") and source != "edited"
-        ):
-            context = await _payment_chat_context(client, event.chat_id)
         case = None
         if analysis.get("detected"):
             case = await _record_payment_event(
@@ -1382,7 +2082,8 @@ async def _handle_payment_message(client, pid, event, *, source="message"):
                 analysis=analysis,
                 snippet=_audit_signal_snippet(analysis),
                 source=source,
-                context=context,
+                context=None,
+                archive_seed={"chat_key": chat_key, "event": event},
             )
         elif analysis.get("money_mentioned") and source != "edited":
             # Про деньги в этом сообщении говорили, но на полноценный сигнал не
@@ -1413,14 +2114,14 @@ async def _handle_payment_message(client, pid, event, *, source="message"):
                 analysis=weak,
                 snippet=_audit_signal_snippet(weak),
                 source=source,
-                context=context,
+                context=None,
+                archive_seed={"chat_key": chat_key, "event": event},
             )
-        if case:
-            _notify_admins_payment_case(case, owner_name=(user or {}).get("username") or "")
-        elif source == "edited":
+        notify_case = isinstance(case, dict) and bool(case.get("id"))
+        if not notify_case and not analysis.get("detected") and source == "edited":
             # An edited message that used to be a payment signal is material:
             # keep the historical evidence but remove its live amount/status.
-            await _record_payment_retraction(
+            case = await _record_payment_retraction(
                 store,
                 owner=owner,
                 pid=pid,
@@ -1446,7 +2147,53 @@ async def _handle_payment_message(client, pid, event, *, source="message"):
                     "snippet": "",
                     "source": "edited",
                 },
+                archive_seed={"chat_key": chat_key, "event": event},
             )
+
+        if isinstance(case, dict) and case.get("id"):
+            _schedule_payment_chat_archive(
+                client,
+                owner=owner,
+                pid=pid,
+                chat_id=event.chat_id,
+                chat_key=chat_key,
+            )
+            is_archive_image, _archive_mime, _archive_size = _payment_archive_image_candidate(event)
+            if is_archive_image:
+                archive = await _get_payment_chat_archive_async()
+                _track_audit_task(_capture_payment_continuation_media(
+                    client,
+                    archive,
+                    owner=owner,
+                    pid=pid,
+                    chat_key=chat_key,
+                    event=event,
+                    status="pending",
+                ))
+            if notify_case:
+                _notify_admins_payment_case(case, owner_name=(user or {}).get("username") or "")
+        else:
+            try:
+                archive = await _get_payment_chat_archive_async()
+                continuation = await _append_existing_payment_chat_message(
+                    archive,
+                    owner=owner,
+                    pid=pid,
+                    chat_key=chat_key,
+                    event=event,
+                )
+                if continuation.get("image_media"):
+                    _track_audit_task(_capture_payment_continuation_media(
+                        client,
+                        archive,
+                        owner=owner,
+                        pid=pid,
+                        chat_key=chat_key,
+                        event=event,
+                        status=continuation.get("status"),
+                    ))
+            except (PaymentChatArchiveError, ValueError) as exc:
+                print(f"[payment-archive] continuation {type(exc).__name__}")
 
         ocr_priority = bool(analysis.get("detected"))
         if _payment_ocr_media_allowed(event, media_type):
@@ -2403,11 +3150,19 @@ async def _scheduler_loop():
             # ошибки подключения/диска в фоновой задаче.
             await _resume_queued_sends()
             _scheduler_tick()
+            if time.monotonic() >= state.audit_archive_resume_at:
+                state.audit_archive_resume_at = time.monotonic() + 5 * 60
+                await _resume_pending_payment_archives()
             if time.monotonic() >= state.audit_cleanup_at:
                 state.audit_cleanup_at = time.monotonic() + 24 * 60 * 60
                 store = await _get_payment_audit_store_async()
                 if store is not None:
                     await asyncio.to_thread(store.cleanup)
+                    if PAYMENT_CHAT_ARCHIVE_RETENTION_DAYS > 0:
+                        archive = await _get_payment_chat_archive_async()
+                        await asyncio.to_thread(
+                            archive.cleanup, PAYMENT_CHAT_ARCHIVE_RETENTION_DAYS
+                        )
         except Exception as e:
             print(f"[scheduler] ошибка цикла: {e}")
 
@@ -2481,6 +3236,111 @@ async def _warm_response_listeners():
         except Exception as e:
             print(f"[resp] прогрев слушателя {pid}: {e}")
         await asyncio.sleep(2)
+    await _resume_pending_payment_archives()
+
+
+async def _resume_pending_payment_archives():
+    """Replay committed archive markers, then resume interrupted snapshots."""
+    try:
+        archive = await _get_payment_chat_archive_async()
+        store = await _get_payment_audit_store_async()
+    except Exception as exc:
+        print(f"[payment-archive] resume {type(exc).__name__}")
+        return
+    if store is None:
+        return
+    try:
+        outboxes = await asyncio.to_thread(archive.list_case_outboxes)
+    except Exception as exc:
+        print(f"[payment-archive] outbox-list {type(exc).__name__}")
+        outboxes = []
+    allowed = {
+        "event_key", "chat_key", "observed_at", "direction", "analysis",
+        "snippet", "source", "media_hash", "message_ref", "chat_ref", "context",
+    }
+    for item in outboxes:
+        owner = str(item.get("owner") or "")
+        pid = str(item.get("profile_id") or "")
+        chat_key = str(item.get("chat_key") or "")
+        payload = item.get("outbox")
+        record = payload.get("record") if isinstance(payload, dict) else None
+        if (
+            not owner or not pid or not chat_key
+            or not isinstance(payload, dict) or payload.get("version") != 1
+            or not isinstance(record, dict) or set(record) - allowed
+            or str(record.get("chat_key") or "") != chat_key
+            or not str(record.get("event_key") or "")
+        ):
+            print("[payment-archive] invalid encrypted outbox")
+            continue
+        async with _audit_owner_lock(owner):
+            if not _payment_audit_scope_active(owner, pid):
+                # Consent/profile removal wins over a crash-replay marker.
+                try:
+                    await _cancel_safe_to_thread(
+                        archive.purge, owner, pid, chat_key, tombstone=False
+                    )
+                except Exception as exc:
+                    print(f"[payment-archive] stale-outbox-purge {type(exc).__name__}")
+                continue
+            try:
+                await _cancel_safe_to_thread(
+                    store.record_event,
+                    owner=owner,
+                    profile_id=pid,
+                    **record,
+                )
+                await _cancel_safe_to_thread(
+                    archive.clear_case_outbox, owner, pid, chat_key
+                )
+            except Exception as exc:
+                # The marker remains encrypted and is safe to retry next startup.
+                print(f"[payment-archive] outbox-replay {type(exc).__name__}")
+
+    try:
+        pending = await asyncio.to_thread(archive.list_statuses, ("pending", "error"))
+    except Exception as exc:
+        print(f"[payment-archive] pending-list {type(exc).__name__}")
+        return
+    for item in pending:
+        if item.get("status") == "error":
+            retry_seconds = 5 * 60
+            error = str(item.get("last_error") or "")
+            if error.startswith("FloodWaitError:"):
+                try:
+                    retry_seconds = max(retry_seconds, min(3600, int(error.split(":", 1)[1])))
+                except (TypeError, ValueError):
+                    pass
+            try:
+                changed = datetime.fromisoformat(str(item.get("updated_at") or "").replace("Z", "+00:00"))
+                if changed.tzinfo is None:
+                    changed = changed.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) < changed.astimezone(timezone.utc) + timedelta(seconds=retry_seconds):
+                    continue
+            except (TypeError, ValueError):
+                pass
+        owner = str(item.get("owner") or "")
+        pid = str(item.get("profile_id") or "")
+        chat_key = str(item.get("chat_key") or "")
+        if not _payment_audit_scope_active(owner, pid):
+            continue
+        cases = await asyncio.to_thread(store.list_chat_cases, owner, chat_key)
+        case = next((row for row in reversed(cases) if row.get("chat_ref")), None)
+        if case is None:
+            continue
+        try:
+            client = await get_client(pid)
+            if client is None or not await client.is_user_authorized():
+                continue
+            _schedule_payment_chat_archive(
+                client,
+                owner=owner,
+                pid=pid,
+                chat_id=case["chat_ref"],
+                chat_key=chat_key,
+            )
+        except Exception as exc:
+            print(f"[payment-archive] resume-chat {type(exc).__name__}")
 
 
 @asynccontextmanager
@@ -2490,6 +3350,8 @@ async def lifespan(app: FastAPI):
         store = _get_payment_audit_store()
         if store is not None:
             store.cleanup()
+            if PAYMENT_CHAT_ARCHIVE_RETENTION_DAYS > 0:
+                _get_payment_chat_archive().cleanup(PAYMENT_CHAT_ARCHIVE_RETENTION_DAYS)
             state.audit_cleanup_at = time.monotonic() + 24 * 60 * 60
     except Exception as exc:
         print(f"[payment-audit] cleanup {type(exc).__name__}")
@@ -2526,13 +3388,17 @@ async def lifespan(app: FastAPI):
         pass
     state.audit_tasks.clear()
     state.audit_ocr_tasks.clear()
+    state.audit_archive_tasks.clear()
     state.audit_ocr_recent.clear()
     state.audit_ocr_dropped = {"queue": 0, "quota": 0, "invalid": 0}
     state.audit_deleted_owners.clear()
     state.audit_deleted_profiles.clear()
     state.audit_owner_locks.clear()
     state.audit_ocr_semaphore = None
+    state.audit_archive_semaphore = None
+    state.audit_archive_media_semaphore = None
     state.audit_cleanup_at = 0.0
+    state.audit_archive_resume_at = 0.0
     for client in state.clients.values():
         try:
             await client.disconnect()
@@ -2783,10 +3649,18 @@ async def admin_delete_user(uid: str, admin=Depends(require_admin)):
     state.audit_deleted_owners.add(str(uid))
     state.audit_deleted_profiles.update(str(p["id"]) for p in owner_profiles)
     _cancel_audit_ocr_for_profiles(p["id"] for p in owner_profiles)
+    await _cancel_payment_archive_tasks(owner=uid)
     try:
         async with _audit_owner_lock(uid):
+            archive = await _get_payment_chat_archive_async()
+            chat_keys = await _cancel_safe_to_thread(store.owner_chat_keys, uid) if store is not None else []
+            for chat_key in chat_keys:
+                await _cancel_safe_to_thread(
+                    archive.purge, uid, "detached", chat_key, tombstone=False
+                )
+            await _cancel_safe_to_thread(archive.purge_owner, uid)
             if store is not None:
-                await asyncio.to_thread(store.delete_owner, uid)
+                await _cancel_safe_to_thread(store.delete_owner, uid)
     except Exception as exc:
         state.audit_deleted_owners.discard(str(uid))
         state.audit_deleted_profiles.difference_update(str(p["id"]) for p in owner_profiles)
@@ -3077,6 +3951,59 @@ def _audit_case_view(case, *, profiles=None, users=None):
     return row
 
 
+def _payment_archive_scope(case, archive=None):
+    archive = archive or _get_payment_chat_archive()
+    owner = str(case.get("owner") or "")
+    chat_key = str(case.get("chat_key") or "")
+    profile_id = str(case.get("profile_id") or "")
+    if owner and profile_id and chat_key:
+        return profile_id, archive.load(owner, profile_id, chat_key)
+    found = archive.find_chat(owner, chat_key)
+    return found if found is not None else ("", None)
+
+
+def _payment_archive_summary(case, archive=None):
+    archive = archive or _get_payment_chat_archive()
+    owner = str(case.get("owner") or "")
+    chat_key = str(case.get("chat_key") or "")
+    profile_id = str(case.get("profile_id") or "")
+    if owner and profile_id and chat_key:
+        return archive.summary(owner, profile_id, chat_key)
+    try:
+        found = archive.find_chat(owner, chat_key)
+    except PaymentChatArchiveError:
+        return {
+            "status": "error", "message_count": 0, "media_count": 0,
+            "captured_at": "", "truncated": False,
+            "last_error": "archive_corrupt", "size_bytes": 0,
+        }
+    if found is None:
+        return archive.summary(owner, "missing-profile", chat_key) if owner and chat_key else {
+            "status": "missing", "message_count": 0, "media_count": 0,
+            "captured_at": "", "truncated": False, "last_error": "", "size_bytes": 0,
+        }
+    archived_profile_id, _manifest = found
+    return archive.summary(owner, archived_profile_id, chat_key)
+
+
+def _admin_payment_case_views(cases, profiles, users):
+    archive = _get_payment_chat_archive()
+    rows = []
+    summaries = {}
+    for case in cases:
+        view = _audit_case_view(case, profiles=profiles, users=users)
+        key = (
+            str(case.get("owner") or ""),
+            str(case.get("profile_id") or ""),
+            str(case.get("chat_key") or ""),
+        )
+        if key not in summaries:
+            summaries[key] = _payment_archive_summary(case, archive)
+        view["archive"] = dict(summaries[key])
+        rows.append(view)
+    return rows
+
+
 async def _warm_payment_owner_profiles(owner):
     if str(owner) in state.audit_deleted_owners:
         return
@@ -3093,7 +4020,8 @@ async def _warm_payment_owner_profiles(owner):
 
 
 @app.get("/api/payment-audit")
-async def payment_audit_info(user=Depends(require_user)):
+async def payment_audit_info(response: Response, user=Depends(require_user)):
+    response.headers["Cache-Control"] = "private, no-store"
     week, next_week = _current_week_bounds()
     store = await _get_payment_audit_store_async()
     if store is None:
@@ -3130,11 +4058,17 @@ async def payment_audit_info(user=Depends(require_user)):
 
 
 @app.get("/api/payment-audit/cases")
-async def payment_audit_cases(days: int = 7, limit: int = 100, user=Depends(require_user)):
+async def payment_audit_cases(response: Response, days: int = 7, limit: int = 100,
+                              user=Depends(require_user)):
+    response.headers["Cache-Control"] = "private, no-store"
     profiles = load_profiles()
     store = await _get_payment_audit_store_async()
     if store is None:
-        return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
+        return JSONResponse(
+            {"error": "Проверка оплат временно недоступна"},
+            status_code=503,
+            headers={"Cache-Control": "private, no-store"},
+        )
     cases = await asyncio.to_thread(
         store.list_cases,
         owner=user["id"], days=max(1, min(int(days), 90)), limit=max(1, min(int(limit), 200))
@@ -3175,14 +4109,27 @@ async def payment_audit_week(body: PaymentWeekIn, user=Depends(require_user)):
 
 
 @app.get("/api/admin/payment-audit")
-async def admin_payment_audit(days: int = 7, admin=Depends(require_admin)):
-    days = max(1, min(int(days), 90))
+async def admin_payment_audit(response: Response, days: int = 7,
+                              limit: int = 300, offset: int = 0,
+                              admin=Depends(require_admin)):
+    response.headers["Cache-Control"] = "private, no-store"
+    days = max(1, min(int(days), 36_500))
     users = load_users()
     profiles = load_profiles()
     store = await _get_payment_audit_store_async()
     if store is None:
-        return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
-    cases = await asyncio.to_thread(store.list_cases, days=days, limit=500)
+        return JSONResponse(
+            {"error": "Проверка оплат временно недоступна"},
+            status_code=503,
+            headers={"Cache-Control": "private, no-store"},
+        )
+    limit = max(50, min(int(limit), 500))
+    offset = max(0, min(int(offset), 10_000_000))
+    cases_page = await asyncio.to_thread(
+        store.list_cases, days=days, limit=limit + 1, offset=offset
+    )
+    has_more = len(cases_page) > limit
+    cases = cases_page[:limit]
     summaries = []
     week, next_week = _current_week_bounds()
     for owner in users:
@@ -3200,12 +4147,19 @@ async def admin_payment_audit(days: int = 7, admin=Depends(require_admin)):
             "week_reports": week_reports,
         })
         summaries.append(summary)
+    case_views = await asyncio.to_thread(
+        _admin_payment_case_views, cases, profiles, users
+    )
     return {
         "days": days,
         "week_start": week,
         "commission_rate": PAYMENT_COMMISSION_RATE,
+        "archive_retention_days": PAYMENT_CHAT_ARCHIVE_RETENTION_DAYS,
         "summaries": summaries,
-        "cases": [_audit_case_view(c, profiles=profiles, users=users) for c in cases],
+        "cases": case_views,
+        "offset": offset,
+        "next_offset": offset + len(cases),
+        "has_more": has_more,
         "ocr_queue": {
             "active": len(_active_ocr_meta()),
             "dropped": dict(state.audit_ocr_dropped),
@@ -3249,6 +4203,116 @@ def _peek_image_mime(raw: bytes) -> str:
     return "image/jpeg"
 
 
+@app.post("/api/admin/payment-audit/cases/{case_id}/archive")
+async def admin_payment_archive_refresh(case_id: str, admin=Depends(require_admin)):
+    store = await _get_payment_audit_store_async()
+    if store is None:
+        return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
+    case = await asyncio.to_thread(store.get_case, case_id)
+    if not case:
+        return JSONResponse({"error": "Событие не найдено"}, status_code=404)
+    pid = case.get("profile_id")
+    chat_ref = case.get("chat_ref")
+    if not pid or not case.get("profile_active", True) or not isinstance(chat_ref, int):
+        return JSONResponse(
+            {"error": "Рабочий аккаунт отключён; сохранённый архив можно только читать"},
+            status_code=409,
+        )
+    if not _payment_audit_scope_active(case.get("owner"), pid):
+        return JSONResponse(
+            {"error": "Доступ сотрудника сейчас неактивен; сохранённый архив можно читать"},
+            status_code=409,
+        )
+    client = await get_client(pid)
+    if client is None or not await client.is_user_authorized():
+        return JSONResponse({"error": "Аккаунт сотрудника сейчас офлайн"}, status_code=503)
+    archive = await _get_payment_chat_archive_async()
+    await _payment_archive_write(
+        archive, case["owner"], pid, archive.mark_status,
+        case["owner"], pid, case["chat_key"], "pending",
+        truncated=False, reset_truncated=True, reopen_purged=True,
+    )
+    _schedule_payment_chat_archive(
+        client,
+        owner=case["owner"],
+        pid=pid,
+        chat_id=chat_ref,
+        chat_key=case["chat_key"],
+    )
+    return JSONResponse(
+        {
+            "ok": True,
+            "archive": await asyncio.to_thread(
+                archive.summary, case["owner"], pid, case["chat_key"]
+            ),
+        },
+        status_code=202,
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+@app.delete("/api/admin/payment-audit/cases/{case_id}/archive")
+async def admin_payment_archive_compact(case_id: str, admin=Depends(require_admin)):
+    store = await _get_payment_audit_store_async()
+    if store is None:
+        return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
+    case = await asyncio.to_thread(store.get_case, case_id)
+    if not case:
+        return JSONResponse({"error": "Событие не найдено"}, status_code=404)
+    owner = str(case.get("owner") or "")
+    chat_key = str(case.get("chat_key") or "")
+    archive = await _get_payment_chat_archive_async()
+    await _cancel_payment_archive_tasks(owner=owner, chat_key=chat_key)
+    async with _audit_owner_lock(owner):
+        kept = await asyncio.to_thread(
+            store.compact_chat, owner, chat_key, admin["id"]
+        )
+        summary = await _cancel_safe_to_thread(
+            archive.purge,
+            owner,
+            str(case.get("profile_id") or "detached"),
+            chat_key,
+            tombstone=True,
+        )
+    return JSONResponse(
+        {"ok": True, "archive": summary, "payment_facts_kept": kept},
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+@app.get("/api/admin/payment-audit/cases/{case_id}/archive/media/{file_id}")
+async def admin_payment_archive_media(case_id: str, file_id: str, admin=Depends(require_admin)):
+    store = await _get_payment_audit_store_async()
+    if store is None:
+        raise HTTPException(status_code=503, detail="Проверка оплат недоступна")
+    case = await asyncio.to_thread(store.get_case, case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail="Событие не найдено")
+    archive = await _get_payment_chat_archive_async()
+    profile_id, manifest = await asyncio.to_thread(_payment_archive_scope, case, archive)
+    if not profile_id or manifest is None:
+        raise HTTPException(status_code=404, detail="Вложение не найдено")
+    try:
+        raw, mime = await asyncio.to_thread(
+            archive.read_media,
+            case["owner"],
+            profile_id,
+            case["chat_key"],
+            file_id,
+        )
+    except (KeyError, PaymentChatArchiveError):
+        raise HTTPException(status_code=404, detail="Вложение не найдено")
+    return Response(
+        content=raw,
+        media_type=mime,
+        headers={
+            "Cache-Control": "private, no-store",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 async def _peek_collect_messages(client, entity, *, pid, chat_ref, target_refs, limit=80):
     """Fetch a quiet history window and prefer the case trigger message."""
     collected = []
@@ -3287,6 +4351,125 @@ async def _peek_collect_messages(client, entity, *, pid, chat_ref, target_refs, 
     return ordered, matched
 
 
+def _payment_origin(case, *, trigger_found=False, trigger_message_id=None):
+    evidence_bits = []
+    for item in case.get("evidence") or []:
+        if not isinstance(item, dict):
+            continue
+        snippet = str(item.get("snippet") or "").strip()
+        if snippet:
+            evidence_bits.append(f"{item.get('source') or 'message'}: «{snippet}»")
+    return {
+        "summary": (
+            f"Сумма {_payment_amounts_label(case)} взята из сохранённого сигнала/чека."
+            if any(a.get("value") for a in (case.get("amounts") or []))
+            else "Сумма не распознана — проверь сохранённую переписку и вложения."
+        ),
+        "detector": evidence_bits[-6:],
+        "trigger_found": bool(trigger_found),
+        "trigger_message_id": trigger_message_id,
+    }
+
+
+def _archived_payment_peek(store, case, case_id):
+    archive = _get_payment_chat_archive()
+    profile_id, manifest = _payment_archive_scope(case, archive)
+    if manifest is None:
+        return None
+    owner = str(case.get("owner") or "")
+    chat_key = str(case.get("chat_key") or "")
+    summary = archive.summary(owner, profile_id, chat_key)
+    target_refs = store.chat_message_refs(owner, chat_key)
+    chat_ref = case.get("chat_ref")
+    rows = []
+    trigger_id = None
+    trigger_by_id = {}
+    for item in manifest.get("messages") or []:
+        message_id = int(item.get("id") or 0)
+        is_trigger = bool(
+            message_id
+            and isinstance(chat_ref, int)
+            and chat_ref > 0
+            and PaymentAuditStore.message_ref(profile_id, chat_ref, message_id) in target_refs
+        )
+        if is_trigger and trigger_id is None:
+            trigger_id = message_id
+        trigger_by_id[message_id] = is_trigger
+        revisions = [
+            {
+                "text": str(revision.get("text") or ""),
+                "captured_at": str(revision.get("captured_at") or ""),
+                "original": False,
+            }
+            for revision in (item.get("revisions") or [])[-3:]
+            if isinstance(revision, dict) and revision.get("text")
+        ]
+        original_text = str(item.get("original_text") or "")
+        if (
+            original_text
+            and original_text != str(item.get("text") or "")
+            and not any(revision["text"] == original_text for revision in revisions)
+        ):
+            revisions.insert(0, {
+                "text": original_text,
+                "captured_at": str(item.get("original_captured_at") or ""),
+                "original": True,
+            })
+        rows.append({
+            "id": message_id,
+            "direction": "outgoing" if item.get("direction") == "outgoing" else "incoming",
+            "text": str(item.get("text") or ""),
+            "at": str(item.get("at") or ""),
+            "has_media": bool(item.get("has_media")),
+            "is_trigger": is_trigger,
+            "edited": bool(revisions),
+            "revisions": revisions,
+        })
+    photos = []
+    by_message = {row["id"]: row for row in rows}
+    media_counts = {}
+    for item in manifest.get("media") or []:
+        message_id = int(item.get("message_id") or 0)
+        media_counts[message_id] = media_counts.get(message_id, 0) + 1
+    for item in manifest.get("media") or []:
+        message_id = int(item.get("message_id") or 0)
+        photos.append({
+            "message_id": message_id,
+            "direction": (by_message.get(message_id) or {}).get("direction", "incoming"),
+            "mime": str(item.get("mime") or "image/jpeg"),
+            "is_trigger": bool(trigger_by_id.get(message_id)),
+            "matches_case_amount": False,
+            "ocr_text": "",
+            "ocr_amounts": [],
+            "versioned": media_counts.get(message_id, 0) > 1,
+            "captured_at": str(item.get("captured_at") or ""),
+            "url": f"/api/admin/payment-audit/cases/{case_id}/archive/media/{item.get('file_id')}",
+        })
+    related = store.list_chat_cases(owner, chat_key)
+    profiles = load_profiles()
+    users = load_users()
+    related_views = [_audit_case_view(row, profiles=profiles, users=users) for row in related]
+    view = _audit_case_view(case, profiles=profiles, users=users)
+    view["archive"] = summary
+    return {
+        "ok": True,
+        "quiet": True,
+        "archived": True,
+        "archive": summary,
+        "case": view,
+        "related_cases": related_views,
+        "peer": {"name": case.get("chat_label") or "сохранённый диалог", "username": ""},
+        "origin": _payment_origin(
+            case,
+            trigger_found=trigger_id is not None,
+            trigger_message_id=trigger_id,
+        ),
+        "messages": rows,
+        "photos": photos,
+        "hint": "Сохранённая зашифрованная копия. Telegram не открывался.",
+    }
+
+
 @app.get("/api/admin/payment-audit/cases/{case_id}/peek")
 async def admin_payment_audit_peek(case_id: str, admin=Depends(require_admin)):
     """Тихий просмотр диалога глазами рабочего аккаунта.
@@ -3301,6 +4484,15 @@ async def admin_payment_audit_peek(case_id: str, admin=Depends(require_admin)):
     case = await asyncio.to_thread(store.get_case, case_id)
     if not case:
         return JSONResponse({"error": "Событие не найдено"}, status_code=404)
+    try:
+        archived = await asyncio.to_thread(_archived_payment_peek, store, case, case_id)
+    except PaymentChatArchiveError:
+        archived = None
+    if archived is not None:
+        return JSONResponse(
+            archived,
+            headers={"Cache-Control": "private, no-store", "Pragma": "no-cache"},
+        )
     pid = case.get("profile_id")
     chat_ref = case.get("chat_ref")
     if not pid or not isinstance(chat_ref, int) or chat_ref <= 0:
@@ -3318,22 +4510,9 @@ async def admin_payment_audit_peek(case_id: str, admin=Depends(require_admin)):
         return JSONResponse({"error": "Не удалось открыть диалог на аккаунте сотрудника"}, status_code=404)
 
     peer = _brief(entity)
-    target_refs = {
-        str(item.get("message_ref") or "")
-        for item in (case.get("evidence") or [])
-        if isinstance(item, dict) and item.get("message_ref")
-    }
-    # message_ref intentionally stripped from API evidence — recover from events table.
-    try:
-        with store._connection() as db:
-            for row in db.execute(
-                "SELECT message_ref FROM payment_events WHERE case_id=?", (case_id,)
-            ):
-                if row["message_ref"]:
-                    target_refs.add(str(row["message_ref"]))
-    except Exception:
-        pass
-    target_refs.discard("")
+    target_refs = await asyncio.to_thread(
+        store.chat_message_refs, case.get("owner"), case.get("chat_key")
+    )
 
     try:
         # get_messages сам по себе не шлёт read-ack — клиент/сотрудник ничего не видит.
@@ -3346,25 +4525,11 @@ async def admin_payment_audit_peek(case_id: str, admin=Depends(require_admin)):
             status_code=502,
         )
 
-    evidence_bits = []
-    for item in case.get("evidence") or []:
-        if not isinstance(item, dict):
-            continue
-        snip = str(item.get("snippet") or "").strip()
-        src = str(item.get("source") or "message")
-        if snip:
-            evidence_bits.append(f"{src}: «{snip}»")
-    origin = {
-        "summary": (
-            f"Сумма {_payment_amounts_label(case)} взята не из последних реплик чата, "
-            f"а из распознанного чека/сигнала."
-            if any(a.get("value") for a in (case.get("amounts") or []))
-            else "Сумма в кейсе не распознана — смотри скрины и фразы ниже."
-        ),
-        "detector": evidence_bits[-6:],
-        "trigger_found": matched is not None,
-        "trigger_message_id": int(matched.id) if matched is not None else None,
-    }
+    origin = _payment_origin(
+        case,
+        trigger_found=matched is not None,
+        trigger_message_id=int(matched.id) if matched is not None else None,
+    )
 
     rows = []
     image_msgs = []
@@ -3455,17 +4620,32 @@ async def admin_payment_audit_peek(case_id: str, admin=Depends(require_admin)):
 
     photos.sort(key=lambda p: (not p.get("is_trigger"), not p.get("matches_case_amount"), -p["message_id"]))
 
-    view = _audit_case_view(case, users=load_users())
-    return {
+    users = load_users()
+    profiles = load_profiles()
+    view = _audit_case_view(case, profiles=profiles, users=users)
+    view["archive"] = await asyncio.to_thread(_payment_archive_summary, case)
+    related = await asyncio.to_thread(
+        store.list_chat_cases, case.get("owner"), case.get("chat_key")
+    )
+    payload = {
         "ok": True,
         "quiet": True,
+        "archived": False,
+        "archive": view["archive"],
         "case": view,
+        "related_cases": [
+            _audit_case_view(row, profiles=profiles, users=users) for row in related
+        ],
         "peer": peer,
         "origin": origin,
         "messages": rows,
         "photos": photos,
         "hint": "Просмотр только для тебя. Сообщения не отмечены прочитанными, ничего не отправлено.",
     }
+    return JSONResponse(
+        payload,
+        headers={"Cache-Control": "private, no-store", "Pragma": "no-cache"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3736,6 +4916,7 @@ async def delete_profile(pid: str, user=Depends(require_user)):
         return JSONResponse({"error": "Не удалось безопасно удалить данные проверки оплат"}, status_code=503)
     state.audit_deleted_profiles.add(str(pid))
     _cancel_audit_ocr_for_profiles([pid])
+    await _cancel_payment_archive_tasks(profile_ids=[pid])
     try:
         async with _audit_owner_lock(profile.get("owner")):
             if store is not None:

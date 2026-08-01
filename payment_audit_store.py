@@ -122,9 +122,10 @@ class PaymentAuditStore:
                  correlation_minutes: int = 120):
         self.path = str(path)
         self.secret = (secret or "payment-audit").encode("utf-8")
-        self.retention_days = max(7, int(retention_days))
+        requested_retention = int(retention_days)
+        self.retention_days = 0 if requested_retention <= 0 else max(7, requested_retention)
         self.report_retention_days = max(
-            self.retention_days, int(report_retention_days)
+            self.retention_days, 7, int(report_retention_days)
         )
         self.correlation_minutes = max(15, int(correlation_minutes))
         parent = Path(self.path).parent
@@ -965,16 +966,106 @@ class PaymentAuditStore:
         with self._connection() as db:
             return self._row(db.execute("SELECT * FROM payment_cases WHERE id=?", (case_id,)).fetchone())
 
+    def list_chat_cases(self, owner: str, chat_key: str) -> list[dict]:
+        """Return all retained payment facts that belong to one opaque chat."""
+        owner = str(owner or "")
+        chat_key = str(chat_key or "")
+        if not owner or not chat_key:
+            return []
+        with self._connection() as db:
+            rows = db.execute(
+                """SELECT * FROM payment_cases
+                   WHERE owner=? AND chat_key=?
+                   ORDER BY first_at ASC, id ASC""",
+                (owner, chat_key),
+            ).fetchall()
+        return [self._row(row) for row in rows]
+
+    def owner_chat_keys(self, owner: str) -> list[str]:
+        """Return every archive scope before destructive owner deletion."""
+        owner = str(owner or "")
+        if not owner:
+            return []
+        with self._connection() as db:
+            rows = db.execute(
+                "SELECT DISTINCT chat_key FROM payment_cases WHERE owner=? AND chat_key<>''",
+                (owner,),
+            ).fetchall()
+        return [str(row["chat_key"]) for row in rows if row["chat_key"]]
+
+    def chat_message_refs(self, owner: str, chat_key: str) -> set[str]:
+        """Return one-way Telegram message references for every case in a chat."""
+        owner = str(owner or "")
+        chat_key = str(chat_key or "")
+        if not owner or not chat_key:
+            return set()
+        with self._connection() as db:
+            rows = db.execute(
+                """SELECT DISTINCT e.message_ref
+                   FROM payment_events e
+                   JOIN payment_cases c ON c.id=e.case_id
+                   WHERE c.owner=? AND c.chat_key=? AND e.message_ref<>''""",
+                (owner, chat_key),
+            ).fetchall()
+        return {str(row["message_ref"]) for row in rows if row["message_ref"]}
+
+    def compact_chat(self, owner: str, chat_key: str, actor_id: str = "") -> int:
+        """Discard stored snippets/context while retaining payment facts and decisions."""
+        owner = str(owner or "")
+        chat_key = str(chat_key or "")
+        if not owner or not chat_key:
+            raise ValueError("invalid chat scope")
+        now = utc_now_iso()
+        with self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            case_ids = [
+                row["id"] for row in db.execute(
+                    "SELECT id FROM payment_cases WHERE owner=? AND chat_key=?",
+                    (owner, chat_key),
+                ).fetchall()
+            ]
+            if not case_ids:
+                return 0
+            db.execute(
+                """UPDATE payment_cases SET evidence_json='[]', updated_at=?
+                   WHERE owner=? AND chat_key=?""",
+                (now, owner, chat_key),
+            )
+            db.executemany(
+                """INSERT INTO payment_audit_log(
+                   case_id, actor, actor_id, action, old_value,
+                   new_value, note, created_at
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                [
+                    (
+                        case_id,
+                        "admin",
+                        str(actor_id or "admin"),
+                        "compact_chat",
+                        "full-evidence",
+                        "payment-facts-only",
+                        "",
+                        now,
+                    )
+                    for case_id in case_ids
+                ],
+            )
+            return len(case_ids)
+
     def list_cases(self, *, owner: str | None = None, days: int = 7,
-                   limit: int = 100, min_score: int = 20) -> list[dict]:
+                   limit: int = 100, min_score: int = 20,
+                   offset: int = 0) -> list[dict]:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))).isoformat(timespec="seconds")
         sql = "SELECT * FROM payment_cases WHERE last_at>=? AND score>=?"
         args: list = [cutoff, max(0, int(min_score))]
         if owner is not None:
             sql += " AND owner=?"
             args.append(owner)
-        sql += " ORDER BY last_at DESC LIMIT ?"
-        args.append(max(1, min(500, int(limit))))
+        sql += " ORDER BY last_at DESC, id DESC LIMIT ? OFFSET ?"
+        args.extend([
+            max(1, min(5000, int(limit))),
+            max(0, min(10_000_000, int(offset))),
+        ])
         with self._connection() as db:
             return [self._row(row) for row in db.execute(sql, args).fetchall()]
 
@@ -1178,18 +1269,27 @@ class PaymentAuditStore:
 
     def cleanup(self, now: str | datetime | None = None) -> int:
         current = datetime.fromisoformat(normalize_event_time(now))
-        cutoff = (current - timedelta(days=self.retention_days)).isoformat(timespec="seconds")
         report_cutoff = (
             current - timedelta(days=self.report_retention_days)
         ).isoformat(timespec="seconds")
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            cur = db.execute("DELETE FROM payment_cases WHERE last_at<?", (cutoff,))
-            db.execute(
-                """DELETE FROM payment_audit_log
-                   WHERE created_at<? OR case_id NOT IN (SELECT id FROM payment_cases)""",
-                (cutoff,),
-            )
+            removed = 0
+            if self.retention_days > 0:
+                cutoff = (
+                    current - timedelta(days=self.retention_days)
+                ).isoformat(timespec="seconds")
+                cur = db.execute("DELETE FROM payment_cases WHERE last_at<?", (cutoff,))
+                removed = int(cur.rowcount or 0)
+                db.execute(
+                    """DELETE FROM payment_audit_log
+                       WHERE created_at<? OR case_id NOT IN (SELECT id FROM payment_cases)""",
+                    (cutoff,),
+                )
+            else:
+                db.execute(
+                    "DELETE FROM payment_audit_log WHERE case_id NOT IN (SELECT id FROM payment_cases)"
+                )
             db.execute(
                 "DELETE FROM payment_weekly_reports WHERE updated_at<?", (report_cutoff,)
             )
@@ -1202,7 +1302,7 @@ class PaymentAuditStore:
                    )""",
                 (report_cutoff,),
             )
-            return int(cur.rowcount or 0)
+            return removed
 
     def delete_owner(self, owner: str) -> None:
         with self._connection() as db:
