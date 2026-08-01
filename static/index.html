@@ -245,6 +245,108 @@
   .check-row.done { opacity: .6; text-decoration: line-through; }
   .check-bar-wrap { background: var(--panel-2); border-radius: 8px; height: 10px; overflow: hidden; margin-top: 12px; }
   .check-bar { background: var(--ok); height: 100%; width: 0; transition: width .3s; border-radius: 8px; }
+
+  /* ---------- проверка оплат ---------- */
+  .audit-head {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 14px; margin-bottom: 14px;
+  }
+  .audit-head h3 { margin-bottom: 5px; font-size: 17px; }
+  .audit-head-note { max-width: 540px; font-size: 12px; color: var(--muted); line-height: 1.5; }
+  .audit-health {
+    flex-shrink: 0; padding: 5px 9px; border-radius: 999px;
+    background: var(--panel-2); color: var(--muted); font-size: 11px;
+  }
+  .audit-health.ok { color: var(--ok); }
+  .audit-health.warn { color: var(--accent-3); }
+  .audit-kpis {
+    display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr));
+    gap: 8px; margin: 12px 0 16px;
+  }
+  .audit-kpi {
+    min-width: 0; padding: 11px 12px; border: 1px solid var(--border);
+    border-radius: 11px; background: var(--panel-2);
+  }
+  .audit-kpi-value { font-size: 19px; line-height: 1.15; font-weight: 750; color: var(--text); }
+  .audit-kpi-label { margin-top: 4px; font-size: 11px; color: var(--muted); line-height: 1.3; }
+  .audit-kpi.danger .audit-kpi-value { color: var(--err); }
+  .audit-kpi.ok .audit-kpi-value { color: var(--ok); }
+  .audit-workers { display: grid; gap: 8px; margin: 0 0 16px; }
+  .audit-worker {
+    display: grid; grid-template-columns: minmax(110px, 1.25fr) repeat(3, minmax(90px, 1fr));
+    gap: 8px 12px; align-items: center; padding: 11px 12px;
+    border: 1px solid var(--border); border-radius: 11px; background: rgba(29,39,51,.72);
+  }
+  .audit-worker-name { font-size: 14px; font-weight: 700; }
+  .audit-worker-cell { font-size: 13px; font-weight: 650; }
+  .audit-worker-cell span { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; font-weight: 500; }
+  .audit-list-title { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin: 16px 0 9px; }
+  .audit-list-title strong { font-size: 14px; }
+  .audit-list-title span { color: var(--muted); font-size: 11px; }
+  .audit-list { display: grid; gap: 10px; }
+  .audit-card {
+    position: relative; overflow: hidden; padding: 14px;
+    border: 1px solid var(--border); border-radius: 13px; background: var(--panel-2);
+  }
+  .audit-card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--muted); }
+  .audit-card.high::before, .audit-card.failed::before { background: var(--err); }
+  .audit-card.medium::before, .audit-card.needs-info::before { background: var(--accent-3); }
+  .audit-card.confirmed::before { background: var(--ok); }
+  .audit-card.dismissed { opacity: .72; }
+  .audit-case-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .audit-person { min-width: 0; }
+  .audit-person-name { font-size: 14px; font-weight: 750; }
+  .audit-meta { margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.4; }
+  .audit-amount { flex-shrink: 0; font-size: 21px; line-height: 1.1; font-weight: 800; text-align: right; }
+  .audit-status {
+    display: inline-flex; align-items: center; gap: 5px; margin-top: 8px;
+    padding: 4px 8px; border-radius: 999px; background: var(--panel-3);
+    color: var(--muted); font-size: 11px; font-weight: 650;
+  }
+  .audit-status.high, .audit-status.failed { color: var(--err); }
+  .audit-status.medium, .audit-status.needs-info { color: #8dbaf0; }
+  .audit-status.confirmed { color: var(--ok); }
+  .audit-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
+  .audit-tag { padding: 4px 7px; border-radius: 6px; background: rgba(74,127,191,.12); color: #9dbfe6; font-size: 10px; }
+  .audit-signal {
+    margin-top: 9px; padding: 8px 10px; border-radius: 9px;
+    background: rgba(14,22,33,.58); color: #cbd8e5; font-size: 12px; line-height: 1.45;
+  }
+  .audit-context { margin-top: 9px; border-top: 1px solid var(--border); }
+  .audit-context summary {
+    cursor: pointer; list-style: none; padding: 9px 0 2px;
+    color: var(--accent-3); font-size: 11px; font-weight: 650;
+  }
+  .audit-context summary::-webkit-details-marker { display: none; }
+  .audit-context summary::before { content: "▸"; display: inline-block; width: 14px; color: var(--muted); }
+  .audit-context[open] summary::before { content: "▾"; }
+  .audit-chat { display: grid; gap: 5px; padding-top: 7px; }
+  .audit-chat-row { max-width: 88%; padding: 7px 9px; border-radius: 9px; font-size: 11px; line-height: 1.4; color: #b9c6d3; background: var(--panel-3); }
+  .audit-chat-row.outgoing { margin-left: auto; background: rgba(43,82,120,.55); }
+  .audit-chat-who { display: block; margin-bottom: 2px; color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .04em; }
+  .audit-review { margin-top: 10px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+  .audit-review b { color: var(--text); }
+  .audit-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 11px; }
+  .audit-actions .btn { padding: 8px 11px; border-radius: 8px; font-size: 12px; }
+  .audit-actions .btn.audit-secondary { background: transparent; border: 1px solid var(--panel-3); }
+  .audit-actions .btn.audit-negative { background: transparent; border: 1px solid rgba(255,107,107,.28); color: var(--err); }
+  .audit-empty { padding: 18px; border: 1px dashed var(--panel-3); border-radius: 11px; text-align: center; color: var(--muted); font-size: 12px; }
+  .audit-origin { padding: 12px; border: 1px solid var(--border); border-radius: 11px; background: var(--panel-2); }
+  .audit-peek-section { margin-top: 12px; }
+  .audit-peek-section > summary { cursor: pointer; color: var(--text); font-size: 13px; font-weight: 700; }
+  .audit-photo { margin-top: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+
+  @media (max-width: 640px) {
+    .audit-head { display: block; }
+    .audit-health { display: inline-flex; margin-top: 8px; }
+    .audit-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .audit-worker { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .audit-worker-name { grid-column: 1 / -1; }
+    .audit-case-top { align-items: center; }
+    .audit-amount { font-size: 19px; }
+    .audit-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .audit-actions .btn { width: 100%; }
+  }
 </style>
 </head>
 <body>
@@ -744,8 +846,8 @@ https://t.me/+AbCdEf..."></textarea>
 <!-- ============ Модалка: тихий просмотр оплаты ============ -->
 <div id="modal-payment-peek" class="overlay hidden" onclick="if(event.target===this)closePaymentPeek()">
   <div class="modal" style="width:520px">
-    <h2>👁 Проверка диалога</h2>
-    <p class="sub" id="payment-peek-sub">Тихий просмотр через аккаунт сотрудника — без «прочитано» и без сообщений.</p>
+    <h2>Проверка перевода</h2>
+    <p class="sub" id="payment-peek-sub">История открывается без отправки сообщений и отметки «прочитано».</p>
     <div id="payment-peek-body"><div class="hint">Загрузка…</div></div>
     <div class="modal-actions">
       <button class="btn ghost" onclick="closePaymentPeek()">Закрыть</button>
@@ -1156,30 +1258,126 @@ function paymentAmounts(c) {
   return rows.map(a => `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 }).format(Number(a.value))} ${a.currency === "RUB" ? "₽" : escapeHtml(String(a.currency || ""))}`).join(" · ");
 }
 
-function paymentEvidence(c, maxRows) {
-  return (c.evidence || []).slice(-(maxRows || 3)).map(e => {
-    const arrow = e.direction === "outgoing" ? "аккаунт →" : "клиент →";
-    const text = e.snippet ? `«${escapeHtml(e.snippet)}»` : (e.source === "ocr" ? "чек распознан" : "сигнал");
-    return `<div class="si-to" style="margin-top:3px">${arrow} · ${text}</div>`;
-  }).join("");
-}
-
-function paymentChatContext(c, maxRows) {
+function paymentChatRows(c, maxRows) {
   const rows = (c.context && c.context.length)
     ? c.context
     : (c.evidence || []).flatMap(e => e.context || []);
-  if (!rows.length) return "";
-  const body = rows.slice(-(maxRows || 5)).map(e => {
-    const arrow = e.direction === "outgoing" ? "аккаунт →" : "клиент →";
-    return `<div class="si-to" style="margin-top:2px">${arrow} «${escapeHtml(e.snippet || "")}»</div>`;
-  }).join("");
-  return `<div class="si-to" style="margin-top:6px;color:var(--accent-3)">переписка рядом:</div>${body}`;
+  return rows.slice(-(maxRows || 5));
 }
 
 function paymentLevel(c) {
   if (c.level === "high") return { text: "высокая уверенность", color: "var(--err)" };
   if (c.level === "medium") return { text: "средняя уверенность", color: "var(--accent-3)" };
   return { text: "слабый сигнал", color: "var(--muted)" };
+}
+
+function paymentCasePresentation(c) {
+  const categories = new Set(c.categories || []);
+  const failed = c.event_status === "failed_or_reversed" || c.event_status === "retracted"
+    || categories.has("payment_negation") || categories.has("refund_or_reversal") || categories.has("message_retracted");
+  if (c.admin_status === "confirmed") return { tone: "confirmed", icon: "✓", label: "Доход подтверждён" };
+  if (c.admin_status === "dismissed") return { tone: "dismissed", icon: "—", label: "Не относится к доходу" };
+  if (failed) return { tone: "failed", icon: "!", label: c.event_status === "retracted" ? "Сообщение изменили" : "Оплата не состоялась" };
+  if (c.admin_status === "needs_info") return { tone: "needs-info", icon: "?", label: "Нужно уточнение" };
+  if (c.level === "high") return { tone: "high", icon: "!", label: "Высокая вероятность оплаты" };
+  if (c.level === "medium") return { tone: "medium", icon: "?", label: "Нужно проверить" };
+  return { tone: "low", icon: "·", label: "Слабый сигнал" };
+}
+
+function paymentCategoryTags(c, limit) {
+  const hidden = new Set(["amount", "negated", "money_mentioned"]);
+  const rows = (c.categories || [])
+    .filter(x => PAYMENT_CATEGORY[x] && !hidden.has(x))
+    .map(x => PAYMENT_CATEGORY[x]);
+  if (!rows.length) rows.push("возможная оплата");
+  return rows.slice(0, limit || 5).map(x => `<span class="audit-tag">${escapeHtml(x)}</span>`).join("");
+}
+
+function paymentSignalBlock(c, maxRows) {
+  const rows = (c.evidence || []).filter(e => e && (e.snippet || e.source === "ocr")).slice(-(maxRows || 2));
+  if (!rows.length) return "";
+  return rows.map(e => {
+    const who = e.direction === "outgoing" ? "аккаунт" : "клиент";
+    const text = e.snippet || "чек распознан";
+    return `<div class="audit-signal"><b>${who}:</b> «${escapeHtml(text)}»</div>`;
+  }).join("");
+}
+
+function paymentContextDetails(c) {
+  const rows = paymentChatRows(c, 5);
+  if (!rows.length) return "";
+  const body = rows.map(e => {
+    const outgoing = e.direction === "outgoing";
+    return `<div class="audit-chat-row${outgoing ? " outgoing" : ""}">
+      <span class="audit-chat-who">${outgoing ? "рабочий аккаунт" : "клиент"}</span>${escapeHtml(e.snippet || "")}
+    </div>`;
+  }).join("");
+  return `<details class="audit-context"><summary>Показать переписку рядом · ${rows.length}</summary><div class="audit-chat">${body}</div></details>`;
+}
+
+function paymentReviewLine(c) {
+  const userLine = `${PAYMENT_USER_STATUS[c.user_status] || c.user_status}${c.user_note ? ` — ${c.user_note}` : ""}`;
+  const adminLine = `${PAYMENT_ADMIN_STATUS[c.admin_status] || c.admin_status}${c.admin_amount != null ? ` · ${money(c.admin_amount)}` : ""}${c.admin_note ? ` — ${c.admin_note}` : ""}`;
+  return `<div class="audit-review">Ответ сотрудника: <b>${escapeHtml(userLine)}</b><br>Решение администратора: <b>${escapeHtml(adminLine)}</b></div>`;
+}
+
+function paymentAdminActions(c, suggested, presentation) {
+  const id = String(c.id || "");
+  if (presentation.tone === "failed") {
+    return `<div class="audit-actions">
+      <button class="btn" onclick="peekPaymentCase('${id}')">Проверить диалог</button>
+      <button class="btn audit-negative" onclick="adminReviewPaymentCase('${id}','dismissed',null)">Не доход</button>
+      <button class="btn audit-secondary" onclick="adminReviewPaymentCase('${id}','needs_info',null)">Уточнить</button>
+      <button class="btn audit-secondary" onclick="adminReviewPaymentCase('${id}','confirmed','${suggested}')">Всё же подтвердить</button>
+    </div>`;
+  }
+  return `<div class="audit-actions">
+    <button class="btn" onclick="adminReviewPaymentCase('${id}','confirmed','${suggested}')">${c.admin_status === "confirmed" ? "Изменить сумму" : "Подтвердить доход"}</button>
+    <button class="btn ghost" onclick="peekPaymentCase('${id}')">Проверить диалог</button>
+    <button class="btn audit-secondary" onclick="adminReviewPaymentCase('${id}','needs_info',null)">Уточнить</button>
+    <button class="btn audit-negative" onclick="adminReviewPaymentCase('${id}','dismissed',null)">Не доход</button>
+  </div>`;
+}
+
+function paymentUserActions(c, presentation) {
+  const id = String(c.id || "");
+  const income = `<button class="btn${presentation.tone === "failed" ? " audit-secondary" : ""}" onclick="respondPaymentCase('${id}','income')">Это доход</button>`;
+  const notReceived = `<button class="btn${presentation.tone === "failed" ? "" : " ghost"}" onclick="respondPaymentCase('${id}','not_received')">Деньги не пришли</button>`;
+  return `<div class="audit-actions">${presentation.tone === "failed" ? notReceived + income : income + notReceived}
+    <button class="btn audit-secondary" onclick="respondPaymentCase('${id}','personal')">Личный перевод</button>
+    <button class="btn audit-secondary" onclick="respondPaymentCase('${id}','refund')">Возврат</button>
+    <button class="btn audit-secondary" onclick="respondPaymentCase('${id}','duplicate')">Дубликат</button>
+    ${c.user_status !== "pending" ? `<button class="btn audit-negative" onclick="respondPaymentCase('${id}','disputed')">Оспорить</button>` : ""}
+  </div>`;
+}
+
+function paymentCaseCard(c, adminMode) {
+  const presentation = paymentCasePresentation(c);
+  const rubAmounts = [...new Set((c.amounts || []).filter(a => a.currency === "RUB").map(a => Number(a.value) || 0).filter(v => v > 0))];
+  const suggested = rubAmounts.length === 1 ? rubAmounts[0] : "";
+  const name = adminMode ? (c.username || "Сотрудник") : (c.chat_label || "Диалог");
+  const chat = adminMode && c.chat_label ? ` · ${escapeHtml(c.chat_label)}` : "";
+  const profile = c.profile_name ? escapeHtml(c.profile_name) : "рабочий аккаунт";
+  const when = escapeHtml((c.last_at || "").slice(0, 16).replace("T", " "));
+  return `<article class="audit-card ${presentation.tone}">
+    <div class="audit-case-top">
+      <div class="audit-person">
+        <div class="audit-person-name">${escapeHtml(name)}${chat}</div>
+        <div class="audit-meta">${profile}${when ? ` · ${when}` : ""}${c.chat_link ? ` · <a href="${escapeHtml(c.chat_link)}">открыть в Telegram</a>` : ""}</div>
+        <div class="audit-status ${presentation.tone}">${presentation.icon} ${escapeHtml(presentation.label)}</div>
+      </div>
+      <div class="audit-amount">${paymentAmounts(c)}</div>
+    </div>
+    <div class="audit-tags">${paymentCategoryTags(c, 5)}</div>
+    ${paymentSignalBlock(c, 2)}
+    ${paymentContextDetails(c)}
+    ${paymentReviewLine(c)}
+    ${adminMode ? paymentAdminActions(c, suggested, presentation) : paymentUserActions(c, presentation)}
+  </article>`;
+}
+
+function auditKpi(value, label, tone) {
+  return `<div class="audit-kpi${tone ? ` ${tone}` : ""}"><div class="audit-kpi-value">${value}</div><div class="audit-kpi-label">${escapeHtml(label)}</div></div>`;
 }
 
 async function loadPaymentAudit() {
@@ -1195,9 +1393,12 @@ async function loadPaymentAudit() {
     return;
   }
   const s = data.summary || {};
-  summary.innerHTML = `За текущую неделю: <b>${s.pending || 0}</b> непроверенных сигналов${s.high ? ` · <span style="color:var(--err)">${s.high} высокой уверенности</span>` : ""}`
-    + ` · подтверждено <b>${money(s.confirmed_total)}</b> · 15% = <b>${money(s.commission)}</b>`
-    + `${data.ocr_available ? " · OCR чеков работает" : " · ⚠️ OCR чеков временно недоступен"}`;
+  summary.innerHTML = `<div class="audit-kpis">
+    ${auditKpi(s.pending || 0, "ждут проверки", s.pending ? "danger" : "")}
+    ${auditKpi(s.high || 0, "важные сигналы", s.high ? "danger" : "")}
+    ${auditKpi(money(s.confirmed_total), "доход подтверждён", "ok")}
+    ${auditKpi(money(s.commission), "твои 15%", "")}
+  </div><div class="audit-health ${data.ocr_available ? "ok" : "warn"}">${data.ocr_available ? "● OCR чеков работает" : "○ OCR чеков временно недоступен"}</div>`;
   el("payment-week-form").classList.remove("hidden");
   const report = data.week_report;
   const previousReport = (data.week_reports || []).find(r => r.week_start !== data.week_start);
@@ -1211,28 +1412,9 @@ async function loadPaymentAudit() {
   const casesRes = await api("/api/payment-audit/cases?days=7&limit=100");
   if (!casesRes.ok) { list.innerHTML = `<div class="hint">${escapeHtml(casesRes.data.error || "Ошибка")}</div>`; return; }
   const cases = casesRes.data.cases || [];
-  if (!cases.length) { list.innerHTML = `<div class="hint">Платёжных сигналов пока нет.</div>`; return; }
-  list.innerHTML = cases.map(c => {
-    const level = paymentLevel(c);
-    const cats = (c.categories || []).filter(x => PAYMENT_CATEGORY[x]).map(x => PAYMENT_CATEGORY[x]).slice(0, 5).join(" · ");
-    const answered = c.user_status !== "pending";
-    return `<div class="sched-item" style="display:block">
-      <div class="si-when" style="color:${level.color}">${level.text} · ${escapeHtml(c.chat_label)} · ${escapeHtml((c.last_at || "").slice(0, 16).replace("T", " "))}${c.chat_link ? ` · <a href="${escapeHtml(c.chat_link)}">открыть в Telegram</a>` : ""}</div>
-      <div class="si-text" style="font-weight:600">${paymentAmounts(c)}</div>
-      <div class="si-to">${escapeHtml(c.profile_name || "")} · ${escapeHtml(cats || "возможная оплата")}</div>
-      ${paymentEvidence(c, 3)}
-      ${paymentChatContext(c, 5)}
-      <div class="si-to" style="margin-top:5px">${escapeHtml(PAYMENT_USER_STATUS[c.user_status] || c.user_status)} · ${escapeHtml(PAYMENT_ADMIN_STATUS[c.admin_status] || c.admin_status)}${c.admin_note ? ` — ${escapeHtml(c.admin_note)}` : ""}</div>
-      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
-        <button class="btn ghost" onclick="respondPaymentCase('${c.id}','income')">✓ Это доход</button>
-        <button class="btn ghost" onclick="respondPaymentCase('${c.id}','not_received')">Не поступило</button>
-        <button class="btn ghost" onclick="respondPaymentCase('${c.id}','personal')">Личный перевод</button>
-        <button class="btn ghost" onclick="respondPaymentCase('${c.id}','refund')">Возврат</button>
-        <button class="btn ghost" onclick="respondPaymentCase('${c.id}','duplicate')">Дубликат</button>
-        ${answered ? `<button class="btn ghost" onclick="respondPaymentCase('${c.id}','disputed')">Оспорить</button>` : ""}
-      </div>
-    </div>`;
-  }).join("");
+  list.className = "audit-list";
+  if (!cases.length) { list.innerHTML = `<div class="audit-empty">Платёжных сигналов пока нет.</div>`; return; }
+  list.innerHTML = cases.map(c => paymentCaseCard(c, false)).join("");
 }
 
 async function respondPaymentCase(id, status) {
@@ -2464,51 +2646,52 @@ function adminStatsHtml(st) {
 function renderAdminPaymentAudit(data) {
   const box = el("admin-payment-audit");
   if (!box) return;
-  if (!data) { box.innerHTML = `<div class="hint">Проверка оплат недоступна.</div>`; return; }
-  const summaries = (data.summaries || []).filter(s => !String(s.username || "").startsWith("admin") || s.cases || s.week_report);
+  if (!data) { box.innerHTML = `<div class="audit-empty">Проверка оплат временно недоступна. Рассылки продолжают работать.</div>`; return; }
+  const summaries = (data.summaries || []).filter(s => s.cases || s.week_report || s.pending || s.confirmed);
   const ocrQueue = data.ocr_queue || { active: 0, dropped: {} };
   const ocrDropped = Object.values(ocrQueue.dropped || {}).reduce((sum, value) => sum + Number(value || 0), 0);
+  const totals = summaries.reduce((acc, s) => {
+    acc.pending += Number(s.pending || 0);
+    acc.high += Number(s.high || 0);
+    acc.confirmed += Number(s.confirmed_total || 0);
+    acc.commission += Number(s.commission || 0);
+    return acc;
+  }, { pending: 0, high: 0, confirmed: 0, commission: 0 });
   const summaryHtml = summaries.map(s => {
     const declared = s.week_report ? money(s.week_report.amount) : "не заявлено";
     const previous = (s.week_reports || []).find(r => r.week_start !== data.week_start);
-    const declaredFee = s.week_report ? ` (15% = ${money(Number(s.week_report.amount) * 0.15)})` : "";
-    return `<div class="si-to" style="margin:5px 0"><b>${escapeHtml(s.username)}</b> · заявлено ${declared}${declaredFee}`
-      + `${previous ? ` · прошлая неделя ${money(previous.amount)}` : ""}`
-      + `${s.week_report && (s.week_report.history || []).length > 1 ? ` · правок суммы: ${(s.week_report.history || []).length - 1}` : ""}`
-      + ` · сигналов ${s.cases || 0}, ждут ${s.pending || 0}${s.high ? ` (${s.high} важных)` : ""}`
-      + ` · подтверждено ${money(s.confirmed_total)} · 15% = <b>${money(s.commission)}</b></div>`;
-  }).join("");
-  const cases = data.cases || [];
-  const caseHtml = cases.length ? cases.map(c => {
-    const level = paymentLevel(c);
-    const rubAmounts = [...new Set((c.amounts || []).filter(a => a.currency === "RUB").map(a => Number(a.value) || 0).filter(v => v > 0))];
-    const suggested = rubAmounts.length === 1 ? rubAmounts[0] : "";
-    const cats = (c.categories || []).filter(x => PAYMENT_CATEGORY[x]).map(x => PAYMENT_CATEGORY[x]).slice(0, 7).join(" · ");
-    const duplicate = (c.categories || []).includes("duplicate_receipt");
-    const userLine = `${PAYMENT_USER_STATUS[c.user_status] || c.user_status}${c.user_note ? ` — ${c.user_note}` : ""}`;
-    const adminLine = `${PAYMENT_ADMIN_STATUS[c.admin_status] || c.admin_status}${c.admin_amount != null ? ` · ${money(c.admin_amount)}` : ""}`;
-    return `<div class="sched-item" style="display:block">
-      <div class="si-when" style="color:${level.color}">${escapeHtml(c.username || "")} · ${level.text} · ${escapeHtml(c.chat_label || "")}${c.chat_link ? ` · <a href="${escapeHtml(c.chat_link)}">открыть в Telegram</a>` : ""}</div>
-      <div class="si-text" style="font-weight:600">${paymentAmounts(c)}</div>
-      <div class="si-to">${escapeHtml(c.profile_name || "")} · ${escapeHtml((c.last_at || "").slice(0,16).replace("T"," "))}</div>
-      <div class="si-to" style="${duplicate ? "color:var(--err);font-weight:700" : ""}">${escapeHtml(cats || "возможная оплата")}</div>
-      ${paymentEvidence(c, 4)}
-      ${paymentChatContext(c, 5)}
-      <div class="si-to" style="margin-top:5px">Ответ: ${escapeHtml(userLine)}</div>
-      <div class="si-to">Решение: ${escapeHtml(adminLine)}${c.admin_note ? ` — ${escapeHtml(c.admin_note)}` : ""}</div>
-      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
-        <button class="btn" onclick="adminReviewPaymentCase('${c.id}','confirmed','${suggested}')">✓ Подтвердить доход</button>
-        <button class="btn ghost" onclick="peekPaymentCase('${c.id}')">👁 Посмотреть тихо</button>
-        <button class="btn ghost" onclick="adminReviewPaymentCase('${c.id}','needs_info',null)">Запросить пояснение</button>
-        <button class="btn ghost" onclick="adminReviewPaymentCase('${c.id}','dismissed',null)">Не доход</button>
-      </div>
+    const edits = s.week_report ? Math.max(0, (s.week_report.history || []).length - 1) : 0;
+    const declaredNote = s.week_report
+      ? `15% = ${money(Number(s.week_report.amount) * 0.15)}${edits ? ` · правок ${edits}` : ""}`
+      : (previous ? `прошлая неделя ${money(previous.amount)}` : "сумма за неделю не указана");
+    return `<div class="audit-worker">
+      <div class="audit-worker-name">${escapeHtml(s.username)}</div>
+      <div class="audit-worker-cell">${declared}<span>заявлено · ${declaredNote}</span></div>
+      <div class="audit-worker-cell">${Number(s.pending || 0)}<span>ждут проверки${s.high ? ` · важных ${s.high}` : ""}</span></div>
+      <div class="audit-worker-cell">${money(s.confirmed_total)}<span>подтверждено · 15% = ${money(s.commission)}</span></div>
     </div>`;
-  }).join("") : `<div class="hint">За выбранный период сигналов нет.</div>`;
-  box.innerHTML = `<h3>🔎 Оплаты и недельная сверка</h3>
-    <div class="hint">Сигнал из чата не является доказательством: сумму подтверждает администратор после ответа пользователя. «Посмотреть тихо» читает диалог глазами аккаунта сотрудника — без отметки прочитано.</div>
-    <div class="hint">OCR: в работе ${Number(ocrQueue.active || 0)}${ocrDropped ? ` · пропущено защитными лимитами ${ocrDropped}` : ""}</div>
-    <div style="margin:10px 0 14px">${summaryHtml || `<div class="hint">Пользователей пока нет.</div>`}</div>
-    <div class="sched-list">${caseHtml}</div>`;
+  }).join("");
+  const order = { high: 0, "needs-info": 1, medium: 2, failed: 3, low: 4, confirmed: 5, dismissed: 6 };
+  const cases = [...(data.cases || [])].sort((a, b) => {
+    const byState = (order[paymentCasePresentation(a).tone] ?? 9) - (order[paymentCasePresentation(b).tone] ?? 9);
+    return byState || String(b.last_at || "").localeCompare(String(a.last_at || ""));
+  });
+  const caseHtml = cases.length
+    ? cases.map(c => paymentCaseCard(c, true)).join("")
+    : `<div class="audit-empty">За последние 7 дней платёжных сигналов нет.</div>`;
+  box.innerHTML = `<div class="audit-head">
+      <div><h3>Проверка оплат</h3><div class="audit-head-note">Сначала проверяй важные карточки. Сигнал из чата или скрин чека — это повод сверить перевод, а не доказательство поступления денег.</div></div>
+      <div class="audit-health ${ocrDropped ? "warn" : "ok"}">OCR в работе: ${Number(ocrQueue.active || 0)}${ocrDropped ? ` · пропущено: ${ocrDropped}` : ""}</div>
+    </div>
+    <div class="audit-kpis">
+      ${auditKpi(totals.pending, "ждут проверки", totals.pending ? "danger" : "")}
+      ${auditKpi(totals.high, "важные сигналы", totals.high ? "danger" : "")}
+      ${auditKpi(money(totals.confirmed), "доход подтверждён", "ok")}
+      ${auditKpi(money(totals.commission), "15% с подтверждённого", "")}
+    </div>
+    <div class="audit-workers">${summaryHtml || `<div class="audit-empty">Недельных данных пока нет.</div>`}</div>
+    <div class="audit-list-title"><strong>Сигналы за последние 7 дней</strong><span>важные показаны первыми · «Проверить диалог» не ставит «прочитано»</span></div>
+    <div class="audit-list">${caseHtml}</div>`;
 }
 
 async function adminReviewPaymentCase(id, status, suggested) {
@@ -2543,7 +2726,7 @@ async function peekPaymentCase(id) {
   const sub = el("payment-peek-sub");
   if (!modal || !body) return;
   body.innerHTML = `<div class="hint">Загрузка диалога…</div>`;
-  if (sub) sub.textContent = "Тихий просмотр через аккаунт сотрудника — без «прочитано» и без сообщений.";
+  if (sub) sub.textContent = "История открывается без отправки сообщений и отметки «прочитано».";
   modal.classList.remove("hidden");
   const { ok, data } = await api(`/api/admin/payment-audit/cases/${id}/peek`);
   if (!ok) {
@@ -2558,33 +2741,34 @@ async function peekPaymentCase(id) {
   }
   const origin = data.origin || {};
   const detector = (origin.detector || []).map(x =>
-    `<div class="si-to" style="margin-top:2px">• ${escapeHtml(x)}</div>`
+    `<span class="audit-tag">${escapeHtml(x)}</span>`
   ).join("");
-  const originHtml = `<div style="background:var(--panel-2);border-radius:10px;padding:10px 12px;margin-bottom:10px">
-      <div class="si-text" style="font-weight:600">Откуда сумма ${escapeHtml(amountsLabel)}</div>
-      <div class="si-to" style="margin-top:4px">${escapeHtml(origin.summary || "")}</div>
-      ${detector}
-      <div class="si-to" style="margin-top:4px;color:${origin.trigger_found ? "var(--ok)" : "var(--accent-3)"}">${origin.trigger_found ? "✓ нашли исходное сообщение с чеком в истории" : "исходное сообщение ищем среди скринов ниже"}</div>
+  const originHtml = `<div class="audit-origin">
+      <div class="audit-case-top"><div><div class="audit-person-name">Что нашёл робот</div><div class="audit-meta">${escapeHtml(origin.summary || "Сигнал требует ручной проверки")}</div></div><div class="audit-amount">${escapeHtml(amountsLabel)}</div></div>
+      ${detector ? `<div class="audit-tags">${detector}</div>` : ""}
+      <div class="audit-status ${origin.trigger_found ? "confirmed" : "needs-info"}">${origin.trigger_found ? "✓ Исходное сообщение найдено" : "? Сверь сообщение и скрины ниже"}</div>
     </div>`;
   const photos = (data.photos || []).map(p => {
     const badge = p.matches_case_amount
-      ? `<span style="color:var(--ok);font-weight:700">← это похоже на чек с суммой кейса</span>`
-      : (p.is_trigger ? `<span style="color:var(--accent-3);font-weight:700">← сообщение-сигнал</span>` : "");
-    const ocr = p.ocr_text ? `<div class="si-to" style="margin-top:3px">OCR: «${escapeHtml(p.ocr_text)}»</div>` : "";
+      ? `<span class="audit-status confirmed">✓ сумма совпадает</span>`
+      : (p.is_trigger ? `<span class="audit-status medium">сообщение-сигнал</span>` : "");
+    const ocr = p.ocr_text ? `<details class="audit-context"><summary>Показать распознанный текст</summary><div class="audit-signal">${escapeHtml(p.ocr_text)}</div></details>` : "";
     const who = p.direction === "outgoing" ? "аккаунт" : "клиент";
-    return `<div style="margin:10px 0;padding-bottom:8px;border-bottom:1px solid var(--border)">
-      <div class="si-to">${who} · фото #${p.message_id} ${badge}</div>
-      <img src="${p.data_url}" alt="вложение" style="max-width:100%;border-radius:10px;border:1px solid var(--border);margin-top:6px" />
+    return `<div class="audit-photo">
+      <div class="audit-meta">${who} · скрин #${p.message_id} ${badge}</div>
+      <img src="${p.data_url}" alt="Скрин из рабочего диалога" loading="lazy" style="max-width:100%;border-radius:10px;border:1px solid var(--border);margin-top:7px" />
       ${ocr}
     </div>`;
   }).join("") || `<div class="hint">Скринов в этом окне нет</div>`;
   const msgs = (data.messages || []).map(m => {
-    const who = m.direction === "outgoing" ? "аккаунт" : "клиент";
+    const outgoing = m.direction === "outgoing";
+    const who = outgoing ? "рабочий аккаунт" : "клиент";
     const when = (m.at || "").slice(11, 16);
-    const mark = m.is_trigger ? ` <span style="color:var(--ok)">← сигнал</span>` : "";
-    return `<div class="si-to" style="margin-top:4px${m.is_trigger ? ";color:var(--text);font-weight:600" : ""}"><b>${who}</b>${when ? ` · ${when}` : ""}${m.has_media ? " · вложение" : ""}${mark}: ${escapeHtml(m.text || "")}</div>`;
+    return `<div class="audit-chat-row${outgoing ? " outgoing" : ""}"><span class="audit-chat-who">${who}${when ? ` · ${when}` : ""}${m.has_media ? " · вложение" : ""}${m.is_trigger ? " · сигнал" : ""}</span>${escapeHtml(m.text || "")}</div>`;
   }).join("") || `<div class="hint">Сообщений не видно</div>`;
-  body.innerHTML = `${originHtml}<div class="si-text" style="font-weight:600;margin:8px 0 4px">Все скрины рядом</div>${photos}<div class="si-text" style="font-weight:600;margin:12px 0 4px">Переписка / слова вроде «перевёл»</div>${msgs}`;
+  body.innerHTML = `${originHtml}
+    <details class="audit-peek-section" open><summary>Скрины рядом · ${(data.photos || []).length}</summary>${photos}</details>
+    <details class="audit-peek-section" open><summary>Переписка рядом · ${(data.messages || []).length}</summary><div class="audit-chat">${msgs}</div></details>`;
 }
 
 function _paymentAmountsLabel(c) {
