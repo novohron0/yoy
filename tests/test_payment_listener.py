@@ -4,7 +4,7 @@ import time
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import web
 
@@ -24,6 +24,20 @@ class FakeEvent:
 
 
 class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def ocr_calls(track):
+        """Только задачи распознавания: сохранение чата тоже идёт фоном."""
+        return [call for call in track.call_args_list if call.kwargs.get("ocr_pid")]
+
+    @staticmethod
+    def closing_track():
+        """Заглушка фоновых задач, закрывающая корутины: иначе Python ругается."""
+        def close(awaitable, **_kwargs):
+            close_method = getattr(awaitable, "close", None)
+            if close_method is not None:
+                close_method()
+        return patch.object(web, "_track_audit_task", side_effect=close)
+
     async def asyncSetUp(self):
         for task in list(web.state.audit_ocr_tasks):
             task.cancel()
@@ -41,6 +55,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         web.state.audit_ocr_semaphore = None
         web.state.audit_archive_semaphore = None
         web.state.audit_archive_media_semaphore = None
+        web.state.audit_archive_next_at = 0.0
         # Ordinary listener tests must never create encrypted artifacts in the
         # repository's real profiles/ directory. Archive-specific tests replace
         # this mock with their own instance inside the test body.
@@ -213,6 +228,27 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("встречаемся завтра", saved_rows[0]["text"])
         self.assertEqual(archive.merge.call_args.kwargs["status"], "ready")
 
+    async def test_first_ordinary_private_message_starts_full_archive_immediately(self):
+        store = MagicMock()
+        store.chat_key.return_value = "CHATKEY"
+        store.message_ref.return_value = "a" * 64
+        archive = MagicMock()
+        archive.load.return_value = None
+        archive.merge.return_value = {"status": "pending"}
+        event = FakeEvent("Здравствуйте, хочу уточнить условия")
+        with (
+            patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
+            patch.object(web, "get_user", return_value=self.work_user()),
+            patch.object(web, "payment_audit_store", store),
+            patch.object(web, "_get_payment_chat_archive_async", AsyncMock(return_value=archive)),
+            patch.object(web, "_schedule_payment_chat_archive") as schedule,
+        ):
+            await web._handle_payment_message(MagicMock(), "p1", event)
+
+        store.record_event.assert_not_called()
+        self.assertEqual(archive.merge.call_args.args[3][0]["id"], event.id)
+        schedule.assert_called_once()
+
     async def test_new_signal_during_capture_forces_one_fresh_pass(self):
         started = asyncio.Event()
         release = asyncio.Event()
@@ -325,8 +361,9 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
         captured = []
         store = MagicMock()
 
-        def capture(awaitable, **_kwargs):
-            captured.append(awaitable)
+        def capture(awaitable, **kwargs):
+            if kwargs.get("ocr_pid"):
+                captured.append(awaitable)
             awaitable.close()
 
         with (
@@ -348,12 +385,13 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
                 patch.object(web, "get_user", return_value=self.work_user()),
                 patch.object(web, "payment_audit_store", store),
-                patch.object(web, "_track_audit_task") as track,
+                self.closing_track() as track,
             ):
                 await web._handle_payment_message(
                     MagicMock(), "p1", FakeEvent("файл", media_type=media_type)
                 )
-            track.assert_not_called()
+            self.assertFalse(self.ocr_calls(track),
+                             "pdf и webp не должны попадать в распознавание")
 
     async def test_forwarded_flag_reaches_ocr_worker(self):
         store = MagicMock()
@@ -364,7 +402,7 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "payment_audit_store", store),
             patch.object(web, "_audit_receipt_media", new=worker),
-            patch.object(web, "_track_audit_task") as track,
+            self.closing_track() as track,
         ):
             await web._handle_payment_message(
                 MagicMock(), "p1",
@@ -373,7 +411,8 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
 
         worker.assert_called_once()
         self.assertTrue(worker.call_args.kwargs["is_forwarded"])
-        track.assert_called_once_with(marker, ocr_pid="p1", priority=False)
+        self.assertEqual(self.ocr_calls(track),
+                         [call(marker, ocr_pid="p1", priority=False)])
 
     async def test_each_edit_version_has_a_distinct_event_key(self):
         store = MagicMock()
@@ -733,12 +772,12 @@ class PaymentListenerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "payment_audit_store", store),
             patch.object(web, "_audit_receipt_media", new=worker),
-            patch.object(web, "_track_audit_task") as track,
+            self.closing_track() as track,
         ):
             await web._handle_payment_message(MagicMock(), "p1", event, source="edited")
 
         self.assertEqual(worker.call_args.kwargs["message_source"], "edited")
-        track.assert_called_once()
+        self.assertEqual(len(self.ocr_calls(track)), 1)
 
     async def test_user_summary_uses_current_calendar_week(self):
         store = MagicMock()
@@ -808,10 +847,15 @@ class WeakMoneyTraceTests(unittest.IsolatedAsyncioTestCase):
         store.chat_key.return_value = "CHATKEY"
         store.event_key.return_value = "EVENTKEY"
         store.message_ref.return_value = "b" * 64
+        archive = MagicMock()
+        archive.load.return_value = None
+        archive.merge.return_value = {"status": "pending"}
         with (
             patch.object(web, "get_profile", return_value={"id": "p1", "owner": "u1"}),
             patch.object(web, "get_user", return_value=self.work_user()),
             patch.object(web, "payment_audit_store", store),
+            patch.object(web, "_get_payment_chat_archive_async", AsyncMock(return_value=archive)),
+            patch.object(web, "_schedule_payment_chat_archive"),
         ):
             await web._handle_payment_message(MagicMock(), "p1", FakeEvent(text))
         return store
@@ -844,3 +888,31 @@ class WeakMoneyTraceTests(unittest.IsolatedAsyncioTestCase):
         analysis = store.record_event.call_args.kwargs["analysis"]
         self.assertNotIn("money_mentioned", analysis["categories"])
         self.assertTrue(analysis["income_claim"])
+
+
+class ArchivePacingTests(unittest.IsolatedAsyncioTestCase):
+    """Истории чатов не выкачиваются залпом: аккаунты за это блокируют."""
+
+    async def asyncSetUp(self):
+        web.state.audit_archive_next_at = 0.0
+        self.gaps = (web.PAYMENT_CHAT_ARCHIVE_GAP_MIN, web.PAYMENT_CHAT_ARCHIVE_GAP_MAX)
+        web.PAYMENT_CHAT_ARCHIVE_GAP_MIN = 0.05
+        web.PAYMENT_CHAT_ARCHIVE_GAP_MAX = 0.05
+
+    async def asyncTearDown(self):
+        web.PAYMENT_CHAT_ARCHIVE_GAP_MIN, web.PAYMENT_CHAT_ARCHIVE_GAP_MAX = self.gaps
+        web.state.audit_archive_next_at = 0.0
+
+    async def test_first_capture_starts_without_waiting(self):
+        started = time.monotonic()
+        await web._payment_archive_pace()
+        self.assertLess(time.monotonic() - started, 0.03,
+                        "одиночный чат должен сохраняться сразу")
+
+    async def test_burst_of_chats_is_spread_over_time(self):
+        await web._payment_archive_pace()
+        started = time.monotonic()
+        await web._payment_archive_pace()
+        await web._payment_archive_pace()
+        self.assertGreaterEqual(time.monotonic() - started, 0.05,
+                                "очередь чатов должна растягиваться")

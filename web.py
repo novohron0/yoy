@@ -128,8 +128,14 @@ PAYMENT_CHAT_ARCHIVE_RETENTION_DAYS = int(os.environ.get(
     "PAYMENT_CHAT_ARCHIVE_RETENTION_DAYS", "0"
 ))
 PAYMENT_CHAT_ARCHIVE_MAX_MESSAGES = int(os.environ.get(
-    "PAYMENT_CHAT_ARCHIVE_MAX_MESSAGES", "5000"
+    # Хватает, чтобы поднять переписку вокруг оплаты, и это ~4 запроса к Telegram
+    # на чат вместо полусотни: рабочие аккаунты не любят всплесков запросов.
+    "PAYMENT_CHAT_ARCHIVE_MAX_MESSAGES", "400"
 ))
+# Разнос выкачки историй во времени (сек). Первый чат сохраняется сразу, очередь
+# следующих растягивается — так с аккаунта не уходит залп запросов подряд.
+PAYMENT_CHAT_ARCHIVE_GAP_MIN = float(os.environ.get("PAYMENT_CHAT_ARCHIVE_GAP_MIN", "1.5"))
+PAYMENT_CHAT_ARCHIVE_GAP_MAX = float(os.environ.get("PAYMENT_CHAT_ARCHIVE_GAP_MAX", "4"))
 PAYMENT_CHAT_ARCHIVE_MAX_TEXT_BYTES = int(os.environ.get(
     "PAYMENT_CHAT_ARCHIVE_MAX_TEXT_BYTES", str(10 * 1024 * 1024)
 ))
@@ -773,6 +779,8 @@ class State:
     audit_ocr_semaphore = None
     audit_archive_semaphore = None
     audit_archive_media_semaphore = None
+    # Момент, раньше которого не начинаем следующую выкачку истории чата.
+    audit_archive_next_at = 0.0
     audit_cleanup_at = 0.0
     audit_archive_resume_at = 0.0
     scheduler_task = None
@@ -1223,6 +1231,24 @@ async def _capture_payment_continuation_media(
         )
 
 
+async def _payment_archive_pace():
+    """Держит паузу между выкачками историй разных чатов.
+
+    Простаивающий сервис ждать не заставляет: первая выкачка идёт сразу, а вот
+    очередь из десятков диалогов растягивается во времени, чтобы Telegram не
+    видел с рабочего аккаунта всплеск запросов истории.
+    """
+    gap = random.uniform(
+        max(0.0, PAYMENT_CHAT_ARCHIVE_GAP_MIN),
+        max(PAYMENT_CHAT_ARCHIVE_GAP_MIN, PAYMENT_CHAT_ARCHIVE_GAP_MAX),
+    )
+    now = time.monotonic()
+    wait = state.audit_archive_next_at - now
+    state.audit_archive_next_at = max(now, state.audit_archive_next_at) + gap
+    if wait > 0:
+        await asyncio.sleep(wait)
+
+
 async def _capture_payment_chat(client, *, owner, pid, chat_id, chat_key):
     """Fetch and encrypt a full readable chat snapshot without sending read ACKs."""
     archive = await _get_payment_chat_archive_async()
@@ -1246,6 +1272,7 @@ async def _capture_payment_chat(client, *, owner, pid, chat_id, chat_key):
         async with state.audit_archive_semaphore:
             if not _payment_audit_scope_active(owner, pid):
                 return
+            await _payment_archive_pace()
             async with asyncio.timeout(max(5.0, capture_deadline - time.monotonic())):
                 history = list(await client.get_messages(chat_id, limit=max_messages + 1) or [])
             if len(history) > max_messages:
@@ -2182,7 +2209,29 @@ async def _handle_payment_message(client, pid, event, *, source="message"):
                     chat_key=chat_key,
                     event=event,
                 )
-                if continuation.get("image_media"):
+                started = False
+                if not continuation.get("appended"):
+                    seeded = await _prime_payment_chat_archive(
+                        archive,
+                        owner=owner,
+                        pid=pid,
+                        chat_key=chat_key,
+                        event=event,
+                    )
+                    started = True
+                    continuation["status"] = str((seeded or {}).get("status") or "pending")
+                if started or continuation.get("status") in {"pending", "error"}:
+                    # Первый любой диалог сохраняем сразу, не дожидаясь слов об
+                    # оплате. Если сигнал появится позже, ранняя часть уже на диске.
+                    _schedule_payment_chat_archive(
+                        client,
+                        owner=owner,
+                        pid=pid,
+                        chat_id=event.chat_id,
+                        chat_key=chat_key,
+                    )
+                is_archive_image, _archive_mime, _archive_size = _payment_archive_image_candidate(event)
+                if is_archive_image and (started or continuation.get("appended")):
                     _track_audit_task(_capture_payment_continuation_media(
                         client,
                         archive,
@@ -3397,6 +3446,7 @@ async def lifespan(app: FastAPI):
     state.audit_ocr_semaphore = None
     state.audit_archive_semaphore = None
     state.audit_archive_media_semaphore = None
+    state.audit_archive_next_at = 0.0
     state.audit_cleanup_at = 0.0
     state.audit_archive_resume_at = 0.0
     for client in state.clients.values():

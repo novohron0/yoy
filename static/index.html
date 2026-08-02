@@ -2765,9 +2765,10 @@ function paymentChatGroupKey(c) {
   // Группируем по полному непрозрачному ключу, иначе два разных клиента с
   // одинаковыми последними шестью символами окажутся одной перепиской.
   const owner = String(c.owner || c.username || "");
-  const profile = String(c.profile_id || c.profile_name || "");
   const chat = String(c.chat_key || c.chat_id || c.peer_id || c.id || "");
-  return JSON.stringify([owner, profile, chat]);
+  // Один и тот же чат мог пережить отключение/повторное подключение профиля;
+  // profile_id не должен разрезать его на две одинаковые карточки.
+  return JSON.stringify([owner, chat]);
 }
 
 function paymentChatGroupsHtml(cases) {
