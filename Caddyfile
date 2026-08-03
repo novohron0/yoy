@@ -9,8 +9,10 @@
         reverse_proxy host.docker.internal:8083
     }
     # Портфолио владельца и приём заявок (~/orders, порт 8792).
-    # handle_path срезает /work, поэтому сервис у себя видит обычные / и /api/lead
-    handle_path /work* {
+    # handle_path срезает /work, поэтому сервис у себя видит обычные / и /api/lead.
+    # Без завершающего слэша путь после обрезки становится пустым — отсюда redir.
+    redir /work /work/
+    handle_path /work/* {
         reverse_proxy host.docker.internal:8792
     }
     handle {
