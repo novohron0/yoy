@@ -3142,42 +3142,85 @@ async function loadAdminUsers() {
   renderAdminSummary(data.users || [], statsById);
   renderAdminPaymentAudit(paymentRes.ok ? paymentRes.data : null);
   box.innerHTML = "";
-  for (const u of (data.users || [])) {
-    const me = state.me && u.id === state.me.id;
-    const item = document.createElement("div");
-    item.className = "sched-item";
-    const sub = u.is_admin ? "♾ админ (безлимит)"
-      : (u.sub_active ? `✅ доступ активен · осталось ${u.days_left} дн`
-                      : `⛔ доступ не активен`);
-    let actions = "";
-    if (!me) {
-      if (u.reset_status === "pending") actions += `<button class="btn" data-act="reset-approve">🔑 Одобрить сброс пароля</button>`;
-      if (u.reset_status === "approved") actions += `<button class="btn ghost" data-act="reset-reject">Отменить сброс пароля</button>`;
-      if (u.status !== "approved") actions += `<button class="btn" data-act="approve">Одобрить</button>`;
-      if (u.status !== "blocked") actions += `<button class="btn ghost" data-act="block">${u.sub_active ? "Заморозить" : "Заблокировать"}</button>`;
-      if (!u.is_admin) {
-        actions += `<button class="btn" data-act="week">+7 дней</button>`;
-        actions += `<button class="btn ghost" data-act="month">+30 дней</button>`;
-      }
-      actions += `<button class="btn danger" data-act="delete">Удалить</button>`;
-    }
-    const resetBadge = u.reset_status === "pending"
-      ? `<div class="si-to" style="color:var(--err);margin-top:2px">🔑 просит сброс пароля${u.reset_requested ? " · " + escapeHtml(u.reset_requested) : ""} — нажми «Одобрить сброс пароля»</div>`
-      : (u.reset_status === "approved"
-        ? `<div class="si-to" style="color:var(--accent-3);margin-top:2px">🔑 сброс одобрен — ждём, пока задаст новый пароль</div>`
-        : "");
-    item.innerHTML = `
-      <div class="si-main">
-        <div class="si-when">${escapeHtml(u.username)}${u.is_admin ? " · админ" : ""}${me ? " · это ты" : ""} ${verdictBadge((statsById[u.id] || {}).verdict)}</div>
-        <div class="si-to">${USTATUS[u.status] || u.status} · ${sub}</div>
-        ${resetBadge}
-        ${adminStatsHtml(statsById[u.id])}
-      </div>
-      <div style="display:flex;flex-direction:column;gap:6px;min-width:150px">${actions}</div>`;
-    item.querySelectorAll("button").forEach(b => { b.onclick = () => adminAction(u, b.dataset.act, item); });
-    box.appendChild(item);
+  const users = data.users || [];
+  // Заблокированные не мешаются в основном составе — они уезжают вниз, под спойлер.
+  const working = users.filter(u => u.status !== "blocked");
+  const blocked = users.filter(u => u.status === "blocked");
+
+  state.userSort = state.userSort || "best";
+  const RANK = { good: 3, mid: 2, idle: 1, bad: 0 };
+  const score = u => {
+    const st = statsById[u.id] || {};
+    const v = (st.verdict || {}).level || "idle";
+    const attempts = Number(st.msgs_7d || 0) + Number(st.fails_7d || 0);
+    const rate = attempts ? Number(st.msgs_7d || 0) / attempts : 0;
+    // Ранг светофора решает, дальше — отклик живых людей и доставка.
+    return (RANK[v] ?? 1) * 1e6 + Number(st.responses_7d || 0) * 1e3 + Math.round(rate * 100);
+  };
+  working.sort((a, b) => state.userSort === "best" ? score(b) - score(a) : score(a) - score(b));
+
+  const controls = document.createElement("div");
+  controls.className = "row";
+  controls.style.cssText = "gap:6px;margin-bottom:10px;flex-wrap:wrap";
+  controls.innerHTML = `
+    <button class="btn ${state.userSort === "best" ? "" : "ghost"}" onclick="sortAdminUsers('best')">Сначала лучшие</button>
+    <button class="btn ${state.userSort === "worst" ? "" : "ghost"}" onclick="sortAdminUsers('worst')">Сначала худшие</button>`;
+  box.appendChild(controls);
+
+  for (const u of working) box.appendChild(adminUserItem(u, statsById));
+
+  if (blocked.length) {
+    const wrap = document.createElement("details");
+    wrap.style.marginTop = "14px";
+    const sum = document.createElement("summary");
+    sum.style.cssText = "cursor:pointer;color:var(--muted);font-size:13px";
+    sum.textContent = `Заблокированные · ${blocked.length}`;
+    wrap.appendChild(sum);
+    for (const u of blocked) wrap.appendChild(adminUserItem(u, statsById));
+    box.appendChild(wrap);
   }
   setAdminBadge((data.users || []).filter(u => u.reset_status === "pending").length);
+}
+
+function sortAdminUsers(mode) {
+  state.userSort = mode;
+  loadAdminUsers();
+}
+
+function adminUserItem(u, statsById) {
+  const me = state.me && u.id === state.me.id;
+  const item = document.createElement("div");
+  item.className = "sched-item";
+  const sub = u.is_admin ? "♾ админ (безлимит)"
+    : (u.sub_active ? `✅ доступ активен · осталось ${u.days_left} дн`
+                    : `⛔ доступ не активен`);
+  let actions = "";
+  if (!me) {
+    if (u.reset_status === "pending") actions += `<button class="btn" data-act="reset-approve">🔑 Одобрить сброс пароля</button>`;
+    if (u.reset_status === "approved") actions += `<button class="btn ghost" data-act="reset-reject">Отменить сброс пароля</button>`;
+    if (u.status !== "approved") actions += `<button class="btn" data-act="approve">Одобрить</button>`;
+    if (u.status !== "blocked") actions += `<button class="btn ghost" data-act="block">${u.sub_active ? "Заморозить" : "Заблокировать"}</button>`;
+    if (!u.is_admin) {
+      actions += `<button class="btn" data-act="week">+7 дней</button>`;
+      actions += `<button class="btn ghost" data-act="month">+30 дней</button>`;
+    }
+    actions += `<button class="btn danger" data-act="delete">Удалить</button>`;
+  }
+  const resetBadge = u.reset_status === "pending"
+    ? `<div class="si-to" style="color:var(--err);margin-top:2px">🔑 просит сброс пароля${u.reset_requested ? " · " + escapeHtml(u.reset_requested) : ""} — нажми «Одобрить сброс пароля»</div>`
+    : (u.reset_status === "approved"
+      ? `<div class="si-to" style="color:var(--accent-3);margin-top:2px">🔑 сброс одобрен — ждём, пока задаст новый пароль</div>`
+      : "");
+  item.innerHTML = `
+    <div class="si-main">
+      <div class="si-when">${escapeHtml(u.username)}${u.is_admin ? " · админ" : ""}${me ? " · это ты" : ""} ${verdictBadge((statsById[u.id] || {}).verdict)}</div>
+      <div class="si-to">${USTATUS[u.status] || u.status} · ${sub}</div>
+      ${resetBadge}
+      ${adminStatsHtml(statsById[u.id])}
+    </div>
+    <div style="display:flex;flex-direction:column;gap:6px;min-width:150px">${actions}</div>`;
+  item.querySelectorAll("button").forEach(b => { b.onclick = () => adminAction(u, b.dataset.act, item); });
+  return item;
 }
 
 async function adminAction(u, act, item) {
