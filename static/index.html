@@ -318,6 +318,9 @@
   .audit-person-name { font-size: 14px; font-weight: 750; }
   .audit-meta { margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.4; }
   .audit-amount { flex-shrink: 0; font-size: 21px; line-height: 1.1; font-weight: 800; text-align: right; }
+  .audit-clue { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+  .audit-more { margin-top: 8px; }
+  .audit-more > summary { cursor: pointer; color: var(--muted); font-size: 11px; }
   .audit-status {
     display: inline-flex; align-items: center; gap: 5px; margin-top: 8px;
     padding: 4px 8px; border-radius: 999px; background: var(--panel-3);
@@ -1446,20 +1449,32 @@ function paymentReviewLine(c) {
 
 function paymentAdminActions(c, suggested, presentation) {
   const id = String(c.id || "");
-  if (presentation.tone === "failed") {
+  // Корзина: только вернуть. Доход: только поправить сумму. Остальное — на проверке.
+  if (c.admin_status === "dismissed") {
     return `<div class="audit-actions">
-      <button class="btn" onclick="peekPaymentCase('${id}')">Проверить весь чат</button>
-      <button class="btn audit-negative" onclick="adminReviewPaymentCase('${id}','dismissed',null)">Не доход</button>
-      <button class="btn audit-secondary" onclick="adminReviewPaymentCase('${id}','needs_info',null)">Уточнить</button>
-      <button class="btn audit-secondary" onclick="adminReviewPaymentCase('${id}','confirmed','${suggested}')">Всё же подтвердить</button>
+      <button class="btn ghost" onclick="restorePaymentCase('${id}')">Вернуть</button>
+      <button class="btn ghost" onclick="peekPaymentCase('${id}')">Посмотреть чат</button>
+    </div>`;
+  }
+  if (c.admin_status === "confirmed") {
+    return `<div class="audit-actions">
+      <button class="btn ghost" onclick="adminReviewPaymentCase('${id}','confirmed','${suggested}')">Изменить сумму</button>
+      <button class="btn ghost" onclick="peekPaymentCase('${id}')">Посмотреть чат</button>
     </div>`;
   }
   return `<div class="audit-actions">
-    <button class="btn" onclick="adminReviewPaymentCase('${id}','confirmed','${suggested}')">${c.admin_status === "confirmed" ? "Изменить сумму" : "Подтвердить доход"}</button>
-    <button class="btn ghost" onclick="peekPaymentCase('${id}')">Проверить весь чат</button>
-    <button class="btn audit-secondary" onclick="adminReviewPaymentCase('${id}','needs_info',null)">Уточнить</button>
-    <button class="btn audit-negative" onclick="adminReviewPaymentCase('${id}','dismissed',null)">Не доход</button>
+    <button class="btn" onclick="adminReviewPaymentCase('${id}','confirmed','${suggested}')">✓ Доход</button>
+    <button class="btn ghost" onclick="peekPaymentCase('${id}')">Проверить чат</button>
+    <button class="btn audit-negative" onclick="adminReviewPaymentCase('${id}','dismissed',null)">В корзину</button>
+    ${presentation.tone === "failed" ? "" : `<button class="btn audit-secondary" onclick="adminReviewPaymentCase('${id}','needs_info',null)">Уточнить</button>`}
   </div>`;
+}
+
+async function restorePaymentCase(id) {
+  const { ok, data } = await post(`/api/admin/payment-audit/cases/${id}/restore`, {});
+  if (!ok) return toast(data.error || "Не удалось вернуть", "bad");
+  toast("Вернул в проверку ✓", "ok");
+  loadAdminUsers();
 }
 
 function paymentUserActions(c, presentation) {
@@ -1480,26 +1495,40 @@ function paymentCaseCard(c, adminMode, showArchive) {
   const suggested = rubAmounts.length === 1 ? rubAmounts[0] : "";
   const name = adminMode ? (c.username || "Сотрудник") : (c.chat_label || "Диалог");
   const chat = adminMode && c.chat_label ? ` · ${escapeHtml(c.chat_label)}` : "";
-  const profile = c.profile_name ? escapeHtml(c.profile_name) : "рабочий аккаунт";
   const when = escapeHtml((c.last_at || "").slice(0, 16).replace("T", " "));
-  // Одна карточка на собеседника: показываем, сколько сигналов в ней накопилось.
   const signals = Math.max(Number(c.signal_count || 0), (c.evidence || []).length);
+  const decided = c.admin_status === "confirmed" || c.admin_status === "dismissed";
+  // Минимализм: в карточке только имя, сумма, время и одна улика. Всё
+  // остальное — категории, ответы, архив — прячем под «подробнее».
+  const details = `<details class="audit-more"><summary>подробнее</summary>
+    <div class="audit-tags">${paymentCategoryTags(c, 5)}</div>
+    ${paymentSignalBlock(c, 3)}
+    ${paymentContextDetails(c, adminMode)}
+    ${adminMode && showArchive !== false ? paymentArchiveBlock(c) : ""}
+    ${paymentReviewLine(c)}
+  </details>`;
   return `<article class="audit-card ${presentation.tone}">
     <div class="audit-case-top">
       <div class="audit-person">
         <div class="audit-person-name">${escapeHtml(name)}${chat}</div>
-        <div class="audit-meta">${profile}${when ? ` · ${when}` : ""}${signals > 1 ? ` · сигналов: ${signals}` : ""}${c.chat_link ? ` · <a href="${escapeHtml(c.chat_link)}">открыть в Telegram</a>` : ""}</div>
-        <div class="audit-status ${presentation.tone}">${presentation.icon} ${escapeHtml(presentation.label)}</div>
+        <div class="audit-meta">${when}${signals > 1 ? ` · сигналов: ${signals}` : ""}</div>
       </div>
       <div class="audit-amount">${paymentAmounts(c)}</div>
     </div>
-    <div class="audit-tags">${paymentCategoryTags(c, 5)}</div>
-    ${paymentSignalBlock(c, 2)}
-    ${paymentContextDetails(c, adminMode)}
-    ${adminMode && showArchive !== false ? paymentArchiveBlock(c) : ""}
-    ${paymentReviewLine(c)}
+    ${c.has_new_after_review ? `<div class="audit-status needs-info">● после проверки появилось новое</div>` : ""}
+    ${paymentFirstClue(c)}
+    ${decided ? "" : details}
     ${adminMode ? paymentAdminActions(c, suggested, presentation) : paymentUserActions(c, presentation)}
   </article>`;
+}
+
+function paymentFirstClue(c) {
+  // Одна строка-улика вместо простыни: последняя фраза, по которой сработало.
+  const rows = (c.evidence || []).filter(e => e && e.snippet);
+  const last = rows[rows.length - 1];
+  if (!last) return "";
+  const who = last.direction === "outgoing" ? "аккаунт" : "клиент";
+  return `<div class="audit-clue">${who}: «${escapeHtml(String(last.snippet).slice(0, 120))}»</div>`;
 }
 
 function auditKpi(value, label, tone) {
@@ -2855,21 +2884,43 @@ function renderAdminPaymentAudit(data) {
   const moreHtml = data.has_more
     ? `<button class="btn ghost full" style="margin-top:12px" onclick="loadMoreAdminPaymentAudit(this)">Показать более старые сигналы · сейчас ${cases.length}</button>`
     : (Number(data.offset || 0) > 0 ? `<div class="hint" style="margin-top:10px;text-align:center">Показана вся сохранённая история · ${cases.length}</div>` : "");
-  box.innerHTML = `<div class="audit-head">
-      <div><h3>Проверка оплат</h3><div class="audit-head-note">Сначала проверяй важные карточки. Сигнал из чата или скрин чека — это повод сверить перевод, а не доказательство поступления денег.</div></div>
-      <div class="audit-health ${ocrDropped ? "warn" : "ok"}">OCR в работе: ${Number(ocrQueue.active || 0)}${ocrDropped ? ` · пропущено: ${ocrDropped}` : ""}</div>
+  const buckets = { pending: [], income: [], trash: [] };
+  for (const item of cases) {
+    if (item.admin_status === "confirmed") buckets.income.push(item);
+    else if (item.admin_status === "dismissed") buckets.trash.push(item);
+    else buckets.pending.push(item);
+  }
+  state.paymentTab = state.paymentTab || "pending";
+  if (!buckets[state.paymentTab]) state.paymentTab = "pending";
+  const tab = state.paymentTab;
+  const tabBtn = (key, label) =>
+    `<button class="btn ${tab === key ? "" : "ghost"}" onclick="switchPaymentTab('${key}')">${label} · ${buckets[key].length}</button>`;
+  const list = buckets[tab];
+  const body = list.length
+    ? paymentChatGroupsHtml(list)
+    : `<div class="audit-empty">${tab === "pending" ? "Всё проверено." : (tab === "income" ? "Подтверждённого дохода пока нет." : "Корзина пуста.")}</div>`;
+  const note = tab === "trash"
+    ? `<div class="hint" style="margin:8px 0">Удалятся сами через 7 дней. Нажми «Вернуть», если передумал.</div>`
+    : (tab === "income"
+        ? `<div class="hint" style="margin:8px 0">Подтверждено ${money(totals.confirmed)} · 15% = ${money(totals.commission)}</div>`
+        : "");
+  box.innerHTML = `<div class="audit-head"><h3>Оплаты</h3></div>
+    <div class="row" style="gap:6px;flex-wrap:wrap;margin-bottom:6px">
+      ${tabBtn("pending", "Ждут проверки")}${tabBtn("income", "Доход")}${tabBtn("trash", "Корзина")}
     </div>
-    <div class="audit-kpis">
-      ${auditKpi(totals.pending, "ждут проверки", totals.pending ? "danger" : "")}
-      ${auditKpi(totals.high, "важные сигналы", totals.high ? "danger" : "")}
-      ${auditKpi(money(totals.confirmed), "доход подтверждён", "ok")}
-      ${auditKpi(money(totals.commission), "15% с подтверждённого", "")}
-    </div>
-    <div class="audit-workers">${summaryHtml || `<div class="audit-empty">Недельных данных пока нет.</div>`}</div>
-    <input class="audit-search" type="search" placeholder="Найти сотрудника, аккаунт, диалог или сумму…" oninput="filterPaymentChatGroups(this.value)" />
-    <div class="audit-list-title"><strong>Все сохранённые чаты с сигналами</strong><span>сигналы одного чата собраны вместе · архив доступен до вашей ручной очистки</span></div>
-    <div class="audit-list">${caseHtml}</div>
-    ${moreHtml}`;
+    ${note}
+    ${tab === "pending" && list.length > 3 ? `<input class="audit-search" type="search" placeholder="Найти сотрудника, диалог или сумму…" oninput="filterPaymentChatGroups(this.value)" />` : ""}
+    <div class="audit-list">${body}</div>
+    ${tab === "pending" ? moreHtml : ""}
+    <details class="audit-more" style="margin-top:12px"><summary>сводка по сотрудникам</summary>
+      <div class="audit-workers">${summaryHtml || `<div class="audit-empty">Данных пока нет.</div>`}</div>
+      <div class="hint" style="margin-top:6px">OCR в работе: ${Number(ocrQueue.active || 0)}${ocrDropped ? ` · пропущено: ${ocrDropped}` : ""}</div>
+    </details>`;
+}
+
+function switchPaymentTab(key) {
+  state.paymentTab = key;
+  renderAdminPaymentAudit(state.adminPaymentAudit);
 }
 
 async function loadMoreAdminPaymentAudit(button) {
@@ -2895,9 +2946,10 @@ async function adminReviewPaymentCase(id, status, suggested) {
     if (entered === null) return;
     amount = Number(String(entered).replace(",", "."));
     if (!Number.isFinite(amount) || amount < 0) return toast("Неверная сумма", "bad");
-    note = prompt("Комментарий к проверке (необязательно):", "") || "";
+  } else if (status === "dismissed") {
+    note = "";
   } else {
-    const entered = prompt(status === "needs_info" ? "Какое пояснение запросить?" : "Почему это не доход?", "");
+    const entered = prompt("Какое пояснение запросить?", "");
     if (entered === null) return;
     note = entered;
   }

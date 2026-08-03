@@ -119,7 +119,8 @@ class PaymentAuditStore:
 
     def __init__(self, path: str, secret: str, *, retention_days: int = 60,
                  report_retention_days: int = 370,
-                 correlation_minutes: int = 120):
+                 correlation_minutes: int = 120,
+                 trash_days: int = 7):
         self.path = str(path)
         self.secret = (secret or "payment-audit").encode("utf-8")
         requested_retention = int(retention_days)
@@ -128,6 +129,8 @@ class PaymentAuditStore:
             self.retention_days, 7, int(report_retention_days)
         )
         self.correlation_minutes = max(15, int(correlation_minutes))
+        # «Не доход» уезжает в корзину и удаляется сам, если его не вернули.
+        self.trash_days = max(1, int(trash_days))
         parent = Path(self.path).parent
         parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -1223,6 +1226,30 @@ class PaymentAuditStore:
             db.commit()
         return self._row(result)
 
+    def restore(self, case_id: str, admin_id: str) -> dict:
+        """Возвращает карточку из корзины обратно в очередь на проверку."""
+        now = utc_now_iso()
+        with self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT admin_status FROM payment_cases WHERE id=?", (case_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError(case_id)
+            db.execute(
+                """UPDATE payment_cases SET admin_status='pending', admin_note='',
+                   admin_amount=NULL, admin_reviewed_at=NULL, updated_at=? WHERE id=?""",
+                (now, case_id),
+            )
+            db.execute(
+                """INSERT INTO payment_audit_log(case_id, actor, actor_id, action,
+                   old_value, new_value, note, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                (case_id, "admin", admin_id, "restore", row["admin_status"], "pending", "", now),
+            )
+            result = db.execute("SELECT * FROM payment_cases WHERE id=?", (case_id,)).fetchone()
+            db.commit()
+        return self._row(result)
+
     def submit_week(self, owner: str, week_start: str, amount: float, note: str = "") -> dict:
         try:
             datetime.strptime(week_start, "%Y-%m-%d")
@@ -1390,6 +1417,19 @@ class PaymentAuditStore:
                 db.execute(
                     "DELETE FROM payment_audit_log WHERE case_id NOT IN (SELECT id FROM payment_cases)"
                 )
+            trash_cutoff = (
+                current - timedelta(days=self.trash_days)
+            ).isoformat(timespec="seconds")
+            trashed = db.execute(
+                """DELETE FROM payment_cases
+                   WHERE admin_status='dismissed' AND admin_reviewed_at IS NOT NULL
+                     AND admin_reviewed_at<?""",
+                (trash_cutoff,),
+            )
+            removed += int(trashed.rowcount or 0)
+            db.execute(
+                "DELETE FROM payment_audit_log WHERE case_id NOT IN (SELECT id FROM payment_cases)"
+            )
             db.execute(
                 "DELETE FROM payment_weekly_reports WHERE updated_at<?", (report_cutoff,)
             )

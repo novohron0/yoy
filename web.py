@@ -166,6 +166,8 @@ PAYMENT_AUDIT_OCR_QUEUE_MAX = int(os.environ.get("PAYMENT_AUDIT_OCR_QUEUE_MAX", 
 PAYMENT_AUDIT_DOWNLOAD_TIMEOUT = float(os.environ.get("PAYMENT_AUDIT_DOWNLOAD_TIMEOUT", "20"))
 PAYMENT_AUDIT_OCR_HEALTH_TIMEOUT = float(os.environ.get("PAYMENT_AUDIT_OCR_HEALTH_TIMEOUT", "2"))
 PAYMENT_COMMISSION_RATE = 0.15
+# Сколько дней «не доход» лежит в корзине, прежде чем удалиться сам.
+PAYMENT_TRASH_DAYS = int(os.environ.get("PAYMENT_TRASH_DAYS", "7"))
 payment_audit_store = None
 _payment_audit_store_retry_at = 0.0
 _payment_audit_store_lock = threading.Lock()
@@ -196,6 +198,7 @@ def _get_payment_audit_store():
                 PAYMENT_AUDIT_DB,
                 SECRET_KEY,
                 retention_days=PAYMENT_AUDIT_RETENTION_DAYS,
+                trash_days=PAYMENT_TRASH_DAYS,
                 correlation_minutes=60,
             )
         except Exception as exc:
@@ -4256,6 +4259,19 @@ def _peek_image_mime(raw: bytes) -> str:
     if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
         return "image/webp"
     return "image/jpeg"
+
+
+@app.post("/api/admin/payment-audit/cases/{case_id}/restore")
+async def admin_payment_audit_restore(case_id: str, admin=Depends(require_admin)):
+    """Достаёт карточку из корзины обратно в очередь на проверку."""
+    store = await _get_payment_audit_store_async()
+    if store is None:
+        return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
+    try:
+        case = await asyncio.to_thread(store.restore, case_id, admin["id"])
+    except KeyError:
+        return JSONResponse({"error": "Событие не найдено"}, status_code=404)
+    return {"ok": True, "case": _audit_case_view(case, users=load_users())}
 
 
 @app.post("/api/admin/payment-audit/cases/{case_id}/archive")

@@ -856,3 +856,43 @@ class MergeDuplicateChatCasesTests(unittest.TestCase):
         self.assertEqual(card["admin_status"], "confirmed")
         self.assertEqual(card["admin_amount"], 9000.0)
         self.assertEqual(self.store.merge_duplicate_chat_cases(), 0)
+
+
+class TrashLifecycleTests(unittest.TestCase):
+    """«Не доход» лежит в корзине 7 дней, потом удаляется сам."""
+
+    setUp = PaymentAuditStoreTests.setUp
+    tearDown = PaymentAuditStoreTests.tearDown
+    record = PaymentAuditStoreTests.record
+
+    def test_dismissed_case_is_purged_after_the_trash_window(self):
+        case = self.record("trash-me", minute=1)
+        self.store.review(case["id"], "admin", "dismissed")
+
+        kept = self.store.cleanup(datetime.now(timezone.utc) + timedelta(days=6))
+        self.assertTrue(self.store.get_case(case["id"]))
+
+        self.store.cleanup(datetime.now(timezone.utc) + timedelta(days=8))
+        self.assertEqual(self.store.get_case(case["id"]), {})
+        self.assertEqual(kept, 0)
+
+    def test_restore_pulls_a_case_back_from_the_trash(self):
+        case = self.record("restore-me", minute=1)
+        self.store.review(case["id"], "admin", "dismissed", None, "мимо")
+
+        restored = self.store.restore(case["id"], "admin")
+
+        self.assertEqual(restored["admin_status"], "pending")
+        self.assertIsNone(restored["admin_reviewed_at"])
+        self.assertEqual(restored["admin_note"], "")
+        # Возвращённая карточка переживает автоочистку корзины.
+        self.store.cleanup(datetime.now(timezone.utc) + timedelta(days=30))
+        self.assertTrue(self.store.get_case(case["id"]))
+
+    def test_confirmed_income_is_never_thrown_away(self):
+        case = self.record("keep-me", minute=1)
+        self.store.review(case["id"], "admin", "confirmed", 5000)
+
+        self.store.cleanup(datetime.now(timezone.utc) + timedelta(days=30))
+
+        self.assertEqual(self.store.get_case(case["id"])["admin_amount"], 5000.0)
