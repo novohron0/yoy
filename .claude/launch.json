@@ -6,6 +6,19 @@
       "runtimeExecutable": ".venv/bin/python",
       "runtimeArgs": ["web.py"],
       "port": 8000
+    },
+    {
+      "name": "orders-web",
+      "runtimeExecutable": "/Users/kamilimangulov/yoy/.venv/bin/python",
+      "runtimeArgs": ["-m", "uvicorn", "app:app", "--port", "8794", "--app-dir",
+                      "/Users/kamilimangulov/orders/web"],
+      "port": 8794
+    },
+    {
+      "name": "vita-static",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "8798", "--directory", "/Users/kamilimangulov/vita/static"],
+      "port": 8798
     }
   ]
 }
