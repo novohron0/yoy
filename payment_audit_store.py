@@ -674,16 +674,17 @@ class PaymentAuditStore:
                     same_message = row is not None
 
             if row is None:
+                # Один собеседник — одна карточка. Владелец проверяет людей, а не
+                # разрозненные сигналы: все события чата собираются в один случай
+                # независимо от паузы между ними и от того, отвечали ли на него.
                 row = db.execute(
                     """
                     SELECT * FROM payment_cases
                     WHERE owner=? AND profile_id=? AND profile_active=1 AND chat_key=?
-                      AND first_at<=? AND last_at BETWEEN ? AND ?
-                      AND user_status='pending' AND admin_status='pending'
                       AND (chat_ref IS NULL OR ? IS NULL OR chat_ref=?)
                     ORDER BY last_at DESC LIMIT 1
                     """,
-                    (owner, profile_id, chat_key, at, cutoff, at, chat_ref, chat_ref),
+                    (owner, profile_id, chat_key, chat_ref, chat_ref),
                 ).fetchone()
 
             if row is not None and not same_message:
@@ -708,17 +709,10 @@ class PaymentAuditStore:
                     and existing_amount_keys.isdisjoint(new_amount_keys)
                 )
 
-                # A completed case is closed for subsequent ordinary/positive
-                # messages. Only a later failure/refund may amend its state.
-                if event_status == "retracted":
-                    # Retractions only have meaning for their exact message.
-                    row = None
-                elif has_positive_event and not new_negative:
-                    row = None
-                elif row["event_status"] in {"failed_or_reversed", "retracted"}:
-                    row = None
-                elif (new_positive or new_negative) and different_amount:
-                    row = None
+                # Раньше каждый новый платёж в том же чате заводил отдельную
+                # карточку. Теперь всё остаётся в одной: суммы копятся списком,
+                # а решение принимает владелец, глядя на весь диалог целиком.
+                del has_positive_event, new_negative, new_positive, different_amount
 
             case_id_hint = row["id"] if row else None
             duplicate_media = False
@@ -960,7 +954,113 @@ class PaymentAuditStore:
                 seen_context.add(key)
                 context_rows.append({"direction": direction, "snippet": snippet})
         out["context"] = context_rows[-5:]
+        # В карточку продолжают падать новые сообщения и после решения владельца.
+        # Помечаем такие, чтобы проверенный диалог с новой активностью не потерялся.
+        last_at = str(out.get("last_at") or "")
+        reviewed_at = str(out.get("admin_reviewed_at") or "")
+        answered_at = str(out.get("user_responded_at") or "")
+        out["has_new_after_review"] = bool(reviewed_at and last_at > reviewed_at)
+        out["has_new_after_answer"] = bool(answered_at and last_at > answered_at)
+        out["signal_count"] = len(out.get("evidence") or [])
         return out
+
+    def merge_duplicate_chat_cases(self) -> int:
+        """Сводит ранее разделённые карточки одного чата в одну.
+
+        До перехода на «один собеседник — одна карточка» каждый новый платёж в
+        том же диалоге заводил отдельный случай. Здесь они склеиваются: улики,
+        суммы и события переносятся в самую раннюю карточку, решения владельца
+        не теряются, лишние строки удаляются. Повторный вызов ничего не меняет.
+        """
+        merged = 0
+        with self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            groups = db.execute(
+                """SELECT owner, profile_id, chat_key, COUNT(*) AS n
+                   FROM payment_cases WHERE profile_active=1
+                   GROUP BY owner, profile_id, chat_key HAVING n > 1"""
+            ).fetchall()
+            for group in groups:
+                rows = db.execute(
+                    """SELECT * FROM payment_cases
+                       WHERE owner=? AND profile_id=? AND chat_key=? AND profile_active=1
+                       ORDER BY first_at ASC""",
+                    (group["owner"], group["profile_id"], group["chat_key"]),
+                ).fetchall()
+                if len(rows) < 2:
+                    continue
+                keep, extras = rows[0], rows[1:]
+                categories: set[str] = set(self._loads(keep["categories_json"], []))
+                amounts = self._amount_values(self._loads(keep["amounts_json"], []))
+                evidence = list(self._loads(keep["evidence_json"], []))
+                directions: set[str] = set(self._loads(keep["directions_json"], []))
+                media: set[str] = set(self._loads(keep["media_hashes_json"], []))
+                first_at, last_at = str(keep["first_at"]), str(keep["last_at"])
+                base = int(keep["base_score"] or 0)
+                status, income = str(keep["event_status"]), bool(keep["income_claim"])
+                state_at = str(keep["state_at"] or "")
+                user_status, user_note = str(keep["user_status"]), str(keep["user_note"] or "")
+                user_at = keep["user_responded_at"]
+                admin_status, admin_note = str(keep["admin_status"]), str(keep["admin_note"] or "")
+                admin_amount, admin_at = keep["admin_amount"], keep["admin_reviewed_at"]
+                chat_ref = keep["chat_ref"]
+
+                for row in extras:
+                    categories |= set(self._loads(row["categories_json"], []))
+                    amounts = self._amount_values(
+                        amounts + self._amount_values(self._loads(row["amounts_json"], []))
+                    )
+                    evidence.extend(self._loads(row["evidence_json"], []))
+                    directions |= set(self._loads(row["directions_json"], []))
+                    media |= set(self._loads(row["media_hashes_json"], []))
+                    first_at = min(first_at, str(row["first_at"]))
+                    last_at = max(last_at, str(row["last_at"]))
+                    base = max(base, int(row["base_score"] or 0))
+                    if str(row["state_at"] or "") > state_at:
+                        state_at = str(row["state_at"] or "")
+                        status, income = str(row["event_status"]), bool(row["income_claim"])
+                    # Ответ и решение владельца важнее пустого «ждёт ответа».
+                    if user_status == "pending" and row["user_status"] != "pending":
+                        user_status = str(row["user_status"])
+                        user_note, user_at = str(row["user_note"] or ""), row["user_responded_at"]
+                    if admin_status == "pending" and row["admin_status"] != "pending":
+                        admin_status = str(row["admin_status"])
+                        admin_note, admin_at = str(row["admin_note"] or ""), row["admin_reviewed_at"]
+                    if admin_amount is None and row["admin_amount"] is not None:
+                        admin_amount = row["admin_amount"]
+                    if chat_ref is None and row["chat_ref"] is not None:
+                        chat_ref = row["chat_ref"]
+                    db.execute("UPDATE payment_events SET case_id=? WHERE case_id=?",
+                               (keep["id"], row["id"]))
+                    db.execute("UPDATE payment_audit_log SET case_id=? WHERE case_id=?",
+                               (keep["id"], row["id"]))
+                    db.execute("DELETE FROM payment_cases WHERE id=?", (row["id"],))
+                    merged += 1
+
+                evidence.sort(key=lambda item: str((item or {}).get("at") or ""))
+                score = self._case_score(base, categories, amounts, directions, media, status, income)
+                db.execute(
+                    """UPDATE payment_cases SET first_at=?, last_at=?, base_score=?, score=?,
+                       level=?, categories_json=?, amounts_json=?, evidence_json=?,
+                       directions_json=?, media_hashes_json=?, event_status=?, income_claim=?,
+                       state_at=?, chat_ref=?, user_status=?, user_note=?, user_responded_at=?,
+                       admin_status=?, admin_note=?, admin_amount=?, admin_reviewed_at=?,
+                       updated_at=? WHERE id=?""",
+                    (
+                        first_at, last_at, base, score, self._level(score),
+                        json.dumps(sorted(categories), ensure_ascii=False),
+                        json.dumps(amounts, ensure_ascii=False),
+                        json.dumps(evidence[-10:], ensure_ascii=False),
+                        json.dumps(sorted(directions), ensure_ascii=False),
+                        json.dumps(sorted(media), ensure_ascii=False),
+                        status, int(income), state_at or None, chat_ref,
+                        user_status, user_note, user_at,
+                        admin_status, admin_note, admin_amount, admin_at,
+                        utc_now_iso(), keep["id"],
+                    ),
+                )
+            db.commit()
+        return merged
 
     def get_case(self, case_id: str) -> dict:
         with self._connection() as db:

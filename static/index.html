@@ -1434,7 +1434,14 @@ function paymentArchiveBlock(c) {
 function paymentReviewLine(c) {
   const userLine = `${PAYMENT_USER_STATUS[c.user_status] || c.user_status}${c.user_note ? ` — ${c.user_note}` : ""}`;
   const adminLine = `${PAYMENT_ADMIN_STATUS[c.admin_status] || c.admin_status}${c.admin_amount != null ? ` · ${money(c.admin_amount)}` : ""}${c.admin_note ? ` — ${c.admin_note}` : ""}`;
-  return `<div class="audit-review">Ответ сотрудника: <b>${escapeHtml(userLine)}</b><br>Решение администратора: <b>${escapeHtml(adminLine)}</b></div>`;
+  // Карточка = один собеседник. После решения в неё продолжают падать новые
+  // сообщения — о них нужно сказать прямо, иначе «подтверждено» усыпит.
+  const fresh = c.has_new_after_review
+    ? `<div class="audit-status needs-info">● после твоей проверки в диалоге появилось новое — посмотри ещё раз</div>`
+    : (c.has_new_after_answer && c.admin_status === "pending"
+        ? `<div class="audit-status medium">● сотрудник ответил, потом в диалоге были ещё сообщения</div>`
+        : "");
+  return `${fresh}<div class="audit-review">Ответ сотрудника: <b>${escapeHtml(userLine)}</b><br>Решение администратора: <b>${escapeHtml(adminLine)}</b></div>`;
 }
 
 function paymentAdminActions(c, suggested, presentation) {
@@ -1475,11 +1482,13 @@ function paymentCaseCard(c, adminMode, showArchive) {
   const chat = adminMode && c.chat_label ? ` · ${escapeHtml(c.chat_label)}` : "";
   const profile = c.profile_name ? escapeHtml(c.profile_name) : "рабочий аккаунт";
   const when = escapeHtml((c.last_at || "").slice(0, 16).replace("T", " "));
+  // Одна карточка на собеседника: показываем, сколько сигналов в ней накопилось.
+  const signals = Math.max(Number(c.signal_count || 0), (c.evidence || []).length);
   return `<article class="audit-card ${presentation.tone}">
     <div class="audit-case-top">
       <div class="audit-person">
         <div class="audit-person-name">${escapeHtml(name)}${chat}</div>
-        <div class="audit-meta">${profile}${when ? ` · ${when}` : ""}${c.chat_link ? ` · <a href="${escapeHtml(c.chat_link)}">открыть в Telegram</a>` : ""}</div>
+        <div class="audit-meta">${profile}${when ? ` · ${when}` : ""}${signals > 1 ? ` · сигналов: ${signals}` : ""}${c.chat_link ? ` · <a href="${escapeHtml(c.chat_link)}">открыть в Telegram</a>` : ""}</div>
         <div class="audit-status ${presentation.tone}">${presentation.icon} ${escapeHtml(presentation.label)}</div>
       </div>
       <div class="audit-amount">${paymentAmounts(c)}</div>

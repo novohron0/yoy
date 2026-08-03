@@ -111,7 +111,10 @@ class PaymentAuditStoreTests(unittest.TestCase):
 
         rows = self.store.list_chat_cases("u1", first["chat_key"])
 
-        self.assertEqual([row["id"] for row in rows], [first["id"], second["id"]])
+        # Два платежа одного собеседника — одна карточка, но оба сообщения
+        # остаются на учёте: по ним потом чистится архив.
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual([row["id"] for row in rows], [first["id"]])
         self.assertEqual(len(self.store.chat_message_refs("u1", first["chat_key"])), 2)
 
     def test_compacts_chat_to_payment_facts_without_losing_amount_or_decision(self):
@@ -291,7 +294,7 @@ class PaymentAuditStoreTests(unittest.TestCase):
         self.assertEqual(restored["amounts"], [{"value": 9000.0, "currency": "RUB"}])
         self.assertNotIn(5000.0, [item["value"] for item in restored["amounts"]])
 
-    def test_separate_completed_messages_are_separate_payments(self):
+    def test_all_payments_of_one_chat_live_in_one_card(self):
         first = self.record(
             "one", minute=0, score=75, categories=["transfer_completed"],
             amounts=[{"value": 5000, "currency": "RUB"}],
@@ -308,10 +311,14 @@ class PaymentAuditStoreTests(unittest.TestCase):
             event_status="completed", income_claim=True,
         )
 
-        self.assertNotEqual(first["id"], same_amount_again["id"])
-        self.assertNotEqual(same_amount_again["id"], different_amount["id"])
+        # Владелец проверяет человека, а не отдельные сигналы: все платежи
+        # одного диалога собираются в одну карточку, суммы копятся списком.
+        self.assertEqual(first["id"], same_amount_again["id"])
+        self.assertEqual(same_amount_again["id"], different_amount["id"])
+        values = sorted(item["value"] for item in different_amount["amounts"])
+        self.assertEqual(values, [5000.0, 9000.0])
 
-    def test_out_of_order_unrelated_event_does_not_merge_or_regress_time(self):
+    def test_out_of_order_event_joins_the_card_without_regressing_time(self):
         newer = self.record(
             "new", at=datetime(2026, 7, 30, 13, 0, tzinfo=timezone.utc),
             event_status="intent", income_claim=False,
@@ -321,10 +328,11 @@ class PaymentAuditStoreTests(unittest.TestCase):
             event_status="intent", income_claim=False,
         )
 
-        self.assertNotEqual(newer["id"], older["id"])
-        self.assertEqual(newer["last_at"], "2026-07-30T13:00:00+00:00")
+        self.assertEqual(newer["id"], older["id"])
+        self.assertEqual(older["last_at"], "2026-07-30T13:00:00+00:00")
+        self.assertEqual(older["first_at"], "2026-07-30T10:00:00+00:00")
 
-    def test_reviewed_cases_only_accept_updates_for_the_same_message(self):
+    def test_reviewed_card_keeps_collecting_and_flags_new_activity(self):
         user_case = self.record(
             "user-message", minute=0, event_status="intent", income_claim=False,
         )
@@ -334,7 +342,8 @@ class PaymentAuditStoreTests(unittest.TestCase):
             event_status="receipt", income_claim=False,
         )
         later_user_message = self.record(
-            "user-later", minute=5, event_status="intent", income_claim=False,
+            "user-later", at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            event_status="intent", income_claim=False,
         )
 
         admin_case = self.record(
@@ -347,14 +356,20 @@ class PaymentAuditStoreTests(unittest.TestCase):
             source="ocr", event_status="receipt", income_claim=False,
         )
         later_admin_message = self.record(
-            "admin-later", chat_id=456, minute=25,
+            "admin-later", chat_id=456,
+            at=datetime.now(timezone.utc) + timedelta(minutes=1),
             event_status="intent", income_claim=False,
         )
 
+        # Ответ пользователя и решение админа не закрывают диалог: новые
+        # сообщения продолжают падать в ту же карточку, но помечаются как
+        # появившиеся уже после проверки — чтобы владелец их не проглядел.
         self.assertEqual(user_case["id"], same_user_message["id"])
-        self.assertNotEqual(user_case["id"], later_user_message["id"])
+        self.assertEqual(user_case["id"], later_user_message["id"])
+        self.assertTrue(later_user_message["has_new_after_answer"])
         self.assertEqual(admin_case["id"], same_admin_message["id"])
-        self.assertNotEqual(admin_case["id"], later_admin_message["id"])
+        self.assertEqual(admin_case["id"], later_admin_message["id"])
+        self.assertTrue(later_admin_message["has_new_after_review"])
 
     def test_new_negative_lowers_score_and_older_ocr_cannot_restore_state(self):
         positive = self.record(
@@ -785,3 +800,59 @@ class PaymentAuditStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MergeDuplicateChatCasesTests(unittest.TestCase):
+    """Старые раздвоенные карточки одного диалога сводятся в одну."""
+
+    # Берём готовое окружение соседнего набора, не перезапуская его тесты.
+    setUp = PaymentAuditStoreTests.setUp
+    tearDown = PaymentAuditStoreTests.tearDown
+    record = PaymentAuditStoreTests.record
+
+    def test_merges_old_split_cards_keeping_amounts_and_decision(self):
+        completed = {
+            "score": 80,
+            "categories": ["transfer_completed"],
+            "event_status": "completed",
+            "income_claim": True,
+        }
+        first = self.record(
+            "old-one", minute=1, amounts=[{"value": 5000, "currency": "RUB"}], **completed
+        )
+        # Имитируем прежнее поведение: вторая карточка того же чата.
+        with self.store._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """INSERT INTO payment_cases(
+                       id, owner, profile_id, chat_key, first_at, last_at, base_score,
+                       score, level, categories_json, amounts_json, evidence_json,
+                       directions_json, media_hashes_json, event_status, income_claim,
+                       attribution, user_status, admin_status, admin_amount,
+                       admin_reviewed_at, created_at, updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "legacy-second", "u1", "p1", first["chat_key"],
+                    "2026-07-30T10:09:00+00:00", "2026-07-30T10:09:00+00:00",
+                    80, 80, "high", '["transfer_completed"]',
+                    '[{"value": 9000, "currency": "RUB"}]',
+                    '[{"at": "2026-07-30T10:09:00+00:00", "snippet": "ещё перевод"}]',
+                    '["incoming"]', "[]", "completed", 1, "direct",
+                    "pending", "confirmed", 9000, "2026-07-30T11:00:00+00:00",
+                    "2026-07-30T10:09:00+00:00", "2026-07-30T10:09:00+00:00",
+                ),
+            )
+            db.commit()
+
+        merged = self.store.merge_duplicate_chat_cases()
+        rows = self.store.list_cases(owner="u1", days=3650, min_score=0)
+
+        self.assertEqual(merged, 1)
+        self.assertEqual(len(rows), 1)
+        card = rows[0]
+        self.assertEqual(card["id"], first["id"])
+        self.assertEqual(sorted(a["value"] for a in card["amounts"]), [5000.0, 9000.0])
+        # Решение владельца из склеенной карточки не теряется.
+        self.assertEqual(card["admin_status"], "confirmed")
+        self.assertEqual(card["admin_amount"], 9000.0)
+        self.assertEqual(self.store.merge_duplicate_chat_cases(), 0)

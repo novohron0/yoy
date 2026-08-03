@@ -3398,6 +3398,11 @@ async def lifespan(app: FastAPI):
     try:
         store = _get_payment_audit_store()
         if store is not None:
+            # Разово сводит карточки, разделённые старым правилом «каждый платёж
+            # отдельно»: один собеседник должен быть одной карточкой.
+            merged = store.merge_duplicate_chat_cases()
+            if merged:
+                print(f"[payment-audit] склеено дублей карточек: {merged}")
             store.cleanup()
             if PAYMENT_CHAT_ARCHIVE_RETENTION_DAYS > 0:
                 _get_payment_chat_archive().cleanup(PAYMENT_CHAT_ARCHIVE_RETENTION_DAYS)
