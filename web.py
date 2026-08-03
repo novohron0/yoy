@@ -461,6 +461,51 @@ def _responses_window(pid, days):
 CHAT_FAIL_LIMIT = int(os.environ.get("CHAT_FAIL_LIMIT", "3"))
 
 
+def _verify_chats(pid):
+    """Чаты профиля, которые ждут ручных действий (подписка, капча, правила)."""
+    profile = get_profile(pid) or {}
+    return dict(profile.get("verify_chats") or {})
+
+
+def _mark_chat_for_verify(pid, chat_id, name, reason):
+    """Убирает чат из рассылок до тех пор, пока владелец не выполнит условия."""
+    key = str(chat_id)
+    profiles = load_profiles()
+    added = False
+    for p in profiles:
+        if p["id"] != pid:
+            continue
+        pending = p.setdefault("verify_chats", {})
+        if key not in pending:
+            added = True
+        pending[key] = {
+            "name": name or key,
+            "reason": (reason or "")[:160],
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+        p.setdefault("chat_fails", {}).pop(key, None)   # это не «мёртвый» чат
+        save_profiles(profiles)
+        break
+    return added
+
+
+def _unmark_verify_chats(pid, chat_ids=None):
+    """Возвращает чаты в рассылку после того, как человек выполнил условия."""
+    profiles = load_profiles()
+    returned = 0
+    for p in profiles:
+        if p["id"] != pid:
+            continue
+        pending = p.setdefault("verify_chats", {})
+        keys = [str(x) for x in chat_ids] if chat_ids else list(pending)
+        for key in keys:
+            if pending.pop(key, None) is not None:
+                returned += 1
+        save_profiles(profiles)
+        break
+    return returned
+
+
 def _record_chat_result(pid, chat_id, ok):
     """Ведёт счётчик подряд-ошибок по чату. Возвращает True, если чат пора удалить (мёртвый)."""
     profiles = load_profiles()
@@ -2592,12 +2637,15 @@ def _classify_send_error(e):
     if "userbannedinchannel" in low or "banned" in low:
         return "skip", "аккаунт забанен в этом чате", None
     if "channelprivate" in low:
-        return "skip", "чат приватный или тебя удалили/не участник", None
-    if ("chatwriteforbidden" in low or "chatadminrequired" in low
-            or "chatsendmediaforbidden" in low or "forbidden" in low
-            or "chatrestricted" in low or "notallowed" in low
-            or "chatguestsendforbidden" in low or "senderrestricted" in low):
-        return "skip", "нет прав писать в этот чат (нужно вступить/подписаться или доступ закрыт)", None
+        return "verify", "нужно вступить в чат — бот сам не пройдёт", None
+    if "chatguestsendforbidden" in low:
+        return "verify", "просят сначала подписаться на канал", None
+    if ("chatwriteforbidden" in low or "chatrestricted" in low
+            or "senderrestricted" in low or "notallowed" in low):
+        return "verify", "чат требует проверки: подписка, капча или правила", None
+    if ("chatadminrequired" in low or "chatsendmediaforbidden" in low
+            or "forbidden" in low):
+        return "verify", "нет прав писать — проверь условия чата", None
     if "peeridinvalid" in low or "invalid" in low and "peer" in low:
         return "skip", "чат недоступен (неверный/удалён)", None
 
@@ -2674,12 +2722,80 @@ class _InitialQueuePersistError(RuntimeError):
 _STOP_CATEGORIES = ("flood", "spam", "limit", "dead", "badmsg")
 
 
+VERIFY_FOLDER_NAME = os.environ.get("VERIFY_FOLDER_NAME", "На проверку")
+
+
+async def _sync_verify_folder(pid, owner, added=0):
+    """Складывает чаты, требующие ручных действий, в отдельную папку Telegram.
+
+    Папка создаётся один раз и переписывается целиком: вернул чат в рассылку —
+    он исчезает и из папки. Сбой здесь не должен ломать рассылку, поэтому все
+    ошибки гасим и просто пишем владельцу уведомление.
+    """
+    pending = _verify_chats(pid)
+    try:
+        from telethon.tl.types import DialogFilter
+        try:
+            from telethon.tl.types import TextWithEntities
+        except Exception:
+            TextWithEntities = None
+        client = await get_client(pid)
+        if client is None:
+            return
+        res = await client(GetDialogFiltersRequest())
+        existing = getattr(res, "filters", res) or []
+        folder_id, used = None, set()
+        for flt in existing:
+            fid = getattr(flt, "id", None)
+            if isinstance(fid, int):
+                used.add(fid)
+            title = getattr(flt, "title", None)
+            text = getattr(title, "text", title)
+            if isinstance(text, str) and text.strip() == VERIFY_FOLDER_NAME:
+                folder_id = fid
+        peers = []
+        for chat_id in pending:
+            try:
+                peers.append(await client.get_input_entity(int(chat_id)))
+            except Exception:
+                continue
+        if not peers:
+            return
+        if folder_id is None:
+            folder_id = next(i for i in range(2, 250) if i not in used)
+        title_obj = (TextWithEntities(text=VERIFY_FOLDER_NAME, entities=[])
+                     if TextWithEntities else VERIFY_FOLDER_NAME)
+        await client(UpdateDialogFilterRequest(
+            id=folder_id,
+            filter=DialogFilter(id=folder_id, title=title_obj, pinned_peers=[],
+                                include_peers=peers, exclude_peers=[]),
+        ))
+        if added and owner:
+            _add_notification(
+                owner, pid, "warn",
+                f"📁 {added} чат(ов) просят подписку или проверку — рассылка туда"
+                f" остановлена, они сложены в папку «{VERIFY_FOLDER_NAME}» в Telegram."
+                " Выполни условия и верни их кнопкой «Вернуть в рассылку».",
+            )
+    except Exception as exc:
+        if owner:
+            _add_notification(
+                owner, pid, "warn",
+                f"📁 {len(pending)} чат(ов) ждут проверки, но папку в Telegram"
+                f" создать не вышло ({type(exc).__name__}). Список есть в панели.",
+            )
+
+
 async def _send_bulk(pid, targets, text, gap_lo=None, gap_hi=None, source="ручная",
                      label="", started=None, done=0, ok=0, failed=None, fresh=True):
     """Последовательная отправка по чатам: пауза между ними, защита от флуда,
     живой прогресс (state.send_jobs), отмена, докатка при рестарте и запись в историю.
     targets — оставшиеся к отправке чаты (при докатке — недоотправленный хвост)."""
-    remaining = list(targets)
+    pending_verify = _verify_chats(pid)
+    # Чат, который просит подписку или капчу, в рассылку не берём совсем —
+    # пока владелец не выполнит условия и не вернёт его кнопкой.
+    remaining = [t for t in targets if str(t.get("id")) not in pending_verify]
+    verify_added = []
     if fresh:
         random.shuffle(remaining)   # случайный порядок чатов — меньше похоже на бота
     started = started or datetime.now().isoformat(timespec="seconds")
@@ -2747,7 +2863,15 @@ async def _send_bulk(pid, targets, text, gap_lo=None, gap_hi=None, source="ру�
             elif status == "slow":
                 # медленный режим — временно, чат пропущен, но НЕ считаем «мёртвым»
                 job["failed"].append({"name": target.get("name") or "", "reason": detail or "медленный режим"})
+            elif status == "verify":
+                # Чат просит подписку/капчу/правила: бот это не пройдёт. Убираем
+                # его из рассылок и складываем в папку «На проверку» — человек
+                # выполнит условия и вернёт чат обратно одной кнопкой.
+                job["failed"].append({"name": target.get("name") or "", "reason": (detail or "")[:120]})
+                if _mark_chat_for_verify(pid, target.get("id"), target.get("name"), detail):
+                    verify_added.append(target.get("id"))
             else:  # 'skip' (чат недоступен) или 'error' (неизвестно) — пропуск + счётчик
+
                 job["failed"].append({"name": target.get("name") or "", "reason": (detail or "")[:120]})
                 # авто-удаление мёртвого чата после N подряд ошибок
                 if _record_chat_result(pid, target.get("id"), False):
@@ -2765,6 +2889,8 @@ async def _send_bulk(pid, targets, text, gap_lo=None, gap_hi=None, source="ру�
         errored = True
         raise
     finally:
+        if verify_added:
+            _track_audit_task(_sync_verify_folder(pid, owner, len(verify_added)))
         job["running"] = False
         if shutdown or errored:
             if errored:
@@ -5932,6 +6058,35 @@ async def clone_apply(pid: str, body: CloneApplyIn, user=Depends(require_active)
         done.append(f"папки: пропущены — новый аккаунт ещё не вступил в чаты ({chats_missing})")
 
     return {"ok": True, "applied": done, "from": snap.get("source_name", "")}
+
+
+@app.get("/api/profiles/{pid}/verify-chats")
+async def verify_chats_list(pid: str, user=Depends(require_user)):
+    """Чаты, которые просят подписку/капчу: рассылка туда стоит."""
+    _owned_profile(pid, user)
+    pending = _verify_chats(pid)
+    return {
+        "folder": VERIFY_FOLDER_NAME,
+        "chats": [
+            {"id": key, "name": item.get("name") or key,
+             "reason": item.get("reason") or "", "at": item.get("at") or ""}
+            for key, item in sorted(pending.items(), key=lambda kv: kv[1].get("at") or "")
+        ],
+    }
+
+
+class VerifyReturnIn(BaseModel):
+    ids: list[str] | None = None
+
+
+@app.post("/api/profiles/{pid}/verify-chats/return")
+async def verify_chats_return(pid: str, body: VerifyReturnIn, user=Depends(require_active)):
+    """Возвращает чаты в рассылку после того, как человек выполнил условия."""
+    _owned_profile(pid, user)
+    returned = _unmark_verify_chats(pid, body.ids)
+    if returned:
+        _track_audit_task(_sync_verify_folder(pid, user["id"]))
+    return {"ok": True, "returned": returned, "left": len(_verify_chats(pid))}
 
 
 @app.post("/api/profiles/{pid}/folder")

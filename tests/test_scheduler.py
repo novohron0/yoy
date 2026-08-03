@@ -649,3 +649,51 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VerifyChatsTests(unittest.TestCase):
+    """Чат, который просит подписку или капчу, выпадает из рассылки до человека."""
+
+    def test_subscribe_and_captcha_errors_go_to_manual_check(self):
+        cases = {
+            "ChatGuestSendForbiddenError": "verify",
+            "ChatWriteForbiddenError": "verify",
+            "ChannelPrivateError": "verify",
+            "ChatAdminRequiredError": "verify",
+            "UserBannedInChannelError": "skip",
+            "SlowModeWaitError": "slow",
+        }
+        for name, expected in cases.items():
+            with self.subTest(error=name):
+                error = type(name, (Exception,), {})()
+                status, reason, _ = web._classify_send_error(error)
+                self.assertEqual(status, expected)
+                self.assertTrue(reason)
+
+    def test_marked_chat_is_skipped_and_can_be_returned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "profiles.json")
+            profile = {"id": "p1", "owner": "u1", "name": "acc"}
+            with patch.object(web, "PROFILES_JSON", path):
+                web.save_profiles([profile])
+
+                self.assertTrue(web._mark_chat_for_verify("p1", 555, "Канал", "просят подписку"))
+                pending = web._verify_chats("p1")
+                self.assertIn("555", pending)
+                self.assertEqual(pending["555"]["reason"], "просят подписку")
+                # Повторная пометка того же чата не считается новой.
+                self.assertFalse(web._mark_chat_for_verify("p1", 555, "Канал", "просят подписку"))
+
+                self.assertEqual(web._unmark_verify_chats("p1", ["555"]), 1)
+                self.assertEqual(web._verify_chats("p1"), {})
+
+    def test_returning_all_chats_clears_the_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "profiles.json")
+            with patch.object(web, "PROFILES_JSON", path):
+                web.save_profiles([{"id": "p1", "owner": "u1"}])
+                web._mark_chat_for_verify("p1", 1, "A", "подписка")
+                web._mark_chat_for_verify("p1", 2, "B", "капча")
+
+                self.assertEqual(web._unmark_verify_chats("p1"), 2)
+                self.assertEqual(web._verify_chats("p1"), {})

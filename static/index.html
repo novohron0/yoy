@@ -646,6 +646,16 @@
     <div id="send-progress-fails" style="margin-top:6px"></div>
   </div>
 
+  <!-- Чаты, которые просят подписку/капчу: рассылка туда остановлена -->
+  <div class="section hidden" id="verify-chats-section" style="margin-top:18px">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <b>✋ Ждут твоих действий</b>
+      <button class="btn ghost" style="flex:0 0 auto" onclick="returnVerifyChats()">Вернуть все</button>
+    </div>
+    <div class="hint" id="verify-chats-note" style="margin-top:4px"></div>
+    <div class="sched-list" id="verify-chats-list" style="margin-top:8px"></div>
+  </div>
+
   <!-- Проверка оплат в рабочих личных диалогах -->
   <div class="section" id="payment-audit-section" style="margin-top:24px">
     <h3>🔎 Проверка оплат</h3>
@@ -1740,6 +1750,7 @@ function enterCompose(pid, name) {
   el("msg").value = "";
   el("compose-err").textContent = "";
   el("send-progress-box").classList.add("hidden");
+  loadVerifyChats();
   loadSendHistory();
   pollSend();   // если рассылка по этому профилю уже идёт — покажем прогресс
   renderRecipients();
@@ -1754,6 +1765,34 @@ function enterCompose(pid, name) {
   loadPacks();
   loadSchedules();
   loadPaymentAudit();
+}
+
+async function loadVerifyChats() {
+  const box = el("verify-chats-section");
+  const pid = state.profileId;
+  if (!box || !pid) return;
+  const { ok, data } = await api(`/api/profiles/${pid}/verify-chats`);
+  const chats = (ok && data.chats) || [];
+  box.classList.toggle("hidden", !chats.length);
+  if (!chats.length) return;
+  el("verify-chats-note").textContent =
+    `${chats.length} чат(ов) просят подписку, капчу или правила. Рассылка туда остановлена, `
+    + `они собраны в папку «${data.folder}» в Telegram. Выполни условия и верни их.`;
+  el("verify-chats-list").innerHTML = chats.map(c => `<div class="sched-item" style="display:block">
+      <div class="si-text" style="font-weight:600">${escapeHtml(c.name)}</div>
+      <div class="si-to">${escapeHtml(c.reason)}${c.at ? ` · ${escapeHtml(c.at)}` : ""}</div>
+      <button class="btn ghost" style="margin-top:6px" onclick="returnVerifyChats('${escapeHtml(String(c.id))}')">Вернуть в рассылку</button>
+    </div>`).join("");
+}
+
+async function returnVerifyChats(id) {
+  const pid = state.profileId;
+  if (!pid) return;
+  if (!id && !confirm("Вернуть в рассылку все чаты из списка?")) return;
+  const { ok, data } = await post(`/api/profiles/${pid}/verify-chats/return`, id ? { ids: [String(id)] } : {});
+  if (!ok) return toast(data.error || "Не удалось вернуть", "bad");
+  toast(`Вернул в рассылку: ${data.returned}`, "ok");
+  loadVerifyChats();
 }
 
 function editSchedule(s) {
