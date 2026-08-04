@@ -261,6 +261,21 @@ class PaymentAuditStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_payment_week_log_owner_week
                     ON payment_weekly_report_log(owner, week_start, id DESC);
+
+                CREATE TABLE IF NOT EXISTS payment_payouts (
+                    id TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    period_start TEXT NOT NULL,
+                    period_end TEXT NOT NULL,
+                    total REAL NOT NULL DEFAULT 0,
+                    commission REAL NOT NULL DEFAULT 0,
+                    manual_total REAL NOT NULL DEFAULT 0,
+                    note TEXT NOT NULL DEFAULT '',
+                    cases INTEGER NOT NULL DEFAULT 0,
+                    paid_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_payment_payouts_owner
+                    ON payment_payouts(owner, period_end DESC, id DESC);
                 """
             )
             columns = {row[1] for row in db.execute("PRAGMA table_info(payment_cases)")}
@@ -273,6 +288,9 @@ class PaymentAuditStore:
                 "state_message_ref": "TEXT NOT NULL DEFAULT ''",
                 "chat_ref": "INTEGER",
                 "profile_active": "INTEGER NOT NULL DEFAULT 1",
+                # Ссылка на закрытый расчёт: выплаченные карточки уходят из
+                # «Дохода» в «Общую стату» и больше не попадают в новый период.
+                "payout_id": "TEXT",
             }
             for name, definition in case_migrations.items():
                 if name not in columns:
@@ -1157,13 +1175,15 @@ class PaymentAuditStore:
 
     def list_cases(self, *, owner: str | None = None, days: int = 7,
                    limit: int = 100, min_score: int = 20,
-                   offset: int = 0) -> list[dict]:
+                   offset: int = 0, unpaid_only: bool = False) -> list[dict]:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))).isoformat(timespec="seconds")
         sql = "SELECT * FROM payment_cases WHERE last_at>=? AND score>=?"
         args: list = [cutoff, max(0, int(min_score))]
         if owner is not None:
             sql += " AND owner=?"
             args.append(owner)
+        if unpaid_only:
+            sql += " AND payout_id IS NULL"
         sql += " ORDER BY last_at DESC, id DESC LIMIT ? OFFSET ?"
         args.extend([
             max(1, min(5000, int(limit))),
@@ -1338,6 +1358,8 @@ class PaymentAuditStore:
             case for case in cases
             if case["admin_status"] == "confirmed"
             and case.get("event_status") not in {"failed_or_reversed", "retracted"}
+            # Выплаченное уже посчитано в «Общей стате» — второй раз не считаем.
+            and not case.get("payout_id")
         ]
         confirmed_total = round(sum(float(c.get("admin_amount") or 0) for c in confirmed), 2)
         pending = [c for c in cases if c["admin_status"] in ("pending", "needs_info")]
@@ -1393,6 +1415,159 @@ class PaymentAuditStore:
         result["week_start"] = week_start
         result["week_end"] = week_end
         return result
+
+    # ------------------------------------------------------------------
+    # Расчёт с сотрудником. Когда неделя сотрудника заканчивается, админ
+    # закрывает период: подтверждённые суммы схлопываются в одну строку
+    # payment_payouts, а карточки помечаются выплаченными и уходят из «Дохода».
+    # Строка расчёта переживает удаление самих карточек по retention —
+    # это единственный долгий след о деньгах.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _payout_bound(value: str | datetime | None) -> str:
+        """Границу периода приводим к UTC — карточки хранят время в UTC."""
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            try:
+                dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid payout period") from exc
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+    @staticmethod
+    def _payout_rate(commission_rate: float) -> float:
+        rate = float(commission_rate)
+        if not math.isfinite(rate) or rate < 0 or rate > 1:
+            raise ValueError("invalid commission rate")
+        return rate
+
+    def unpaid_confirmed(self, *, owner: str | None = None,
+                         before: str | datetime | None = None) -> list[dict]:
+        """Подтверждённый доход, который сотруднику ещё не выплатили."""
+        sql = (
+            "SELECT * FROM payment_cases WHERE admin_status='confirmed' "
+            "AND payout_id IS NULL "
+            "AND event_status NOT IN ('failed_or_reversed','retracted')"
+        )
+        args: list = []
+        if owner is not None:
+            sql += " AND owner=?"
+            args.append(owner)
+        if before is not None:
+            sql += " AND last_at<?"
+            args.append(self._payout_bound(before))
+        sql += " ORDER BY last_at ASC, id ASC"
+        with self._connection() as db:
+            return [self._row(row) for row in db.execute(sql, args).fetchall()]
+
+    def pay_out(self, owner: str, *, period_start: str | datetime,
+                period_end: str | datetime, admin_id: str,
+                commission_rate: float = 0.15, note: str = "") -> dict:
+        """Закрывает период сотрудника и помечает его карточки выплаченными."""
+        owner = str(owner or "")
+        if not owner:
+            raise ValueError("invalid owner")
+        start = self._payout_bound(period_start)
+        end = self._payout_bound(period_end)
+        if end <= start:
+            raise ValueError("invalid payout period")
+        rate = self._payout_rate(commission_rate)
+        note = mask_sensitive_text(note, 500)
+        now = utc_now_iso()
+        payout_id = secrets.token_hex(12)
+        with self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                """SELECT id, admin_amount FROM payment_cases
+                   WHERE owner=? AND admin_status='confirmed' AND payout_id IS NULL
+                     AND last_at<?
+                     AND event_status NOT IN ('failed_or_reversed','retracted')""",
+                (owner, end),
+            ).fetchall()
+            if not rows and db.execute(
+                "SELECT 1 FROM payment_payouts WHERE owner=? AND period_end=?",
+                (owner, end),
+            ).fetchone():
+                # Пустой период уже закрыт — второй раз по той же кнопке не создаём.
+                raise LookupError("period already closed")
+            total = round(sum(float(row["admin_amount"] or 0) for row in rows), 2)
+            db.execute(
+                """INSERT INTO payment_payouts(
+                   id, owner, period_start, period_end, total, commission,
+                   manual_total, note, cases, paid_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (payout_id, owner, start, end, total, round(total * rate, 2),
+                 0.0, note, len(rows), now),
+            )
+            db.executemany(
+                "UPDATE payment_cases SET payout_id=?, updated_at=? WHERE id=?",
+                [(payout_id, now, row["id"]) for row in rows],
+            )
+            db.executemany(
+                """INSERT INTO payment_audit_log(case_id, actor, actor_id, action,
+                   old_value, new_value, note, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                [(row["id"], "admin", admin_id, "payout", "", payout_id, note, now)
+                 for row in rows],
+            )
+            result = db.execute(
+                "SELECT * FROM payment_payouts WHERE id=?", (payout_id,)
+            ).fetchone()
+            db.commit()
+        return dict(result)
+
+    def add_manual_payout(self, payout_id: str, amount: float, note: str = "",
+                          *, commission_rate: float = 0.15) -> dict:
+        """Ручная сумма к закрытому периоду — когда сигнал не поймали."""
+        amount = round(float(amount), 2)
+        if not math.isfinite(amount) or abs(amount) > 100_000_000:
+            raise ValueError("invalid amount")
+        rate = self._payout_rate(commission_rate)
+        addition = mask_sensitive_text(note, 200)
+        with self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM payment_payouts WHERE id=?", (str(payout_id),)
+            ).fetchone()
+            if not row:
+                raise KeyError(payout_id)
+            manual_total = round(float(row["manual_total"] or 0) + amount, 2)
+            total = round(float(row["total"] or 0), 2)
+            merged = "; ".join(
+                part for part in (str(row["note"] or ""), addition) if part
+            )[:2000]
+            db.execute(
+                "UPDATE payment_payouts SET manual_total=?, commission=?, note=? WHERE id=?",
+                (manual_total, round((total + manual_total) * rate, 2), merged, row["id"]),
+            )
+            result = db.execute(
+                "SELECT * FROM payment_payouts WHERE id=?", (row["id"],)
+            ).fetchone()
+            db.commit()
+        return dict(result)
+
+    def list_payouts(self, *, owner: str | None = None, limit: int = 100) -> list[dict]:
+        sql = "SELECT * FROM payment_payouts"
+        args: list = []
+        if owner is not None:
+            sql += " WHERE owner=?"
+            args.append(owner)
+        sql += " ORDER BY period_end DESC, paid_at DESC, id DESC LIMIT ?"
+        args.append(max(1, min(500, int(limit))))
+        with self._connection() as db:
+            return [dict(row) for row in db.execute(sql, args).fetchall()]
+
+    def last_payout_end(self, owner: str) -> str | None:
+        """Конец последнего закрытого периода — с него начинается следующий."""
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT MAX(period_end) AS last_end FROM payment_payouts WHERE owner=?",
+                (owner,),
+            ).fetchone()
+        return (row["last_end"] if row else None) or None
 
     def cleanup(self, now: str | datetime | None = None) -> int:
         current = datetime.fromisoformat(normalize_event_time(now))
@@ -1454,6 +1629,7 @@ class PaymentAuditStore:
             db.execute("DELETE FROM payment_cases WHERE owner=?", (owner,))
             db.execute("DELETE FROM payment_weekly_report_log WHERE owner=?", (owner,))
             db.execute("DELETE FROM payment_weekly_reports WHERE owner=?", (owner,))
+            db.execute("DELETE FROM payment_payouts WHERE owner=?", (owner,))
 
     def archive_profile(self, profile_id: str) -> int:
         """Detach a deleted profile while retaining its audit cases temporarily."""

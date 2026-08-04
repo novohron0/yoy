@@ -2819,6 +2819,92 @@ function filterPaymentChatGroups(value) {
   });
 }
 
+// Расчёт с сотрудником: даты периода показываем коротко, ДД.ММ.
+function payoutDay(value) {
+  const d = new Date(String(value || ""));
+  if (Number.isNaN(d.getTime())) return "";
+  return `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function payoutRange(start, end) {
+  // period_end — граница периода, последний его день на сутки раньше.
+  const to = new Date(String(end || ""));
+  const from = payoutDay(start);
+  const last = Number.isNaN(to.getTime()) ? "" : payoutDay(new Date(to.getTime() - 86400000));
+  return from && last ? `с ${from} по ${last}` : "";
+}
+
+function payoutWeeks(start, end) {
+  const ms = new Date(String(end || "")) - new Date(String(start || ""));
+  const weeks = Number.isFinite(ms) ? Math.max(1, Math.round(ms / 604800000)) : 1;
+  const tail = weeks % 10, hundred = weeks % 100;
+  const word = tail === 1 && hundred !== 11 ? "неделя"
+    : (tail >= 2 && tail <= 4 && (hundred < 12 || hundred > 14)) ? "недели" : "недель";
+  return `${weeks} ${word}`;
+}
+
+// Вкладка «Доход»: у кого неделя кончилась — строка с кнопкой «Выплачено».
+function paymentDueHtml(summaries) {
+  const rows = (summaries || []).filter(s => Number(s.due_cases || 0) > 0);
+  if (!rows.length) return "";
+  return rows.map(s => {
+    const total = Number(s.due_total || 0);
+    const range = payoutRange(s.period_start, s.period_end);
+    return `<div class="audit-due">
+      <div class="audit-due-text">${escapeHtml(s.username || "Сотрудник")} · должно быть выплачено ${money(total)}
+        <span>неделя ${range} · сигналов ${Number(s.due_cases || 0)} · твой доход (15%) ${money(total * 0.15)}</span>
+      </div>
+      <button class="btn" onclick="payPeriod('${escapeHtml(String(s.owner || ""))}', this)">Выплачено</button>
+    </div>`;
+  }).join("");
+}
+
+// Вкладка «Общая стата»: по строке на каждый закрытый период.
+function paymentPayoutsHtml() {
+  const rows = state.paymentPayouts || [];
+  if (!rows.length) {
+    return `<div class="audit-empty">Закрытых периодов пока нет. Как у сотрудника кончится неделя — во вкладке «Доход» появится кнопка «Выплачено».</div>`;
+  }
+  return rows.map(p => {
+    const signals = Number(p.total || 0), manual = Number(p.manual_total || 0);
+    return `<div class="audit-period">
+      <div class="audit-period-head">
+        <div class="audit-period-name">${escapeHtml(p.username || p.owner || "Сотрудник")}</div>
+        <div class="audit-period-when">${payoutWeeks(p.period_start, p.period_end)}, ${payoutRange(p.period_start, p.period_end)}</div>
+      </div>
+      <div class="audit-period-money">заработала по сигналам ${money(signals)}${manual ? ` + вручную ${money(manual)}` : ""}<span>, твой доход (15%) ${money(p.commission)}</span></div>
+      ${p.note ? `<div class="audit-period-note">${escapeHtml(p.note)}</div>` : ""}
+      <button class="btn ghost" style="margin-top:9px" onclick="addManualPayout('${escapeHtml(String(p.id || ""))}')">+ добавить сумму вручную</button>
+    </div>`;
+  }).join("");
+}
+
+async function payPeriod(owner, button) {
+  if (!confirm("Отметить неделю выплаченной? Эти карточки уедут из «Дохода» в «Общую стату».")) return;
+  if (button) { button.disabled = true; button.textContent = "Сохраняю…"; }
+  const { ok, data } = await post("/api/admin/payment-audit/payouts", { owner, note: "" });
+  if (!ok) {
+    if (button) { button.disabled = false; button.textContent = "Выплачено"; }
+    return toast(data.error || "Не удалось закрыть период", "bad");
+  }
+  toast("Период закрыт ✓", "ok");
+  state.paymentTab = "stats";
+  loadAdminUsers();
+}
+
+async function addManualPayout(id) {
+  const entered = prompt("Сколько добавить за этот период, ₽:", "");
+  if (entered === null) return;
+  const amount = Number(String(entered).replace(",", "."));
+  if (!Number.isFinite(amount) || !amount) return toast("Неверная сумма", "bad");
+  const note = prompt("За что добавляем? (комментарий)", "");
+  if (note === null) return;
+  const { ok, data } = await post(`/api/admin/payment-audit/payouts/${id}/manual`, { amount, note });
+  if (!ok) return toast(data.error || "Не удалось добавить сумму", "bad");
+  toast("Добавил ✓", "ok");
+  loadAdminUsers();
+}
+
 function renderAdminPaymentAudit(data) {
   const box = el("admin-payment-audit");
   if (!box) return;

@@ -4109,6 +4109,16 @@ class PaymentWeekIn(BaseModel):
     note: str = ""
 
 
+class PaymentPayoutIn(BaseModel):
+    owner: str
+    note: str = ""
+
+
+class PaymentPayoutManualIn(BaseModel):
+    amount: float
+    note: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Проверка оплат в рабочих Telegram-диалогах
 # ---------------------------------------------------------------------------
@@ -4120,6 +4130,47 @@ def _current_week_start():
 def _current_week_bounds():
     start = datetime.fromisoformat(_current_week_start()).date()
     return start.isoformat(), (start + timedelta(days=7)).isoformat()
+
+
+def _payout_period(user, last_end=None):
+    """Расчётная неделя сотрудника: 7 дней, привязанных к концу его подписки.
+
+    Возвращает границы в UTC. ``period_end`` — последний рубеж недели, который
+    уже прошёл: сама дата окончания подписки, если она истекла, иначе на
+    неделю (или сколько нужно) раньше. Подтверждённые суммы, попавшие раньше
+    этого рубежа, помечаются в админке как «должно быть выплачено».
+    """
+    now = datetime.now(timezone.utc)
+    anchor = None
+    raw = (user or {}).get("paid_until")
+    if raw:
+        try:
+            anchor = datetime.fromisoformat(str(raw))
+        except ValueError:
+            anchor = None
+    if anchor is None:
+        # Подписки нет вообще — считаем, что неделя закрыта прямо сейчас.
+        end = now
+    else:
+        if anchor.tzinfo is None:
+            anchor = anchor.astimezone()
+        end = anchor.astimezone(timezone.utc)
+        while end > now:
+            end -= timedelta(days=7)
+    start = None
+    if last_end:
+        try:
+            start = datetime.fromisoformat(str(last_end))
+        except ValueError:
+            start = None
+        if start is not None and start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+    if start is None or start >= end:
+        start = end - timedelta(days=7)
+    return (
+        start.astimezone(timezone.utc).isoformat(timespec="seconds"),
+        end.astimezone(timezone.utc).isoformat(timespec="seconds"),
+    )
 
 
 def _audit_case_view(case, *, profiles=None, users=None):
@@ -4309,8 +4360,9 @@ async def admin_payment_audit(response: Response, days: int = 7,
         )
     limit = max(50, min(int(limit), 500))
     offset = max(0, min(int(offset), 10_000_000))
+    # Выплаченное уходит из «Дохода» в «Общую стату» — в списке его больше нет.
     cases_page = await asyncio.to_thread(
-        store.list_cases, days=days, limit=limit + 1, offset=offset
+        store.list_cases, days=days, limit=limit + 1, offset=offset, unpaid_only=True
     )
     has_more = len(cases_page) > limit
     cases = cases_page[:limit]
@@ -4324,11 +4376,22 @@ async def admin_payment_audit(response: Response, days: int = 7,
         )
         week_report = await asyncio.to_thread(store.weekly_report, owner["id"], week)
         week_reports = await asyncio.to_thread(store.recent_weekly_reports, owner["id"], 4)
+        last_end = await asyncio.to_thread(store.last_payout_end, owner["id"])
+        period_start, period_end = _payout_period(owner, last_end)
+        due = await asyncio.to_thread(
+            store.unpaid_confirmed, owner=owner["id"], before=period_end
+        )
+        due_total = round(sum(float(c.get("admin_amount") or 0) for c in due), 2)
         summary.update({
             "owner": owner["id"],
             "username": owner.get("username") or owner["id"],
             "week_report": week_report,
             "week_reports": week_reports,
+            # Неделя сотрудника закончилась — эти суммы пора выплатить.
+            "period_start": period_start,
+            "period_end": period_end,
+            "due_total": due_total,
+            "due_cases": len(due),
         })
         summaries.append(summary)
     case_views = await asyncio.to_thread(
@@ -4398,6 +4461,85 @@ async def admin_payment_audit_restore(case_id: str, admin=Depends(require_admin)
     except KeyError:
         return JSONResponse({"error": "Событие не найдено"}, status_code=404)
     return {"ok": True, "case": _audit_case_view(case, users=load_users())}
+
+
+def _payout_view(payout, users=None):
+    row = dict(payout)
+    if users is not None:
+        owner = next((u for u in users if u.get("id") == row.get("owner")), None)
+        row["username"] = (owner or {}).get("username") or row.get("owner")
+    return row
+
+
+@app.get("/api/admin/payment-audit/payouts")
+async def admin_payment_payouts(response: Response, limit: int = 100,
+                                admin=Depends(require_admin)):
+    """Закрытые периоды: что уже выплачено сотрудникам и сколько с этого твоё."""
+    response.headers["Cache-Control"] = "private, no-store"
+    store = await _get_payment_audit_store_async()
+    if store is None:
+        return JSONResponse(
+            {"error": "Проверка оплат временно недоступна"},
+            status_code=503,
+            headers={"Cache-Control": "private, no-store"},
+        )
+    users = load_users()
+    payouts = await asyncio.to_thread(
+        store.list_payouts, limit=max(1, min(int(limit), 500))
+    )
+    return {
+        "commission_rate": PAYMENT_COMMISSION_RATE,
+        "payouts": [_payout_view(p, users) for p in payouts],
+    }
+
+
+@app.post("/api/admin/payment-audit/payouts")
+async def admin_payment_payout(body: PaymentPayoutIn, admin=Depends(require_admin)):
+    """«Выплачено»: закрывает неделю сотрудника одной строкой в общей стате."""
+    store = await _get_payment_audit_store_async()
+    if store is None:
+        return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
+    users = load_users()
+    owner = next((u for u in users if u.get("id") == body.owner), None)
+    if owner is None:
+        return JSONResponse({"error": "Сотрудник не найден"}, status_code=404)
+    last_end = await asyncio.to_thread(store.last_payout_end, owner["id"])
+    period_start, period_end = _payout_period(owner, last_end)
+    try:
+        payout = await asyncio.to_thread(
+            store.pay_out,
+            owner["id"],
+            period_start=period_start,
+            period_end=period_end,
+            admin_id=admin["id"],
+            commission_rate=PAYMENT_COMMISSION_RATE,
+            note=body.note,
+        )
+    except LookupError:
+        return JSONResponse({"error": "За этот период выплачивать нечего"}, status_code=400)
+    except ValueError:
+        return JSONResponse({"error": "Неверный период выплаты"}, status_code=400)
+    return {"ok": True, "payout": _payout_view(payout, users)}
+
+
+@app.post("/api/admin/payment-audit/payouts/{payout_id}/manual")
+async def admin_payment_payout_manual(payout_id: str, body: PaymentPayoutManualIn,
+                                      admin=Depends(require_admin)):
+    """Ручная сумма к закрытому периоду — если сигнал не поймали."""
+    store = await _get_payment_audit_store_async()
+    if store is None:
+        return JSONResponse({"error": "Проверка оплат временно недоступна"}, status_code=503)
+    try:
+        payout = await asyncio.to_thread(
+            store.add_manual_payout,
+            payout_id, body.amount, body.note,
+            commission_rate=PAYMENT_COMMISSION_RATE,
+        )
+    except KeyError:
+        return JSONResponse({"error": "Период не найден"}, status_code=404)
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "Неверная сумма"}, status_code=400)
+    return {"ok": True, "payout": _payout_view(payout, load_users())}
 
 
 @app.post("/api/admin/payment-audit/cases/{case_id}/archive")

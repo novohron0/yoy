@@ -896,3 +896,125 @@ class TrashLifecycleTests(unittest.TestCase):
         self.store.cleanup(datetime.now(timezone.utc) + timedelta(days=30))
 
         self.assertEqual(self.store.get_case(case["id"])["admin_amount"], 5000.0)
+
+
+class PayoutTests(unittest.TestCase):
+    """Неделя сотрудника кончилась — подтверждённое уходит в «Общую стату»."""
+
+    setUp = PaymentAuditStoreTests.setUp
+    tearDown = PaymentAuditStoreTests.tearDown
+    record = PaymentAuditStoreTests.record
+
+    WEEK = {
+        "period_start": "2026-07-24T00:00:00+00:00",
+        "period_end": "2026-07-31T00:00:00+00:00",
+        "admin_id": "admin",
+    }
+    NEXT_WEEK = {
+        "period_start": "2026-07-31T00:00:00+00:00",
+        "period_end": "2026-08-07T00:00:00+00:00",
+        "admin_id": "admin",
+    }
+
+    def unpaid_ids(self):
+        return [
+            item["id"]
+            for item in self.store.list_cases(owner="u1", days=3650, unpaid_only=True)
+        ]
+
+    def test_payout_closes_the_week_and_takes_income_out_of_the_tab(self):
+        first = self.record("pay-one", chat_id=101, minute=1)
+        second = self.record("pay-two", chat_id=102, minute=2)
+        later = self.record(
+            "pay-later", chat_id=103,
+            at=datetime(2026, 8, 1, 10, tzinfo=timezone.utc),
+        )
+        self.store.review(first["id"], "admin", "confirmed", 5000)
+        self.store.review(second["id"], "admin", "confirmed", 3000)
+        self.store.review(later["id"], "admin", "confirmed", 1000)
+
+        payout = self.store.pay_out("u1", **self.WEEK)
+
+        self.assertEqual(payout["total"], 8000.0)
+        self.assertEqual(payout["commission"], 1200.0)   # 15% от 8000
+        self.assertEqual(payout["cases"], 2)
+        unpaid = self.unpaid_ids()
+        self.assertNotIn(first["id"], unpaid)
+        self.assertNotIn(second["id"], unpaid)
+        # Сигнал уже следующей недели остаётся ждать своей выплаты.
+        self.assertIn(later["id"], unpaid)
+        self.assertEqual(self.store.get_case(first["id"])["payout_id"], payout["id"])
+        # «Доход» в сводке — только то, что ещё не выплачено.
+        self.assertEqual(self.store.owner_summary("u1", days=3650)["confirmed_total"], 1000)
+        self.assertEqual(self.store.last_payout_end("u1"), self.WEEK["period_end"])
+
+    def test_case_confirmed_after_the_payout_waits_for_the_next_period(self):
+        case = self.record("late-confirm", chat_id=301, minute=1)
+
+        self.store.pay_out("u1", **self.WEEK)
+        # Админ подтвердил старый сигнал уже после закрытия недели — деньги
+        # не должны потеряться, они уходят в следующий период.
+        self.store.review(case["id"], "admin", "confirmed", 2500)
+
+        self.assertIn(case["id"], self.unpaid_ids())
+        self.assertEqual(self.store.pay_out("u1", **self.NEXT_WEEK)["total"], 2500.0)
+
+    def test_manual_amount_is_added_to_a_closed_period(self):
+        case = self.record("manual", chat_id=201, minute=1)
+        self.store.review(case["id"], "admin", "confirmed", 4000)
+        payout = self.store.pay_out("u1", **self.WEEK)
+
+        updated = self.store.add_manual_payout(payout["id"], 1000, "перевод не поймали")
+
+        self.assertEqual(updated["manual_total"], 1000.0)
+        self.assertEqual(updated["commission"], 750.0)   # 15% от 4000 + 1000
+        self.assertIn("перевод не поймали", updated["note"])
+        with self.assertRaises(KeyError):
+            self.store.add_manual_payout("нет-такого", 100)
+
+    def test_failed_signal_is_not_paid_out(self):
+        case = self.record("reversed", chat_id=401, minute=1)
+        self.store.review(case["id"], "admin", "confirmed", 9000)
+        self.record(
+            "reversed", chat_id=401, minute=2,
+            event_status="failed_or_reversed", source="edited", message_id="reversed",
+        )
+
+        self.assertEqual(self.store.pay_out("u1", **self.WEEK)["total"], 0.0)
+
+    def test_closing_the_same_empty_period_twice_is_refused(self):
+        self.assertEqual(self.store.pay_out("u1", **self.WEEK)["total"], 0.0)
+
+        with self.assertRaises(LookupError):
+            self.store.pay_out("u1", **self.WEEK)
+        with self.assertRaises(ValueError):
+            self.store.pay_out(
+                "u1", period_start=self.WEEK["period_end"],
+                period_end=self.WEEK["period_start"], admin_id="admin",
+            )
+
+    def test_payout_survives_the_deletion_of_its_cases(self):
+        case = self.record("short-lived", minute=1)
+        self.store.review(case["id"], "admin", "confirmed", 7000)
+        payout = self.store.pay_out(
+            "u1", period_start="2026-07-24T00:00:00+00:00",
+            period_end=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            admin_id="admin",
+        )
+
+        self.store.cleanup(datetime.now(timezone.utc) + timedelta(days=400))
+
+        self.assertEqual(self.store.get_case(case["id"]), {})
+        rows = self.store.list_payouts(owner="u1")
+        self.assertEqual([row["id"] for row in rows], [payout["id"]])
+        self.assertEqual(rows[0]["total"], 7000.0)
+
+    def test_deleting_an_owner_wipes_the_payout_history(self):
+        case = self.record("bye", minute=1)
+        self.store.review(case["id"], "admin", "confirmed", 1000)
+        self.store.pay_out("u1", **self.WEEK)
+
+        self.store.delete_owner("u1")
+
+        self.assertEqual(self.store.list_payouts(owner="u1"), [])
+        self.assertIsNone(self.store.last_payout_end("u1"))
