@@ -280,6 +280,26 @@
   .audit-worker-name { font-size: 14px; font-weight: 700; }
   .audit-worker-cell { font-size: 13px; font-weight: 650; }
   .audit-worker-cell span { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; font-weight: 500; }
+  /* Неделя сотрудника закончилась — строка с кнопкой «Выплачено» */
+  .audit-due {
+    display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    flex-wrap: wrap; padding: 11px 12px; margin-bottom: 8px;
+    border: 1px solid var(--err); border-radius: 11px; background: rgba(29,39,51,.72);
+  }
+  .audit-due-text { font-size: 13px; font-weight: 650; }
+  .audit-due-text span { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; font-weight: 500; }
+  .audit-due .btn { flex: 0 0 auto; }
+  /* Общая стата: одна строка на закрытый период */
+  .audit-period {
+    padding: 11px 12px; margin-bottom: 8px;
+    border: 1px solid var(--border); border-radius: 11px; background: rgba(29,39,51,.72);
+  }
+  .audit-period-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .audit-period-name { font-size: 14px; font-weight: 700; }
+  .audit-period-when { color: var(--muted); font-size: 11px; }
+  .audit-period-money { margin-top: 5px; font-size: 13px; font-weight: 650; }
+  .audit-period-money span { color: var(--muted); font-weight: 500; }
+  .audit-period-note { margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.45; }
   .audit-list-title { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin: 16px 0 9px; }
   .audit-list-title strong { font-size: 14px; }
   .audit-list-title span { color: var(--muted); font-size: 11px; }
@@ -654,21 +674,6 @@
     </div>
     <div class="hint" id="verify-chats-note" style="margin-top:4px"></div>
     <div class="sched-list" id="verify-chats-list" style="margin-top:8px"></div>
-  </div>
-
-  <!-- Проверка оплат в рабочих личных диалогах -->
-  <div class="section" id="payment-audit-section" style="margin-top:24px">
-    <h3>🔎 Проверка оплат</h3>
-    <div id="payment-audit-summary" class="hint">Загрузка…</div>
-    <div id="payment-week-form" class="hidden" style="margin-top:12px">
-      <label>Заработок за текущую неделю, ₽</label>
-      <div class="row" style="align-items:center;gap:8px">
-        <div><input id="payment-week-amount" type="number" min="0" step="1" placeholder="Например, 25000"></div>
-        <button class="btn ghost" style="flex:0 0 auto" onclick="savePaymentWeek()">Сохранить</button>
-      </div>
-      <div id="payment-week-note" class="hint" style="margin-top:5px"></div>
-    </div>
-    <div class="sched-list" id="payment-audit-cases" style="margin-top:12px"></div>
   </div>
 
   <!-- Активные расписания -->
@@ -1470,6 +1475,7 @@ function paymentAdminActions(c, suggested, presentation) {
     return `<div class="audit-actions">
       <button class="btn ghost" onclick="adminReviewPaymentCase('${id}','confirmed','${suggested}')">Изменить сумму</button>
       <button class="btn ghost" onclick="peekPaymentCase('${id}')">Посмотреть чат</button>
+      <button class="btn audit-negative" onclick="adminReviewPaymentCase('${id}','dismissed',null)">В корзину</button>
     </div>`;
   }
   return `<div class="audit-actions">
@@ -1487,18 +1493,7 @@ async function restorePaymentCase(id) {
   loadAdminUsers();
 }
 
-function paymentUserActions(c, presentation) {
-  const id = String(c.id || "");
-  const income = `<button class="btn${presentation.tone === "failed" ? " audit-secondary" : ""}" onclick="respondPaymentCase('${id}','income')">Это доход</button>`;
-  const notReceived = `<button class="btn${presentation.tone === "failed" ? "" : " ghost"}" onclick="respondPaymentCase('${id}','not_received')">Деньги не пришли</button>`;
-  return `<div class="audit-actions">${presentation.tone === "failed" ? notReceived + income : income + notReceived}
-    <button class="btn audit-secondary" onclick="respondPaymentCase('${id}','personal')">Личный перевод</button>
-    <button class="btn audit-secondary" onclick="respondPaymentCase('${id}','refund')">Возврат</button>
-    <button class="btn audit-secondary" onclick="respondPaymentCase('${id}','duplicate')">Дубликат</button>
-    ${c.user_status !== "pending" ? `<button class="btn audit-negative" onclick="respondPaymentCase('${id}','disputed')">Оспорить</button>` : ""}
-  </div>`;
-}
-
+// Карточки оплат видит только админ, поэтому кнопок сотрудника здесь больше нет.
 function paymentCaseCard(c, adminMode, showArchive) {
   const presentation = paymentCasePresentation(c);
   const rubAmounts = [...new Set((c.amounts || []).filter(a => a.currency === "RUB").map(a => Number(a.value) || 0).filter(v => v > 0))];
@@ -1525,10 +1520,11 @@ function paymentCaseCard(c, adminMode, showArchive) {
       </div>
       <div class="audit-amount">${paymentAmounts(c)}</div>
     </div>
+    ${c.due_payout ? `<div class="audit-status high">● должно быть выплачено</div>` : ""}
     ${c.has_new_after_review ? `<div class="audit-status needs-info">● после проверки появилось новое</div>` : ""}
     ${paymentFirstClue(c)}
     ${decided ? "" : details}
-    ${adminMode ? paymentAdminActions(c, suggested, presentation) : paymentUserActions(c, presentation)}
+    ${adminMode ? paymentAdminActions(c, suggested, presentation) : ""}
   </article>`;
 }
 
@@ -1543,65 +1539,6 @@ function paymentFirstClue(c) {
 
 function auditKpi(value, label, tone) {
   return `<div class="audit-kpi${tone ? ` ${tone}` : ""}"><div class="audit-kpi-value">${value}</div><div class="audit-kpi-label">${escapeHtml(label)}</div></div>`;
-}
-
-async function loadPaymentAudit() {
-  const summary = el("payment-audit-summary"), list = el("payment-audit-cases");
-  if (!summary || !list) return;
-  const { ok, data } = await api("/api/payment-audit");
-  if (!ok) { summary.textContent = "Не удалось загрузить проверку оплат"; return; }
-  state.paymentAudit = data;
-  if (!data.available) {
-    summary.innerHTML = `<span style="color:var(--err)">Проверка оплат временно недоступна.</span> Рассылки при этом продолжают работать.`;
-    el("payment-week-form").classList.add("hidden");
-    list.innerHTML = "";
-    return;
-  }
-  const s = data.summary || {};
-  summary.innerHTML = `<div class="audit-kpis">
-    ${auditKpi(s.pending || 0, "ждут проверки", s.pending ? "danger" : "")}
-    ${auditKpi(s.high || 0, "важные сигналы", s.high ? "danger" : "")}
-    ${auditKpi(money(s.confirmed_total), "доход подтверждён", "ok")}
-    ${auditKpi(money(s.commission), "твои 15%", "")}
-  </div><div class="audit-health ${data.ocr_available ? "ok" : "warn"}">${data.ocr_available ? "● OCR чеков работает" : "○ OCR чеков временно недоступен"}</div>`;
-  el("payment-week-form").classList.remove("hidden");
-  const report = data.week_report;
-  const previousReport = (data.week_reports || []).find(r => r.week_start !== data.week_start);
-  el("payment-week-amount").value = report ? report.amount : "";
-  el("payment-week-note").textContent = report
-    ? `Заявлено: ${money(report.amount)} · 15% = ${money(Number(report.amount) * 0.15)}`
-      + `${previousReport ? ` · прошлая неделя: ${money(previousReport.amount)}` : ""}`
-    : `Неделя с ${data.week_start}: сумма пока не заявлена.`
-      + `${previousReport ? ` Прошлая неделя: ${money(previousReport.amount)}.` : ""}`;
-
-  const casesRes = await api("/api/payment-audit/cases?days=7&limit=100");
-  if (!casesRes.ok) { list.innerHTML = `<div class="hint">${escapeHtml(casesRes.data.error || "Ошибка")}</div>`; return; }
-  const cases = casesRes.data.cases || [];
-  list.className = "audit-list";
-  if (!cases.length) { list.innerHTML = `<div class="audit-empty">Платёжных сигналов пока нет.</div>`; return; }
-  list.innerHTML = cases.map(c => paymentCaseCard(c, false)).join("");
-}
-
-async function respondPaymentCase(id, status) {
-  let note = "";
-  if (status !== "income") {
-    const entered = prompt("Короткое пояснение (необязательно):", "");
-    if (entered === null) return;
-    note = entered;
-  }
-  const { ok, data } = await post(`/api/payment-audit/cases/${id}/respond`, { status, note });
-  if (!ok) return toast(data.error || "Не удалось сохранить", "bad");
-  toast("Ответ сохранён ✓", "ok");
-  loadPaymentAudit();
-}
-
-async function savePaymentWeek() {
-  const amount = Number(el("payment-week-amount").value);
-  if (!Number.isFinite(amount) || amount < 0) return toast("Укажи сумму за неделю", "bad");
-  const { ok, data } = await post("/api/payment-audit/week", { amount });
-  if (!ok) return toast(data.error || "Не удалось сохранить", "bad");
-  toast(`Заявлено ${money(amount)} · 15% = ${money(data.commission)}`, "ok");
-  loadPaymentAudit();
 }
 
 // Счётчик запросов на смену пароля на кнопке «Пользователи» — чтобы новые
@@ -1764,7 +1701,6 @@ function enterCompose(pid, name) {
   renderInactiveBanner();
   loadPacks();
   loadSchedules();
-  loadPaymentAudit();
 }
 
 async function loadVerifyChats() {
@@ -2923,21 +2859,32 @@ function renderAdminPaymentAudit(data) {
   const moreHtml = data.has_more
     ? `<button class="btn ghost full" style="margin-top:12px" onclick="loadMoreAdminPaymentAudit(this)">Показать более старые сигналы · сейчас ${cases.length}</button>`
     : (Number(data.offset || 0) > 0 ? `<div class="hint" style="margin-top:10px;text-align:center">Показана вся сохранённая история · ${cases.length}</div>` : "");
+  // Неделя сотрудника кончилась → его подтверждённые суммы помечаем к выплате.
+  const byOwner = new Map(summaries.map(s => [String(s.owner || ""), s]));
   const buckets = { pending: [], income: [], trash: [] };
   for (const item of cases) {
-    if (item.admin_status === "confirmed") buckets.income.push(item);
+    if (item.admin_status === "confirmed") {
+      const worker = byOwner.get(String(item.owner || ""));
+      item.due_payout = !!(worker && worker.period_end
+        && String(item.last_at || "") < String(worker.period_end));
+      buckets.income.push(item);
+    }
     else if (item.admin_status === "dismissed") buckets.trash.push(item);
     else buckets.pending.push(item);
   }
   state.paymentTab = state.paymentTab || "pending";
-  if (!buckets[state.paymentTab]) state.paymentTab = "pending";
+  if (state.paymentTab !== "stats" && !buckets[state.paymentTab]) state.paymentTab = "pending";
   const tab = state.paymentTab;
+  const counts = { ...Object.fromEntries(Object.entries(buckets).map(([k, v]) => [k, v.length])),
+                   stats: (state.paymentPayouts || []).length };
   const tabBtn = (key, label) =>
-    `<button class="btn ${tab === key ? "" : "ghost"}" onclick="switchPaymentTab('${key}')">${label} · ${buckets[key].length}</button>`;
-  const list = buckets[tab];
-  const body = list.length
-    ? paymentChatGroupsHtml(list)
-    : `<div class="audit-empty">${tab === "pending" ? "Всё проверено." : (tab === "income" ? "Подтверждённого дохода пока нет." : "Корзина пуста.")}</div>`;
+    `<button class="btn ${tab === key ? "" : "ghost"}" onclick="switchPaymentTab('${key}')">${label} · ${counts[key]}</button>`;
+  const list = buckets[tab] || [];
+  const body = tab === "stats"
+    ? paymentPayoutsHtml()
+    : (list.length
+        ? paymentChatGroupsHtml(list)
+        : `<div class="audit-empty">${tab === "pending" ? "Всё проверено." : (tab === "income" ? "Подтверждённого дохода пока нет." : "Корзина пуста.")}</div>`);
   const note = tab === "trash"
     ? `<div class="hint" style="margin:8px 0">Удалятся сами через 7 дней. Нажми «Вернуть», если передумал.</div>`
     : (tab === "income"
@@ -2945,9 +2892,10 @@ function renderAdminPaymentAudit(data) {
         : "");
   box.innerHTML = `<div class="audit-head"><h3>Оплаты</h3></div>
     <div class="row" style="gap:6px;flex-wrap:wrap;margin-bottom:6px">
-      ${tabBtn("pending", "Ждут проверки")}${tabBtn("income", "Доход")}${tabBtn("trash", "Корзина")}
+      ${tabBtn("pending", "Ждут проверки")}${tabBtn("income", "Доход")}${tabBtn("trash", "Корзина")}${tabBtn("stats", "Общая стата")}
     </div>
     ${note}
+    ${tab === "income" ? paymentDueHtml(summaries) : ""}
     ${tab === "pending" && list.length > 3 ? `<input class="audit-search" type="search" placeholder="Найти сотрудника, диалог или сумму…" oninput="filterPaymentChatGroups(this.value)" />` : ""}
     <div class="audit-list">${body}</div>
     ${tab === "pending" ? moreHtml : ""}
@@ -3133,13 +3081,15 @@ function _paymentAmountsLabel(c) {
 async function loadAdminUsers() {
   const box = el("admin-list");
   box.innerHTML = `<div class="hint">Загрузка…</div>`;
-  const [{ ok, data }, statsRes, paymentRes] = await Promise.all([
-    api("/api/admin/users"), api("/api/admin/stats"), api("/api/admin/payment-audit?days=36500")
+  const [{ ok, data }, statsRes, paymentRes, payoutRes] = await Promise.all([
+    api("/api/admin/users"), api("/api/admin/stats"), api("/api/admin/payment-audit?days=36500"),
+    api("/api/admin/payment-audit/payouts?limit=200")
   ]);
   if (!ok) { box.innerHTML = `<div class="hint">${escapeHtml(data.error || "Ошибка")}</div>`; return; }
   const statsById = {};
   if (statsRes.ok) for (const s of (statsRes.data.stats || [])) statsById[s.id] = s;
   renderAdminSummary(data.users || [], statsById);
+  state.paymentPayouts = payoutRes.ok ? (payoutRes.data.payouts || []) : [];
   renderAdminPaymentAudit(paymentRes.ok ? paymentRes.data : null);
   box.innerHTML = "";
   const users = data.users || [];
