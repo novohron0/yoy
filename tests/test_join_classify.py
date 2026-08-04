@@ -103,5 +103,23 @@ class JoinMuteReasonTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.call(chat, raises=True))
 
 
+class HumanLeftTests(unittest.TestCase):
+    """Ожидание показываем словами: «1246с» владельцу ничего не говорит."""
+
+    def test_time_reads_like_a_human_wrote_it(self):
+        cases = {
+            0: "0 сек", 45: "45 сек", 59: "59 сек",
+            60: "1 мин", 90: "1 мин 30 сек", 1246: "20 мин 46 сек",
+            3600: "1 ч", 3900: "1 ч 5 мин", 7325: "2 ч 2 мин",
+        }
+        for seconds, expected in cases.items():
+            self.assertEqual(web._human_left(seconds), expected, seconds)
+
+    def test_junk_does_not_break_the_message(self):
+        self.assertEqual(web._human_left(-5), "0 сек")
+        self.assertEqual(web._human_left(None), "")
+        self.assertEqual(web._human_left("не число"), "")
+
+
 if __name__ == "__main__":
     unittest.main()

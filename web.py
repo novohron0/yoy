@@ -2466,6 +2466,21 @@ def _send_gap(lo=None, hi=None):
     return random.uniform(lo, hi)
 
 
+def _human_left(seconds):
+    """«1246с» человеку ничего не говорит — переводим в минуты и часы."""
+    try:
+        total = max(0, int(round(float(seconds))))
+    except (TypeError, ValueError):
+        return ""
+    if total < 60:
+        return f"{total} сек"
+    minutes, sec = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} мин {sec} сек" if sec else f"{minutes} мин"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} ч {minutes} мин" if minutes else f"{hours} ч"
+
+
 def _on_cooldown(profile):
     """True, если профиль сейчас на охлаждении после флуда."""
     cu = (profile or {}).get("cooldown_until")
@@ -2630,7 +2645,7 @@ def _classify_send_error(e):
 
     # 3) медленный режим — временно, просто пропускаем чат
     if "slowmodewait" in low or "slow mode" in low:
-        s = f" (жди {seconds}с)" if seconds else ""
+        s = f" (жди {_human_left(seconds)})" if seconds else ""
         return "slow", f"медленный режим в чате{s} — пропущен", seconds
 
     # 4) чат недоступен — пропускаем и копим счётчик на авто-удаление
@@ -2670,13 +2685,13 @@ async def _send_one(client, pid, target, text):
         return "ok", None
     except FloodWaitError as e:
         wait = e.seconds + 30  # запас сверху
-        _set_cooldown(pid, wait, note=f"Пауза {e.seconds}с — Telegram просит притормозить (FloodWait).")
+        _set_cooldown(pid, wait, note=f"Пауза {_human_left(e.seconds)} — Telegram просит притормозить (FloodWait).")
         print(f"[flood] профиль {pid}: FloodWait {e.seconds}s → пауза до отправки")
         if e.seconds >= 120:   # мелкие флуды не спамим уведомлениями
             prof = get_profile(pid) or {}
             _add_notification(prof.get("owner"), pid, "warn",
-                              f"⏸ «{prof.get('name', pid)}»: Telegram просит паузу {e.seconds}с (FloodWait). Рассылка приостановлена, продолжится сама.")
-            await _notify_saved(pid, f"⏸ Бот рассылки: аккаунт на паузе {e.seconds}с (FloodWait). Снизь частоту.")
+                              f"⏸ «{prof.get('name', pid)}»: Telegram просит паузу {_human_left(e.seconds)} (FloodWait). Рассылка приостановлена, продолжится сама.")
+            await _notify_saved(pid, f"⏸ Бот рассылки: аккаунт на паузе {_human_left(e.seconds)} (FloodWait). Снизь частоту.")
         return "flood", e.seconds
     except PeerFloodError:
         _set_cooldown(pid, 6 * 3600, note="Telegram пометил аккаунт как спам. Отправки остановлены на 6 ч — снизь частоту.", flagged=True)
@@ -3137,10 +3152,17 @@ async def _join_job(pid, links):
             except FloodWaitError as e:
                 # авто-продолжение: ждём флуд и пробуем снова (если не слишком долго)
                 if e.seconds > 3600 or attempts > 3:
-                    job["failed"].append({"link": link, "reason": f"flood {e.seconds}s — слишком долго, пропуск"})
+                    job["failed"].append({
+                        "link": link,
+                        "reason": f"Telegram просит паузу {_human_left(e.seconds)} — слишком долго, пропустил",
+                    })
                     break
-                job["status"] = f"флуд: жду {e.seconds}с и продолжаю…"
+                # Отдаём момент окончания паузы: обратный отсчёт тикает в панели
+                # сам, без опроса сервера каждую секунду.
+                job["status"] = "пауза Telegram"
+                job["wait_until"] = time.time() + e.seconds + 5
                 await _interruptible_sleep(job, e.seconds + 5)
+                job["wait_until"] = None
                 if job.get("cancel"):
                     break
                 job["status"] = "running"
@@ -5434,7 +5456,7 @@ async def send_code(pid: str, body: PhoneIn, user=Depends(require_active)):
     except FloodWaitError as e:
         print(f"[send_code] FLOOD WAIT {e.seconds}s для {phone} — слишком частые запросы кода")
         return JSONResponse(
-            {"error": f"Слишком много запросов кода. Подожди {e.seconds} сек и попробуй снова."},
+            {"error": f"Слишком много запросов кода. Подожди {_human_left(e.seconds)} и попробуй снова."},
             status_code=429,
         )
     except (PhoneNumberInvalidError, ApiIdInvalidError) as e:
@@ -5904,7 +5926,7 @@ async def join_chats(pid: str, body: JoinIn, user=Depends(require_active)):
         "joined": [], "skipped": [], "failed": [],
         # verify — впустили, но писать нельзя (капча); requests — ждём админа
         "verify": [], "requests": [],
-        "running": True, "cancel": False, "status": "running",
+        "running": True, "cancel": False, "status": "running", "wait_until": None,
     }
     asyncio.create_task(_join_job_safe(pid, links))
     return {"ok": True, "total": len(links)}
@@ -5916,7 +5938,7 @@ async def join_chats_status(pid: str, user=Depends(require_user)):
     job = state.join_jobs.get(pid)
     if not job:
         return {"running": False, "total": 0, "done": 0, "joined": [], "skipped": [],
-                "failed": [], "verify": [], "requests": [], "status": ""}
+                "failed": [], "verify": [], "requests": [], "status": "", "wait_until": None}
     return job
 
 

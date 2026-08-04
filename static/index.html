@@ -1831,11 +1831,14 @@ async function activateCurrent() {
 function renderFloodBanner() {
   const p = state.profilesById[state.profileId];
   const banner = el("flood-banner");
+  clearTimeout(state.floodTimer);
   if (p && (p.flagged || p.on_cooldown)) {
     let msg = p.flood_note || "Аккаунт на паузе из-за флуда.";
-    if (p.cooldown_until) {
-      const until = new Date(p.cooldown_until);
-      if (!isNaN(until)) msg += ` До ${until.toLocaleString()}.`;
+    const until = p.cooldown_until ? new Date(p.cooldown_until) : null;
+    if (until && !isNaN(until)) {
+      const left = Math.max(0, Math.round((until - Date.now()) / 1000));
+      msg += left ? ` Осталось ${humanLeft(left)}.` : " Пауза кончилась — можно продолжать.";
+      if (left) state.floodTimer = setTimeout(renderFloodBanner, 1000);
     }
     el("flood-text").textContent = "⏸ " + msg;
     banner.classList.remove("hidden");
@@ -1897,11 +1900,45 @@ async function pollJoin() {
   if (data.running) setTimeout(pollJoin, 4000);
 }
 
+// «1246 сек» человеку ничего не говорит — показываем минуты и часы.
+function humanLeft(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  if (total < 60) return `${total} сек`;
+  const m = Math.floor(total / 60), s = total % 60;
+  if (m < 60) return s ? `${m} мин ${s} сек` : `${m} мин`;
+  const h = Math.floor(m / 60), mm = m % 60;
+  return mm ? `${h} ч ${mm} мин` : `${h} ч`;
+}
+
+function joinWaitLeft(job) {
+  const until = Number((job || {}).wait_until || 0);
+  return until ? Math.max(0, Math.round(until - Date.now() / 1000)) : 0;
+}
+
+function joinProgressText(job) {
+  const left = joinWaitLeft(job);
+  if (left && job.running) {
+    return `${job.done}/${job.total} — Telegram просит паузу, осталось ${humanLeft(left)}`;
+  }
+  const st = (job.status && job.status !== "running") ? ` — ${job.status}` : (job.running ? " — идёт…" : "");
+  return `${job.done}/${job.total}${st}`;
+}
+
+// Отсчёт тикает локально раз в секунду: сервер опрашивать чаще незачем.
+function joinTick() {
+  clearTimeout(state.joinTimer);
+  const job = state.joinJob;
+  if (!job || !job.running || el("screen-join").classList.contains("hidden")) return;
+  el("join-progress").textContent = joinProgressText(job);
+  if (joinWaitLeft(job) > 0) state.joinTimer = setTimeout(joinTick, 1000);
+}
+
 function renderJoin(job) {
   const stopBtn = el("join-stop");
+  state.joinJob = job;
   if (!job.total) { el("join-progress").textContent = ""; stopBtn.style.display = "none"; return; }
-  const st = (job.status && job.status !== "running") ? ` — ${escapeHtml(job.status)}` : (job.running ? " — идёт…" : "");
-  el("join-progress").textContent = `${job.done}/${job.total}${st}`;
+  el("join-progress").textContent = joinProgressText(job);
+  joinTick();
   stopBtn.style.display = job.running ? "" : "none";
   el("join-start").disabled = !!job.running;
   const j = (job.joined || []).length, sk = (job.skipped || []).length, fl = (job.failed || []).length;
