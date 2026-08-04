@@ -2951,6 +2951,9 @@ async def _send_bulk_safe(pid, targets, text, gap_lo=None, gap_hi=None, source="
 # Вступление — операция с ВЫСОКИМ риском бана, поэтому паузы большие.
 JOIN_GAP_MIN = float(os.environ.get("JOIN_GAP_MIN", "25"))
 JOIN_GAP_MAX = float(os.environ.get("JOIN_GAP_MAX", "60"))
+# Сколько ждать после вступления, прежде чем смотреть, дали ли писать:
+# капча-бот вешает мут не мгновенно.
+JOIN_CHECK_DELAY = float(os.environ.get("JOIN_CHECK_DELAY", "3"))
 
 
 def _parse_join_link(link):
@@ -2972,20 +2975,73 @@ def _parse_join_link(link):
     return None
 
 
-def _join_err(e):
+# Категории, при которых идти по списку дальше нельзя: дело не в ссылке, а в
+# самом аккаунте. Продолжишь долбиться в закрытую дверь — получишь бан.
+_JOIN_STOP_CATEGORIES = ("spam", "dead", "limit")
+
+
+def _classify_join_error(e):
+    """Разбирает ошибку вступления. Возвращает (category, detail).
+
+    category: already | request | verify | expired | full | skip
+              | spam | dead | limit | error
+    """
     name = type(e).__name__
     low = (str(e) + name).lower()
+
+    # 1) аккаунт — дальше по списку идти нельзя
+    for key in ("userdeactivated", "authkeyunregistered", "authkeyduplicated",
+                "sessionrevoked", "sessionexpired", "phonenumberbanned"):
+        if key in low:
+            return "dead", "аккаунт заблокирован Telegram"
+    if "peerflood" in low or "userrestricted" in low or "userbannedinchannel" in low:
+        return "spam", "Telegram ограничил аккаунт на вступления — нужна пауза"
+    if "userstoomuch" in low:
+        return "full", "в чате нет свободных мест"
+    if "channelstoomuch" in low or "toomuch" in low or "too much" in low:
+        return "limit", "аккаунт уже в максимуме чатов — почисти лишние"
+
+    # 2) чат пускает только через человека: заявка, капча, условия
+    if "inviterequest" in low or "requestsent" in low:
+        return "request", "заявка отправлена — ждёт одобрения админа"
+    if ("chatadminrequired" in low or "chatguestsendforbidden" in low
+            or "chatwriteforbidden" in low or "senderrestricted" in low):
+        return "verify", "чат просит подтверждение — вступи руками"
+
+    # 3) сама ссылка
     if "already" in low:
-        return "уже участник"
+        return "already", "уже участник"
     if "expired" in low:
-        return "ссылка истекла"
-    if "invalid" in low or "invitehashempty" in low:
-        return "ссылка недействительна"
-    if "toomuch" in low or "too much" in low:
-        return "лимит каналов аккаунта исчерпан"
-    if "privacy" in low or "ban" in low or "kick" in low:
-        return "нет доступа (бан/приват)"
-    return name
+        return "expired", "ссылка истекла"
+    if "invitehashempty" in low or "invitehashinvalid" in low or "invalid" in low:
+        return "expired", "ссылка недействительна"
+    if ("channelprivate" in low or "privacy" in low or "banned" in low
+            or "kick" in low or "private" in low):
+        return "skip", "нет доступа: закрытый чат или бан"
+    return "error", (str(e) or name)[:120]
+
+
+async def _join_mute_reason(client, entity):
+    """Пускают ли нас писать сразу после вступления.
+
+    Чаты с капчей впускают, но немым: бот просит доказать, что ты не робот.
+    Вступление формально удалось, а рассылка туда не пойдёт — такой чат сразу
+    уводим в «На проверку». Возвращает причину или None, если всё в порядке.
+    """
+    if getattr(entity, "broadcast", False):
+        return None   # канал: туда и не пишут, это не проблема вступления
+    rights = getattr(entity, "default_banned_rights", None)
+    if getattr(rights, "send_messages", False):
+        return "новичкам писать нельзя: чат просит подтверждение (капча или правила)"
+    try:
+        from telethon.tl.functions.channels import GetParticipantRequest
+        res = await client(GetParticipantRequest(entity, "me"))
+        banned = getattr(getattr(res, "participant", None), "banned_rights", None)
+        if getattr(banned, "send_messages", False):
+            return "аккаунт в чате в муте: надо пройти проверку «я не робот»"
+    except Exception:
+        pass   # обычные группы такого запроса не понимают — не страшно
+    return None
 
 
 async def _interruptible_sleep(job, seconds):
@@ -3016,6 +3072,11 @@ async def _join_job(pid, links):
     except Exception:
         pass
 
+    for key in ("verify", "requests"):
+        job.setdefault(key, [])
+    owner = (get_profile(pid) or {}).get("owner")
+    verify_added, stop = [], None
+
     for i, link in enumerate(links):
         if job.get("cancel"):
             break
@@ -3041,14 +3102,37 @@ async def _join_job(pid, links):
         while True:
             attempts += 1
             try:
+                ent = None
                 if kind == "private":
-                    await client(ImportChatInviteRequest(val))
+                    res = await client(ImportChatInviteRequest(val))
                 else:
                     ent = await client.get_entity(val)
-                    await client(JoinChannelRequest(ent))
-                job["joined"].append({"link": link})
+                    res = await client(JoinChannelRequest(ent))
                 if kind == "public":
                     joined_usernames.add(val.lower())
+                # Вступили. Теперь главное: пустят ли писать. Капча-бот вешает
+                # мут за пару секунд — даём ему их, иначе не заметим.
+                chats = list(getattr(res, "chats", None) or [])
+                entity = chats[0] if chats else ent
+                reason = None
+                if entity is not None:
+                    if JOIN_CHECK_DELAY > 0:
+                        await asyncio.sleep(random.uniform(JOIN_CHECK_DELAY,
+                                                           JOIN_CHECK_DELAY * 1.4))
+                    reason = await _join_mute_reason(client, entity)
+                if reason:
+                    job["verify"].append({"link": link, "reason": reason})
+                    try:
+                        _cache(pid, entity)
+                        chat_id = utils.get_peer_id(entity)
+                        if _mark_chat_for_verify(pid, chat_id, _name(entity), reason):
+                            verify_added.append(chat_id)
+                    except Exception as exc:
+                        # Вступили и мут увидели — это главное. Не смогли записать
+                        # чат в папку — не повод объявлять вступление неудачным.
+                        print(f"[join] {pid}: не отметил чат на проверку ({type(exc).__name__})")
+                else:
+                    job["joined"].append({"link": link})
                 break
             except FloodWaitError as e:
                 # авто-продолжение: ждём флуд и пробуем снова (если не слишком долго)
@@ -3062,19 +3146,39 @@ async def _join_job(pid, links):
                 job["status"] = "running"
                 continue
             except Exception as e:
-                reason = _join_err(e)
-                job["skipped" if reason == "уже участник" else "failed"].append({"link": link, "reason": reason})
+                category, detail = _classify_join_error(e)
+                if category in _JOIN_STOP_CATEGORIES:
+                    # Беда с аккаунтом, а не со ссылкой: остальные не трогаем.
+                    stop = (category, detail)
+                    break
+                bucket = {"already": "skipped", "request": "requests",
+                          "verify": "verify"}.get(category, "failed")
+                job[bucket].append({"link": link, "reason": detail})
                 break
 
+        if stop:
+            break   # ссылку не засчитываем: до неё просто не дошло дело
         job["done"] += 1
         if job.get("cancel"):
             break
         if i < len(links) - 1:
             await _interruptible_sleep(job, random.uniform(JOIN_GAP_MIN, JOIN_GAP_MAX))
 
+    if verify_added:
+        _track_audit_task(_sync_verify_folder(pid, owner, len(verify_added)))
     job["running"] = False
     if job.get("cancel"):
         job["status"] = "остановлено"
+    elif stop:
+        category, detail = stop
+        left = max(0, len(links) - job["done"])
+        job["status"] = f"остановлено: {detail}"
+        prof = get_profile(pid) or {}
+        _add_notification(
+            owner, pid, "error" if category == "dead" else "warn",
+            f"✋ «{prof.get('name', pid)}»: вступление остановлено — {detail}."
+            f" Оставшиеся ссылки ({left}) не тронуты — запусти позже."
+        )
     elif not str(job.get("status", "")).startswith("достигнут лимит"):
         job["status"] = "готово"
 
@@ -5798,6 +5902,8 @@ async def join_chats(pid: str, body: JoinIn, user=Depends(require_active)):
     state.join_jobs[pid] = {
         "total": len(links), "done": 0,
         "joined": [], "skipped": [], "failed": [],
+        # verify — впустили, но писать нельзя (капча); requests — ждём админа
+        "verify": [], "requests": [],
         "running": True, "cancel": False, "status": "running",
     }
     asyncio.create_task(_join_job_safe(pid, links))
@@ -5809,7 +5915,8 @@ async def join_chats_status(pid: str, user=Depends(require_user)):
     _owned_profile(pid, user)
     job = state.join_jobs.get(pid)
     if not job:
-        return {"running": False, "total": 0, "done": 0, "joined": [], "skipped": [], "failed": [], "status": ""}
+        return {"running": False, "total": 0, "done": 0, "joined": [], "skipped": [],
+                "failed": [], "verify": [], "requests": [], "status": ""}
     return job
 
 

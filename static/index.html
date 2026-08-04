@@ -1905,15 +1905,18 @@ function renderJoin(job) {
   stopBtn.style.display = job.running ? "" : "none";
   el("join-start").disabled = !!job.running;
   const j = (job.joined || []).length, sk = (job.skipped || []).length, fl = (job.failed || []).length;
+  const vf = (job.verify || []).length, rq = (job.requests || []).length;
   const box = el("join-stats-box");
-  if (j || sk || fl) {
+  if (j || sk || fl || vf || rq) {
     box.style.display = "";
-    const fails = (job.failed || []).map(f => `<div class="hint">• ${escapeHtml(f.link)} — ${escapeHtml(f.reason || "")}</div>`).join("");
-    const skips = (job.skipped || []).map(f => `<div class="hint">• ${escapeHtml(f.link)} — ${escapeHtml(f.reason || "")}</div>`).join("");
+    const rows = list => (list || []).map(f =>
+      `<div class="hint">• ${escapeHtml(f.link)} — ${escapeHtml(f.reason || "")}</div>`).join("");
     el("join-stats").innerHTML =
       `<div style="color:var(--ok)">✅ Вступил: ${j}</div>
-       <div style="color:var(--muted);margin-top:4px">⏭ Пропущено (уже участник): ${sk}</div>${skips}
-       <div style="color:var(--err);margin:6px 0 4px">❌ Не вступил: ${fl}</div>${fails}`;
+       ${rq ? `<div style="color:var(--muted);margin:6px 0 4px">⏳ Заявка отправлена, ждём админа: ${rq}</div>${rows(job.requests)}` : ""}
+       ${vf ? `<div style="color:#e0a33e;margin:6px 0 4px">🤖 Просят подтвердить «я не робот»: ${vf}<br><span style="font-weight:400">Сложил их в папку «На проверку» в Telegram — пройди проверку сам, потом верни чат в рассылку.</span></div>${rows(job.verify)}` : ""}
+       <div style="color:var(--muted);margin-top:6px">⏭ Пропущено (уже участник): ${sk}</div>${rows(job.skipped)}
+       <div style="color:var(--err);margin:6px 0 4px">❌ Не вступил: ${fl}</div>${rows(job.failed)}`;
   } else {
     box.style.display = "none";
   }
