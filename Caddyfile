@@ -26,3 +26,9 @@
 ghostline-arb.duckdns.org {
     reverse_proxy host.docker.internal:8790
 }
+
+# Сайт плиточника Рияза (~/plitka, порт 8795) — блок тоже обязан жить В РЕПО,
+# по той же причине: на сервере дописанное затрётся ближайшим деплоем yoy.
+plitka-riyaz.duckdns.org {
+    reverse_proxy host.docker.internal:8795
+}
