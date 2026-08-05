@@ -6360,6 +6360,43 @@ async def verify_chats_return(pid: str, body: VerifyReturnIn, user=Depends(requi
     return {"ok": True, "returned": returned, "left": len(_verify_chats(pid))}
 
 
+@app.post("/api/profiles/{pid}/verify-chats/leave")
+async def verify_chats_leave(pid: str, body: VerifyReturnIn, user=Depends(require_active)):
+    """Выход из чатов, с которыми возиться не хочется: бан, капча, мусор.
+
+    Из списка чат убираем в любом случае — даже если выйти не вышло (админ уже
+    забанил, чат удалён). Смысл кнопки в том, чтобы он перестал мозолить глаза.
+    """
+    _owned_profile(pid, user)
+    pending = _verify_chats(pid)
+    ids = [str(x) for x in (body.ids or list(pending)) if str(x) in pending][:100]
+    if not ids:
+        return {"ok": True, "left": 0, "cleaned": 0, "remaining": len(pending)}
+    client = await get_client(pid)
+    if client is None or not await client.is_user_authorized():
+        return JSONResponse({"error": "Аккаунт не авторизован"}, status_code=401)
+    left = 0
+    for index, chat_id in enumerate(ids):
+        try:
+            entity = await _resolve(pid, int(chat_id))
+            await client.delete_dialog(entity)
+            left += 1
+        except Exception as exc:
+            # Забанили или чата уже нет — выходить не из чего, просто вычищаем.
+            print(f"[verify] выход из {chat_id}: {type(exc).__name__}")
+        try:
+            state.entities.get(pid, {}).pop(int(chat_id), None)
+        except ValueError:
+            pass
+        _remove_chat_from_schedules(pid, chat_id)
+        if index < len(ids) - 1:
+            await asyncio.sleep(random.uniform(0.4, 0.9))   # не частим по API
+    _unmark_verify_chats(pid, ids)
+    _track_audit_task(_sync_verify_folder(pid, user["id"]))
+    return {"ok": True, "left": left, "cleaned": len(ids) - left,
+            "remaining": len(_verify_chats(pid))}
+
+
 @app.post("/api/profiles/{pid}/folder")
 async def collect_folder(pid: str, body: FolderIn, user=Depends(require_active)):
     """Собирает все каналы/супергруппы аккаунта в отдельную папку Telegram."""

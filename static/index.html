@@ -670,7 +670,10 @@
   <div class="section hidden" id="verify-chats-section" style="margin-top:18px">
     <div class="row" style="justify-content:space-between;align-items:center">
       <b>✋ Ждут твоих действий</b>
-      <button class="btn ghost" style="flex:0 0 auto" onclick="returnVerifyChats()">Вернуть все</button>
+      <div class="row" style="flex:0 0 auto;gap:6px">
+        <button class="btn ghost" style="flex:0 0 auto" onclick="returnVerifyChats()">Вернуть все</button>
+        <button class="btn ghost" style="flex:0 0 auto" onclick="leaveVerifyChats()">Выйти из всех</button>
+      </div>
     </div>
     <div class="hint" id="verify-chats-note" style="margin-top:4px"></div>
     <div class="sched-list" id="verify-chats-list" style="margin-top:8px"></div>
@@ -1709,16 +1712,46 @@ async function loadVerifyChats() {
   if (!box || !pid) return;
   const { ok, data } = await api(`/api/profiles/${pid}/verify-chats`);
   const chats = (ok && data.chats) || [];
+  state.verifyChats = chats;
   box.classList.toggle("hidden", !chats.length);
   if (!chats.length) return;
   el("verify-chats-note").textContent =
     `${chats.length} чат(ов) просят подписку, капчу или правила. Рассылка туда остановлена, `
-    + `они собраны в папку «${data.folder}» в Telegram. Выполни условия и верни их.`;
-  el("verify-chats-list").innerHTML = chats.map(c => `<div class="sched-item" style="display:block">
-      <div class="si-text" style="font-weight:600">${escapeHtml(c.name)}</div>
+    + `они собраны в папку «${data.folder}» в Telegram. Выполни условия и верни их — `
+    + `или выйди из чата, если возиться с ним незачем.`;
+  el("verify-chats-list").innerHTML = chats.map(c => {
+    const id = escapeHtml(String(c.id)), name = escapeHtml(c.name);
+    return `<div class="sched-item" style="display:block">
+      <div class="si-text" style="font-weight:600">${name}</div>
       <div class="si-to">${escapeHtml(c.reason)}${c.at ? ` · ${escapeHtml(c.at)}` : ""}</div>
-      <button class="btn ghost" style="margin-top:6px" onclick="returnVerifyChats('${escapeHtml(String(c.id))}')">Вернуть в рассылку</button>
-    </div>`).join("");
+      <div class="row" style="gap:6px;margin-top:6px">
+        <button class="btn ghost" onclick="returnVerifyChats('${id}')">Вернуть в рассылку</button>
+        <button class="btn ghost" onclick="leaveVerifyChats('${id}')">Выйти из чата</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+// Выход из чата: он пропадает из списка, из расписаний и из самого Telegram.
+// Если админ уже забанил — из списка всё равно уберём, чтобы не мозолил глаза.
+async function leaveVerifyChats(id) {
+  const pid = state.profileId;
+  if (!pid) return;
+  const chats = state.verifyChats || [];
+  // Имя берём из состояния, а не из onclick: в названии бывают кавычки.
+  const chat = chats.find(c => String(c.id) === String(id));
+  const question = id
+    ? `Выйти из чата «${(chat || {}).name || id}»? Он пропадёт из списка и из расписаний.`
+    : `Выйти из всех ${chats.length} чат(ов)? Аккаунт покинет их в Telegram, они пропадут из расписаний.`;
+  if (!confirm(question)) return;
+  toast("Выхожу…", "ok");
+  const { ok, data } = await post(`/api/profiles/${pid}/verify-chats/leave`, id ? { ids: [String(id)] } : {});
+  if (!ok) return toast(data.error || "Не удалось выйти", "bad");
+  toast(data.cleaned
+    ? `Вышел: ${data.left} · убрал из списка: ${data.cleaned}`
+    : `Вышел из чатов: ${data.left}`, "ok");
+  loadVerifyChats();
+  loadSchedules();
 }
 
 async function returnVerifyChats(id) {
