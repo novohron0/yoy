@@ -457,6 +457,66 @@ def _responses_window(pid, days):
     return sum(n for d, n in per.items() if d >= cutoff)
 
 
+# --- клиенты: кто сам написал аккаунту в личку ---
+# Написал в ЛС — значит откликнулся на рассылку, такого человека складываем в
+# отдельную папку Telegram, чтобы он не потерялся среди рабочих чатов. Группы и
+# каналы клиентами не считаем: там пишут не нам лично.
+CLIENTS_FOLDER_NAME = os.environ.get("CLIENTS_FOLDER_NAME", "Клиенты")
+# Сколько карточек храним на профиль: папка Telegram и так ограничена (100 чатов,
+# 200 у Premium), длинный хвост нужен только чтобы не заводить человека дважды.
+CLIENTS_KEEP = int(os.environ.get("CLIENTS_KEEP", "500"))
+# Пауза перед записью папки: за неё копится пачка ответов на рассылку, и мы
+# дёргаем Telegram один раз, а не на каждое входящее сообщение.
+CLIENTS_SYNC_DELAY = float(os.environ.get("CLIENTS_SYNC_DELAY", "8"))
+
+
+def _clients(pid):
+    """Люди, которые писали профилю в личку: {chat_id: {name, username, ...}}."""
+    profile = get_profile(pid) or {}
+    return dict(profile.get("clients") or {})
+
+
+def _note_client(pid, chat_id, name="", username=""):
+    """Заводит карточку написавшего. True — если человек новый."""
+    key = str(chat_id)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    profiles = load_profiles()
+    added = False
+    for p in profiles:
+        if p["id"] != pid:
+            continue
+        clients = p.setdefault("clients", {})
+        rec = clients.get(key)
+        if rec is None:
+            added = True
+            rec = clients[key] = {"at": now, "in_folder": False}
+        rec["name"] = (name or rec.get("name") or key)[:80]
+        rec["username"] = username or rec.get("username") or ""
+        rec["last"] = now
+        if len(clients) > CLIENTS_KEEP:
+            oldest = sorted(clients, key=lambda k: clients[k].get("last") or "")
+            for old in oldest[:len(clients) - CLIENTS_KEEP]:
+                clients.pop(old, None)
+        save_profiles(profiles)
+        break
+    return added
+
+
+def _mark_clients_in_folder(pid, chat_ids):
+    """Помечает, что человек уже лежит в папке — второй раз класть не будем."""
+    profiles = load_profiles()
+    for p in profiles:
+        if p["id"] != pid:
+            continue
+        clients = p.setdefault("clients", {})
+        for cid in chat_ids:
+            rec = clients.get(str(cid))
+            if rec is not None:
+                rec["in_folder"] = True
+        save_profiles(profiles)
+        break
+
+
 # после скольких подряд ошибок чат считается мёртвым и убирается из получателей
 CHAT_FAIL_LIMIT = int(os.environ.get("CHAT_FAIL_LIMIT", "3"))
 
@@ -812,6 +872,10 @@ class State:
     # profile_id -> фоновая задача отправки. Запись появляется ДО первого await,
     # чтобы ручной запуск и планировщик не могли одновременно занять один аккаунт.
     send_tasks: dict[str, asyncio.Task] = {}
+    # profile_id -> отложенная запись папки «Клиенты» (копит пачку новых людей)
+    clients_sync_tasks: dict[str, asyncio.Task] = {}
+    # profile_id -> когда последний раз жаловались, что папка не пишется
+    clients_folder_warn_at: dict[str, float] = {}
     # OCR запускается отдельно от обработчика Telegram, но task держим сильной
     # ссылкой и корректно отменяем при остановке контейнера.
     audit_tasks: set[asyncio.Task] = set()
@@ -2327,6 +2391,7 @@ def _register_response_listener(client, pid):
             if event.chat_id == 777000:
                 return                      # служебные уведомления Telegram — не отклик
             _bump_response(pid)
+            await _note_client_from_event(pid, event)
         except Exception:
             pass                            # учёт отклика не критичен — молча пропускаем
 
@@ -2799,6 +2864,134 @@ async def _sync_verify_folder(pid, owner, added=0):
                 f"📁 {len(pending)} чат(ов) ждут проверки, но папку в Telegram"
                 f" создать не вышло ({type(exc).__name__}). Список есть в панели.",
             )
+
+
+async def _sync_clients_folder(pid, owner=None):
+    """Докладывает новых написавших в личку в папку Telegram «Клиенты».
+
+    Папку не переписываем целиком (в отличие от «На проверку»): владелец мог
+    убрать оттуда человека руками, и тот не должен возвращаться. Поэтому кладём
+    только тех, кого мы туда ещё не клали, а остальное содержимое сохраняем.
+    """
+    fresh = [cid for cid, rec in _clients(pid).items() if not rec.get("in_folder")]
+    if not fresh:
+        return 0
+    try:
+        from telethon.tl.types import DialogFilter
+        try:
+            from telethon.tl.types import TextWithEntities
+        except Exception:
+            TextWithEntities = None
+        client = await get_client(pid)
+        if client is None:
+            return 0
+        res = await client(GetDialogFiltersRequest())
+        existing = getattr(res, "filters", res) or []
+        folder, folder_id, used = None, None, set()
+        for flt in existing:
+            fid = getattr(flt, "id", None)
+            if isinstance(fid, int):
+                used.add(fid)
+            title = getattr(flt, "title", None)
+            text = getattr(title, "text", title)
+            # Папка-ссылка (chatlist) и «Все чаты» списком чатов не управляются —
+            # такие пропускаем, иначе затрём владельцу чужую настройку.
+            if (isinstance(text, str) and text.strip() == CLIENTS_FOLDER_NAME
+                    and getattr(flt, "include_peers", None) is not None):
+                folder, folder_id = flt, fid
+        keep = list(getattr(folder, "include_peers", None) or [])
+        known = set()
+        for peer in keep:
+            try:
+                known.add(utils.get_peer_id(peer))
+            except Exception:
+                continue
+        new_peers, new_ids, done_ids = [], [], []
+        for cid in fresh:
+            try:
+                peer = await client.get_input_entity(int(cid))
+            except Exception:
+                continue          # диалог удалён или недоступен — просто пропускаем
+            done_ids.append(cid)
+            try:
+                if utils.get_peer_id(peer) in known:
+                    continue      # уже лежит в папке — только помечаем у себя
+            except Exception:
+                pass
+            new_peers.append(peer)
+            new_ids.append(cid)
+        if not new_peers:
+            _mark_clients_in_folder(pid, done_ids)
+            return 0
+        if folder_id is None:
+            folder_id = next(i for i in range(2, 250) if i not in used)
+        title_obj = (TextWithEntities(text=CLIENTS_FOLDER_NAME, entities=[])
+                     if TextWithEntities else CLIENTS_FOLDER_NAME)
+        await client(UpdateDialogFilterRequest(
+            id=folder_id,
+            filter=DialogFilter(
+                id=folder_id, title=title_obj,
+                pinned_peers=list(getattr(folder, "pinned_peers", None) or []),
+                include_peers=keep + new_peers,
+                exclude_peers=list(getattr(folder, "exclude_peers", None) or []),
+            ),
+        ))
+        _mark_clients_in_folder(pid, done_ids)
+        if owner:
+            saved = _clients(pid)
+            names = [(saved.get(c) or {}).get("name") or c for c in new_ids]
+            who = ", ".join(names[:3]) + ("…" if len(names) > 3 else "")
+            _add_notification(
+                owner, pid, "info",
+                f"👤 Новых клиентов: {len(new_peers)} — написали в личку, положил"
+                f" в папку «{CLIENTS_FOLDER_NAME}» в Telegram ({who}).",
+            )
+        return len(new_peers)
+    except Exception as exc:
+        # Переполненную папку чинит только владелец, а люди пишут дальше — поэтому
+        # жалуемся не чаще раза в час, иначе лента уведомлений превратится в спам.
+        last = state.clients_folder_warn_at.get(pid, 0)
+        if owner and time.time() - last > 3600:
+            state.clients_folder_warn_at[pid] = time.time()
+            _add_notification(
+                owner, pid, "warn",
+                f"👤 {len(fresh)} чел. написали в личку, но положить их в папку"
+                f" «{CLIENTS_FOLDER_NAME}» не вышло ({type(exc).__name__})."
+                " Возможно, папка переполнена — почисти её в Telegram.",
+            )
+        return 0
+
+
+def _schedule_clients_sync(pid, owner=None):
+    """Ставит отложенную запись папки: одна задача на профиль, не чаще паузы."""
+    task = state.clients_sync_tasks.get(pid)
+    if task is not None and not task.done():
+        return
+
+    async def _later():
+        try:
+            await asyncio.sleep(CLIENTS_SYNC_DELAY)
+            await _sync_clients_folder(pid, owner)
+        finally:
+            state.clients_sync_tasks.pop(pid, None)
+
+    state.clients_sync_tasks[pid] = _track_audit_task(_later())
+
+
+async def _note_client_from_event(pid, event):
+    """Заводит клиента по входящему личному сообщению и планирует папку."""
+    sender = await event.get_sender()
+    if sender is None:
+        return
+    # Боты и служебные аккаунты Telegram — не клиенты.
+    if getattr(sender, "bot", False) or getattr(sender, "support", False):
+        return
+    if getattr(sender, "is_self", False):
+        return
+    owner = (get_profile(pid) or {}).get("owner")
+    _note_client(pid, event.chat_id, _name(sender),
+                 getattr(sender, "username", "") or "")
+    _schedule_clients_sync(pid, owner)
 
 
 async def _send_bulk(pid, targets, text, gap_lo=None, gap_hi=None, source="ручная",
@@ -3537,6 +3730,8 @@ async def _warm_response_listeners():
                     await client.catch_up()   # добрать апдейты, пропущенные в даунтайм
                 except Exception:
                     pass
+                # Клиенты, не доехавшие до папки перед рестартом, доедут сейчас.
+                _schedule_clients_sync(pid, (get_profile(pid) or {}).get("owner"))
         except Exception as e:
             print(f"[resp] прогрев слушателя {pid}: {e}")
         await asyncio.sleep(2)
