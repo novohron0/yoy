@@ -58,6 +58,7 @@ from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import (
     ImportChatInviteRequest,
+    GetCommonChatsRequest,
     GetDialogFiltersRequest,
     UpdateDialogFilterRequest,
     ExportChatInviteRequest,
@@ -468,6 +469,10 @@ CLIENTS_KEEP = int(os.environ.get("CLIENTS_KEEP", "500"))
 # Пауза перед записью папки: за неё копится пачка ответов на рассылку, и мы
 # дёргаем Telegram один раз, а не на каждое входящее сообщение.
 CLIENTS_SYNC_DELAY = float(os.environ.get("CLIENTS_SYNC_DELAY", "8"))
+# За один фоновый проход проверяем ограниченную пачку старых клиентов. Дальше
+# админская аналитика сама запустит следующий проход — без длинного запроса и
+# резкого шквала обращений к Telegram.
+CLIENT_SOURCE_BACKFILL_LIMIT = int(os.environ.get("CLIENT_SOURCE_BACKFILL_LIMIT", "25"))
 
 
 def _clients(pid):
@@ -515,6 +520,164 @@ def _mark_clients_in_folder(pid, chat_ids):
                 rec["in_folder"] = True
         save_profiles(profiles)
         break
+
+
+def _source_chat_link(username):
+    """Публичная ссылка на чат; приватную ссылку из одного id восстановить нельзя."""
+    username = str(username or "").strip().lstrip("@")
+    return f"https://t.me/{username}" if username else ""
+
+
+def _remember_outreach_chat(pid, target, entity=None, *, sent_at=None):
+    """Запоминает чат, куда реально дошла рассылка, для будущей атрибуции ЛС."""
+    target = target or {}
+    kind = str(target.get("kind") or "")
+    if entity is not None:
+        kind = _kind(entity)
+    if kind not in {"group", "channel"}:
+        return False
+    try:
+        chat_id = str(int(target.get("id")))
+    except (TypeError, ValueError):
+        return False
+    username = getattr(entity, "username", None) or target.get("username") or ""
+    name = (_name(entity) if entity is not None else target.get("name")) or chat_id
+    record = {
+        "id": chat_id,
+        "name": str(name)[:120],
+        "username": str(username).lstrip("@")[:64],
+        "link": _source_chat_link(username),
+        "last_sent": sent_at or datetime.now().isoformat(timespec="seconds"),
+    }
+    profiles = load_profiles()
+    for profile in profiles:
+        if profile.get("id") != pid:
+            continue
+        catalog = profile.setdefault("outreach_chats", {})
+        previous = catalog.get(chat_id) or {}
+        catalog[chat_id] = {**previous, **record}
+        # Телеграм-аккаунт физически не может состоять в бесконечном числе чатов,
+        # но всё равно ограничиваем старый хвост, чтобы profiles.json не разрастался.
+        if len(catalog) > CLIENTS_KEEP:
+            oldest = sorted(catalog, key=lambda key: catalog[key].get("last_sent") or "")
+            for old in oldest[:len(catalog) - CLIENTS_KEEP]:
+                catalog.pop(old, None)
+        save_profiles(profiles)
+        return True
+    return False
+
+
+def _outreach_chat_catalog(pid):
+    """Рабочие чаты профиля: успешные рассылки + старые цели расписаний."""
+    profile = get_profile(pid) or {}
+    catalog = {
+        str(key): dict(value or {})
+        for key, value in (profile.get("outreach_chats") or {}).items()
+    }
+    # Это даёт мягкую миграцию: источники можно найти и для клиентов, которые
+    # появились до релиза аналитики, если чат до сих пор стоит в расписании.
+    for rule in load_schedules():
+        if rule.get("profile_id") != pid:
+            continue
+        for target in rule.get("targets") or []:
+            if str(target.get("kind") or "") not in {"group", "channel"}:
+                continue
+            try:
+                key = str(int(target.get("id")))
+            except (TypeError, ValueError):
+                continue
+            old = catalog.get(key) or {}
+            catalog[key] = {
+                "id": key,
+                "name": old.get("name") or str(target.get("name") or key)[:120],
+                "username": old.get("username") or "",
+                "link": old.get("link") or "",
+                "last_sent": old.get("last_sent") or "",
+            }
+    return catalog
+
+
+def _save_client_sources(pid, client_id, sources):
+    """Сохраняет общие рабочие чаты и один основной источник, если он определим."""
+    sources = list(sources or [])
+    # Один общий рабочий чат — точный источник. Если их несколько, берём только
+    # явно самый свежий по успешной рассылке; при равенстве честно оставляем
+    # клиента без основного источника, а не рисуем выдуманную точность.
+    ordered = sorted(sources, key=lambda row: row.get("last_sent") or "", reverse=True)
+    primary = None
+    confidence = ""
+    if len(ordered) == 1:
+        primary, confidence = ordered[0], "exact"
+    elif ordered and ordered[0].get("last_sent"):
+        second_at = (ordered[1].get("last_sent") if len(ordered) > 1 else "") or ""
+        if ordered[0].get("last_sent") != second_at:
+            primary, confidence = ordered[0], "likely"
+
+    profiles = load_profiles()
+    for profile in profiles:
+        if profile.get("id") != pid:
+            continue
+        rec = profile.setdefault("clients", {}).get(str(client_id))
+        if rec is None:
+            return False
+        rec["sources"] = ordered
+        rec["source_checked_at"] = datetime.now().isoformat(timespec="seconds")
+        if primary:
+            rec["source"] = primary
+            rec["source_confidence"] = confidence
+        else:
+            rec.pop("source", None)
+            rec.pop("source_confidence", None)
+        save_profiles(profiles)
+        return True
+    return False
+
+
+async def _discover_client_sources(client, pid, client_id, sender):
+    """Находит среди общих чатов те, куда рабочий аккаунт слал рассылки."""
+    catalog = _outreach_chat_catalog(pid)
+    if not catalog:
+        return False
+    result = await client(GetCommonChatsRequest(
+        user_id=utils.get_input_user(sender), max_id=0, limit=100,
+    ))
+    found = []
+    seen = set()
+    for chat in getattr(result, "chats", None) or []:
+        try:
+            key = str(utils.get_peer_id(chat))
+        except Exception:
+            continue
+        meta = catalog.get(key)
+        if not meta or key in seen:
+            continue
+        seen.add(key)
+        username = getattr(chat, "username", None) or meta.get("username") or ""
+        found.append({
+            "id": key,
+            "name": str(_name(chat) or meta.get("name") or key)[:120],
+            "username": str(username).lstrip("@")[:64],
+            "link": _source_chat_link(username) or meta.get("link") or "",
+            "last_sent": meta.get("last_sent") or "",
+        })
+    _save_client_sources(pid, client_id, found)
+    return bool(found)
+
+
+def _schedule_client_source_lookup(client, pid, client_id, sender):
+    """Не запускает две одинаковые проверки, если человек прислал пачку сообщений."""
+    key = (str(pid), str(client_id))
+    if key in state.client_source_pending:
+        return
+    state.client_source_pending.add(key)
+
+    async def _run():
+        try:
+            await _discover_client_sources(client, pid, client_id, sender)
+        finally:
+            state.client_source_pending.discard(key)
+
+    _track_audit_task(_run())
 
 
 # после скольких подряд ошибок чат считается мёртвым и убирается из получателей
@@ -876,6 +1039,10 @@ class State:
     clients_sync_tasks: dict[str, asyncio.Task] = {}
     # profile_id -> когда последний раз жаловались, что папка не пишется
     clients_folder_warn_at: dict[str, float] = {}
+    # (profile_id, client_id) — уже запущенная проверка общих рабочих чатов
+    client_source_pending: set[tuple[str, str]] = set()
+    # Ленивая дозагрузка источников для клиентов, появившихся до аналитики.
+    client_source_backfill_task: asyncio.Task | None = None
     # OCR запускается отдельно от обработчика Telegram, но task держим сильной
     # ссылкой и корректно отменяем при остановке контейнера.
     audit_tasks: set[asyncio.Task] = set()
@@ -2391,7 +2558,7 @@ def _register_response_listener(client, pid):
             if event.chat_id == 777000:
                 return                      # служебные уведомления Telegram — не отклик
             _bump_response(pid)
-            await _note_client_from_event(pid, event)
+            await _note_client_from_event(client, pid, event)
         except Exception:
             pass                            # учёт отклика не критичен — молча пропускаем
 
@@ -2978,8 +3145,8 @@ def _schedule_clients_sync(pid, owner=None):
     state.clients_sync_tasks[pid] = _track_audit_task(_later())
 
 
-async def _note_client_from_event(pid, event):
-    """Заводит клиента по входящему личному сообщению и планирует папку."""
+async def _note_client_from_event(client, pid, event):
+    """Заводит клиента, планирует папку и фоновое определение источника."""
     sender = await event.get_sender()
     if sender is None:
         return
@@ -2992,6 +3159,11 @@ async def _note_client_from_event(pid, event):
     _note_client(pid, event.chat_id, _name(sender),
                  getattr(sender, "username", "") or "")
     _schedule_clients_sync(pid, owner)
+    rec = (_clients(pid).get(str(event.chat_id)) or {})
+    # Уже найденный основной источник не пересчитываем: аналитика отвечает на
+    # вопрос «откуда пришёл впервые», а не «в каких чатах состоит сейчас».
+    if not rec.get("source"):
+        _schedule_client_source_lookup(client, pid, event.chat_id, sender)
 
 
 async def _send_bulk(pid, targets, text, gap_lo=None, gap_hi=None, source="ручная",
@@ -3068,6 +3240,10 @@ async def _send_bulk(pid, targets, text, gap_lo=None, gap_hi=None, source="ру�
             if status == "ok":
                 job["ok"] += 1
                 _record_chat_result(pid, target.get("id"), True)   # сброс счётчика ошибок чата
+                # Только реально доставленный пост делает чат возможным источником
+                # будущего клиента. Сущность уже лежит в кэше после _send_one.
+                entity = state.entities.get(pid, {}).get(target.get("id"))
+                _remember_outreach_chat(pid, target, entity)
             elif status == "slow":
                 # медленный режим — временно, чат пропущен, но НЕ считаем «мёртвым»
                 job["failed"].append({"name": target.get("name") or "", "reason": detail or "медленный режим"})
@@ -3898,6 +4074,8 @@ async def lifespan(app: FastAPI):
     state.audit_deleted_owners.clear()
     state.audit_deleted_profiles.clear()
     state.audit_owner_locks.clear()
+    state.client_source_pending.clear()
+    state.client_source_backfill_task = None
     state.audit_ocr_semaphore = None
     state.audit_archive_semaphore = None
     state.audit_archive_media_semaphore = None
@@ -4245,6 +4423,156 @@ def _activity_verdict(s):
     return {"level": "mid", "reason": f"рассылает ({pct}% доходит), но в ответ пока не пишут"}
 
 
+def _source_analytics():
+    """Админская сводка без личностей клиентов: только источники и агрегаты."""
+    users = {str(user.get("id")): user for user in load_users()}
+    owner_clients = {}
+    for profile in load_profiles():
+        owner = str(profile.get("owner") or "")
+        if not owner:
+            continue
+        clients = owner_clients.setdefault(owner, {})
+        for client_id, rec in (profile.get("clients") or {}).items():
+            key = str(client_id)
+            current = clients.get(key)
+            # Один и тот же человек мог написать на два аккаунта сотрудника.
+            # Для статистики это один клиент; предпочитаем запись с источником.
+            if current is None or (not current.get("source") and (rec or {}).get("source")):
+                clients[key] = dict(rec or {})
+
+    def summarize(owner, clients):
+        chats = {}
+        attributed = 0
+        ambiguous = 0
+        for rec in clients.values():
+            source = rec.get("source") or {}
+            if not source:
+                if len(rec.get("sources") or []) > 1:
+                    ambiguous += 1
+                continue
+            key = str(source.get("id") or source.get("link") or source.get("name") or "")
+            if not key:
+                continue
+            attributed += 1
+            row = chats.setdefault(key, {
+                "id": str(source.get("id") or ""),
+                "name": str(source.get("name") or "Чат без названия")[:120],
+                "link": str(source.get("link") or "")[:240],
+                "username": str(source.get("username") or "")[:64],
+                "clients": 0,
+                "exact": 0,
+            })
+            row["clients"] += 1
+            if rec.get("source_confidence") == "exact":
+                row["exact"] += 1
+            if not row.get("link") and source.get("link"):
+                row["link"] = str(source.get("link"))[:240]
+        rows = sorted(chats.values(), key=lambda row: (-row["clients"], row["name"].casefold()))
+        for row in rows:
+            row["percent"] = round(row["clients"] * 100 / attributed) if attributed else 0
+        user = users.get(owner) or {}
+        return {
+            "id": owner,
+            "username": user.get("username") or "Пользователь",
+            "clients": len(clients),
+            "attributed": attributed,
+            "ambiguous": ambiguous,
+            "unattributed": max(0, len(clients) - attributed),
+            "chats": rows,
+            "top": rows[0] if rows else None,
+        }
+
+    per_user = [summarize(owner, clients) for owner, clients in owner_clients.items()]
+    per_user.sort(key=lambda row: (-row["attributed"], str(row["username"]).casefold()))
+
+    # Общая сводка считает контакт отдельно у каждого сотрудника, но не дублирует
+    # одного Telegram-пользователя между несколькими аккаунтами одного сотрудника.
+    overall_clients = {}
+    for owner, clients in owner_clients.items():
+        for client_id, rec in clients.items():
+            overall_clients[f"{owner}:{client_id}"] = rec
+    overall = summarize("", overall_clients)
+    overall["id"] = "overall"
+    overall["username"] = "Все пользователи"
+    return {"overall": overall, "users": per_user}
+
+
+def _source_backfill_missing():
+    """Сколько старых клиентов ещё ни разу не проверялось на общий рабочий чат."""
+    return sum(
+        1
+        for profile in load_profiles()
+        if _outreach_chat_catalog(profile.get("id"))
+        for rec in (profile.get("clients") or {}).values()
+        if "sources" not in (rec or {})
+    )
+
+
+async def _backfill_client_sources():
+    """Небольшими пачками достраивает аналитику для уже сохранённых клиентов."""
+    left = max(1, CLIENT_SOURCE_BACKFILL_LIMIT)
+    for profile in load_profiles():
+        if left <= 0:
+            break
+        pid = profile.get("id")
+        if not pid or not _outreach_chat_catalog(pid):
+            continue
+        missing = [
+            client_id for client_id, rec in (profile.get("clients") or {}).items()
+            if "sources" not in (rec or {})
+        ]
+        if not missing:
+            continue
+        try:
+            client = await get_client(pid)
+            authorized = bool(client is not None and await client.is_user_authorized())
+        except Exception:
+            client, authorized = None, False
+        if not authorized:
+            # Не держим админский экран на вечном «сборе», если старый профиль
+            # отключён. При следующем реальном входящем сообщении источник снова
+            # проверится уже на живой сессии.
+            for client_id in missing[:left]:
+                _save_client_sources(pid, client_id, [])
+                left -= 1
+            continue
+        for client_id in missing[:left]:
+            key = (str(pid), str(client_id))
+            if key in state.client_source_pending:
+                continue
+            state.client_source_pending.add(key)
+            try:
+                sender = await client.get_entity(int(client_id))
+                await _discover_client_sources(client, pid, client_id, sender)
+            except Exception as exc:
+                print(f"[source-analytics] lookup {type(exc).__name__}")
+                _save_client_sources(pid, client_id, [])
+            finally:
+                state.client_source_pending.discard(key)
+            left -= 1
+            if left <= 0:
+                break
+            await asyncio.sleep(0.2)
+
+
+def _ensure_client_source_backfill():
+    task = state.client_source_backfill_task
+    if task is not None and not task.done():
+        return True
+    if not _source_backfill_missing():
+        state.client_source_backfill_task = None
+        return False
+
+    async def _run():
+        try:
+            await _backfill_client_sources()
+        finally:
+            state.client_source_backfill_task = None
+
+    state.client_source_backfill_task = _track_audit_task(_run())
+    return True
+
+
 @app.get("/api/admin/stats")
 async def admin_stats(admin=Depends(require_admin)):
     """Статистика активности по каждому пользователю (включая самого админа):
@@ -4327,6 +4655,20 @@ async def admin_stats(admin=Depends(require_admin)):
         s.pop("_pids", None)
 
     return {"stats": list(out.values())}
+
+
+@app.get("/api/admin/source-analytics")
+async def admin_source_analytics(admin=Depends(require_admin)):
+    """Откуда приходят новые личные сообщения; доступно только администратору."""
+    collecting = _ensure_client_source_backfill()
+    data = _source_analytics()
+    data["collecting"] = collecting
+    data["remaining"] = _source_backfill_missing()
+    data["note"] = (
+        "Telegram не передаёт прямой источник личного сообщения. Если общий рабочий чат один — "
+        "источник точный; если их несколько — используется чат с самой свежей успешной рассылкой."
+    )
+    return data
 
 
 # ---------------------------------------------------------------------------

@@ -187,28 +187,83 @@ class ClientsFolderTests(unittest.IsolatedAsyncioTestCase):
     async def listen(self, event):
         client = ListenerClient()
         scheduled = []
+        source_lookups = []
         with patch.object(web, "_bump_response"), \
              patch.object(web, "_schedule_clients_sync",
-                          side_effect=lambda pid, owner=None: scheduled.append(pid)):
+                          side_effect=lambda pid, owner=None: scheduled.append(pid)), \
+             patch.object(web, "_schedule_client_source_lookup",
+                          side_effect=lambda client, pid, cid, sender:
+                              source_lookups.append((pid, cid))):
             web._register_response_listener(client, "p1")
             await client.handlers[0](event)
-        return scheduled
+        return scheduled, source_lookups
 
     async def test_private_message_makes_a_client(self):
-        self.assertEqual(await self.listen(Event(person())), ["p1"])
+        folders, sources = await self.listen(Event(person()))
+        self.assertEqual(folders, ["p1"])
+        self.assertEqual(sources, [("p1", 555)])
         self.assertEqual(self.clients()["555"]["username"], "klient")
 
     async def test_group_message_is_not_a_client(self):
-        self.assertEqual(await self.listen(Event(person(), chat_id=-100777, private=False)), [])
+        self.assertEqual(await self.listen(Event(person(), chat_id=-100777, private=False)), ([], []))
         self.assertEqual(self.clients(), {})
 
     async def test_bot_is_not_a_client(self):
-        self.assertEqual(await self.listen(Event(person(uid=42, bot=True))), [])
+        self.assertEqual(await self.listen(Event(person(uid=42, bot=True))), ([], []))
         self.assertEqual(self.clients(), {})
 
     async def test_telegram_service_account_is_not_a_client(self):
-        self.assertEqual(await self.listen(Event(person(uid=777000), chat_id=777000)), [])
+        self.assertEqual(await self.listen(Event(person(uid=777000), chat_id=777000)), ([], []))
         self.assertEqual(self.clients(), {})
+
+    # --- аналитика источников ---
+
+    def test_one_common_outreach_chat_is_an_exact_source(self):
+        web._note_client("p1", 555, "Вася", "klient")
+        web._save_client_sources("p1", 555, [{
+            "id": "-10010", "name": "Строители", "link": "https://t.me/builders",
+            "username": "builders", "last_sent": "2026-08-08T10:00:00",
+        }])
+        rec = self.clients()["555"]
+        self.assertEqual(rec["source"]["name"], "Строители")
+        self.assertEqual(rec["source_confidence"], "exact")
+
+    def test_latest_successful_chat_wins_when_there_are_several(self):
+        web._note_client("p1", 555, "Вася", "klient")
+        web._save_client_sources("p1", 555, [
+            {"id": "-10010", "name": "Старый", "last_sent": "2026-08-08T09:00:00"},
+            {"id": "-10020", "name": "Свежий", "last_sent": "2026-08-08T10:00:00"},
+        ])
+        rec = self.clients()["555"]
+        self.assertEqual(rec["source"]["name"], "Свежий")
+        self.assertEqual(rec["source_confidence"], "likely")
+
+    def test_equal_candidates_are_not_presented_as_a_fact(self):
+        web._note_client("p1", 555, "Вася", "klient")
+        web._save_client_sources("p1", 555, [
+            {"id": "-10010", "name": "Первый", "last_sent": ""},
+            {"id": "-10020", "name": "Второй", "last_sent": ""},
+        ])
+        rec = self.clients()["555"]
+        self.assertNotIn("source", rec)
+        self.assertEqual(len(rec["sources"]), 2)
+
+    def test_admin_analytics_has_counts_percentages_and_public_link(self):
+        for uid, source in [
+            (1, {"id": "-10010", "name": "Строители", "link": "https://t.me/builders"}),
+            (2, {"id": "-10010", "name": "Строители", "link": "https://t.me/builders"}),
+            (3, {"id": "-10020", "name": "Ремонт", "link": "https://t.me/remont"}),
+        ]:
+            web._note_client("p1", uid, f"Клиент {uid}")
+            self.profiles[0]["clients"][str(uid)]["source"] = source
+            self.profiles[0]["clients"][str(uid)]["source_confidence"] = "exact"
+        with patch.object(web, "load_users", return_value=[{"id": "u1", "username": "admin"}]):
+            data = web._source_analytics()
+        top = data["overall"]["top"]
+        self.assertEqual(top["name"], "Строители")
+        self.assertEqual(top["clients"], 2)
+        self.assertEqual(top["percent"], 67)
+        self.assertEqual(top["link"], "https://t.me/builders")
 
 
 if __name__ == "__main__":

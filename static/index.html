@@ -700,8 +700,18 @@
   </div>
   <div class="hint" style="margin-bottom:16px">Одобряй или блокируй тех, кто зарегистрировался. Войти и пользоваться могут только одобренные.</div>
   <div class="section" id="admin-summary" style="display:none"></div>
-  <div class="section" id="admin-payment-audit"><div class="hint">Проверка оплат загружается…</div></div>
-  <div class="section"><div class="sched-list" id="admin-list"></div></div>
+  <details class="section" id="admin-payment-section">
+    <summary style="cursor:pointer;font-size:16px;font-weight:700">💳 Оплаты и проверка</summary>
+    <div id="admin-payment-audit" style="margin-top:14px"><div class="hint">Проверка оплат загружается…</div></div>
+  </details>
+  <details class="section" id="admin-source-section" open>
+    <summary style="cursor:pointer;font-size:16px;font-weight:700">📈 Аналитика — откуда пишут</summary>
+    <div id="admin-source-analytics" style="margin-top:14px"><div class="hint">Аналитика загружается…</div></div>
+  </details>
+  <details class="section" id="admin-users-section">
+    <summary style="cursor:pointer;font-size:16px;font-weight:700">👥 Пользователи и сортировка</summary>
+    <div class="sched-list" id="admin-list" style="margin-top:14px"></div>
+  </details>
 </div>
 
 <!-- ============ Экран: вступить в чаты ============ -->
@@ -1078,6 +1088,7 @@ let state = {
   billing: null,
   paymentAudit: null,
   adminPaymentAudit: null,
+  sourceAnalyticsTimer: null,
   editingSid: null,
   lastSearch: [],
   helpReturn: null,   // куда вернуться из обучения
@@ -3237,12 +3248,95 @@ function _paymentAmountsLabel(c) {
   return rows.map(a => `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 }).format(Number(a.value))} ${a.currency === "RUB" ? "₽" : String(a.currency || "")}`).join(" · ");
 }
 
+function sourceChatLink(chat) {
+  const url = String((chat || {}).link || "");
+  return /^https:\/\/t\.me\/[A-Za-z0-9_]+$/.test(url) ? url : "";
+}
+
+function sourceChatsHtml(chats, limit) {
+  const rows = (chats || []).slice(0, limit || 10);
+  return rows.map(chat => {
+    const url = sourceChatLink(chat);
+    const title = escapeHtml(String(chat.name || "Чат без названия"));
+    const name = url
+      ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener" style="color:var(--accent-3);font-weight:600">${title} ↗</a>`
+      : `<span style="font-weight:600">${title}</span>`;
+    const percent = Math.max(0, Math.min(100, Number(chat.percent || 0)));
+    return `<div style="margin-top:10px">
+      <div class="row" style="justify-content:space-between;align-items:baseline;gap:10px">
+        <div style="min-width:0">${name}${url ? "" : ` <span class="hint">· приватный, публичной ссылки нет</span>`}</div>
+        <div style="white-space:nowrap"><b>${Number(chat.clients || 0)}</b> чел. · <b>${percent}%</b></div>
+      </div>
+      <div style="height:6px;background:var(--panel-2);border-radius:999px;overflow:hidden;margin-top:5px">
+        <div style="width:${percent}%;height:100%;background:var(--accent-3);border-radius:999px"></div>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function renderSourceAnalytics(data) {
+  const box = el("admin-source-analytics");
+  if (!box) return;
+  if (!data) {
+    box.innerHTML = `<div class="hint" style="color:var(--err)">Аналитика временно недоступна. Рассылки продолжают работать.</div>`;
+    return;
+  }
+  const overall = data.overall || {};
+  const top = overall.top || null;
+  const topUrl = sourceChatLink(top);
+  const topName = top ? escapeHtml(String(top.name || "Чат без названия")) : "";
+  const topTitle = top
+    ? (topUrl ? `<a href="${escapeHtml(topUrl)}" target="_blank" rel="noopener" style="color:var(--accent-3)">${topName} ↗</a>` : topName)
+    : "пока не определён";
+  const collecting = data.collecting
+    ? `<div class="hint" style="margin-top:8px">⏳ Достраиваю источники для старых клиентов${data.remaining ? ` · осталось проверить ${Number(data.remaining)}` : ""}. Блок обновится сам.</div>`
+    : "";
+  const overallHtml = top
+    ? `<div style="padding:13px 15px;background:var(--panel-2);border:1px solid var(--border);border-radius:12px">
+        <div class="hint">Главный источник по всем пользователям</div>
+        <div style="font-size:17px;font-weight:700;margin-top:4px">🏆 ${topTitle}</div>
+        <div class="si-to" style="margin-top:4px"><b>${Number(top.clients || 0)}</b> клиентов · <b>${Number(top.percent || 0)}%</b> среди определённых источников</div>
+      </div>
+      ${sourceChatsHtml(overall.chats, 10)}`
+    : `<div class="hint">Пока источник ни одного клиента не определён. Данные появятся после входящих личных сообщений и успешных рассылок по чатам.</div>`;
+
+  const users = (data.users || []).filter(row => Number(row.clients || 0) > 0);
+  const userHtml = users.map(row => {
+    const topRow = row.top || null;
+    const coverage = Number(row.clients || 0)
+      ? Math.round(Number(row.attributed || 0) * 100 / Number(row.clients || 1))
+      : 0;
+    return `<details style="margin-top:12px;padding:11px 13px;border:1px solid var(--border);border-radius:10px">
+      <summary style="cursor:pointer;font-weight:650">${escapeHtml(String(row.username || "Пользователь"))}
+        <span class="hint">· определено ${Number(row.attributed || 0)}/${Number(row.clients || 0)} (${coverage}%)${topRow ? ` · лидер ${escapeHtml(String(topRow.name || ""))}` : ""}</span>
+      </summary>
+      ${sourceChatsHtml(row.chats, 10) || `<div class="hint" style="margin-top:9px">Источники пока не определены.</div>`}
+      ${row.ambiguous ? `<div class="hint" style="margin-top:8px">У ${Number(row.ambiguous)} клиент(ов) несколько равновероятных общих чатов — они не приписаны случайному источнику.</div>` : ""}
+    </details>`;
+  }).join("");
+
+  box.innerHTML = `${overallHtml}${collecting}
+    <div class="hint" style="margin-top:12px;line-height:1.5">${escapeHtml(String(data.note || ""))}</div>
+    ${userHtml ? `<div style="font-weight:700;margin-top:18px">Откуда пишут каждому пользователю</div>${userHtml}` : ""}`;
+
+  if (state.sourceAnalyticsTimer) clearTimeout(state.sourceAnalyticsTimer);
+  if (data.collecting) {
+    state.sourceAnalyticsTimer = setTimeout(refreshSourceAnalytics, 5000);
+  }
+}
+
+async function refreshSourceAnalytics() {
+  if (el("screen-admin").classList.contains("hidden")) return;
+  const res = await api("/api/admin/source-analytics");
+  renderSourceAnalytics(res.ok ? res.data : null);
+}
+
 async function loadAdminUsers() {
   const box = el("admin-list");
   box.innerHTML = `<div class="hint">Загрузка…</div>`;
-  const [{ ok, data }, statsRes, paymentRes, payoutRes] = await Promise.all([
+  const [{ ok, data }, statsRes, paymentRes, payoutRes, sourceRes] = await Promise.all([
     api("/api/admin/users"), api("/api/admin/stats"), api("/api/admin/payment-audit?days=36500"),
-    api("/api/admin/payment-audit/payouts?limit=200")
+    api("/api/admin/payment-audit/payouts?limit=200"), api("/api/admin/source-analytics")
   ]);
   if (!ok) { box.innerHTML = `<div class="hint">${escapeHtml(data.error || "Ошибка")}</div>`; return; }
   const statsById = {};
@@ -3250,6 +3344,7 @@ async function loadAdminUsers() {
   renderAdminSummary(data.users || [], statsById);
   state.paymentPayouts = payoutRes.ok ? (payoutRes.data.payouts || []) : [];
   renderAdminPaymentAudit(paymentRes.ok ? paymentRes.data : null);
+  renderSourceAnalytics(sourceRes.ok ? sourceRes.data : null);
   box.innerHTML = "";
   const users = data.users || [];
   // Заблокированные не мешаются в основном составе — они уезжают вниз, под спойлер.
